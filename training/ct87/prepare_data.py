@@ -95,21 +95,33 @@ def run_prepare_data(
     #     grows to ~1 GB; release_unused() drops its idle chunks.
     # Empirically, calling both every 10k docs keeps RSS flat at ~2.6 GB for
     # the 100M-token dryrun instead of climbing past 7 GB.
-    _libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    _libc.malloc_trim.argtypes = [ctypes.c_int]
-    _libc.malloc_trim.restype = ctypes.c_int
+    #
+    # malloc_trim is glibc-specific — on macOS/musl the CDLL load fails and
+    # we fall back to a no-op. gc + pyarrow release still handle most of the
+    # leak on those platforms; only the tokenizer-churn arena fragmentation
+    # stays (the 40 B/token regime). If a non-glibc environment ever becomes
+    # a real target, revisit with jemalloc_tls/mallctl or similar.
+    try:
+        _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        _libc.malloc_trim.argtypes = [ctypes.c_int]
+        _libc.malloc_trim.restype = ctypes.c_int
+        def _malloc_trim() -> None:
+            _libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        def _malloc_trim() -> None:
+            pass
 
     try:
         import pyarrow as _pa
         _pa_pool = _pa.default_memory_pool()
-    except Exception:
+    except (ImportError, AttributeError):
         _pa_pool = None
 
     def _release_unused_heap() -> None:
         gc.collect()
         if _pa_pool is not None:
             _pa_pool.release_unused()
-        _libc.malloc_trim(0)
+        _malloc_trim()
 
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
     eos_token_id = tokenizer.eos_token_id
@@ -225,19 +237,21 @@ def run_prepare_data(
         # HF Datasets uses the streaming IPC format (RecordBatchStreamWriter),
         # NOT the file format. The two wire formats look similar but are not
         # interchangeable — HF's load_from_disk expects stream format.
-        with pa.OSFile(arrow_path, "wb") as sink:
-            with pa.ipc.new_stream(sink, arrow_schema) as writer:
-                for start in range(0, n_rows, rows_per_batch):
-                    end = min(start + rows_per_batch, n_rows)
-                    # Per-batch int32 cast: small, short-lived (~80 MB).
-                    batch_i32 = arr_uint16[start:end].astype(np.int32)
-                    flat = batch_i32.reshape(-1)
-                    values = pa.array(flat, type=pa.int32())
-                    list_arr = pa.FixedSizeListArray.from_arrays(values, list_size=seq_len)
-                    record_batch = pa.RecordBatch.from_arrays(
-                        [list_arr], names=["input_ids"]
-                    )
-                    writer.write_batch(record_batch)
+        with (
+            pa.OSFile(arrow_path, "wb") as sink,
+            pa.ipc.new_stream(sink, arrow_schema) as writer,
+        ):
+            for start in range(0, n_rows, rows_per_batch):
+                end = min(start + rows_per_batch, n_rows)
+                # Per-batch int32 cast: small, short-lived (~80 MB).
+                batch_i32 = arr_uint16[start:end].astype(np.int32)
+                flat = batch_i32.reshape(-1)
+                values = pa.array(flat, type=pa.int32())
+                list_arr = pa.FixedSizeListArray.from_arrays(values, list_size=seq_len)
+                record_batch = pa.RecordBatch.from_arrays(
+                    [list_arr], names=["input_ids"]
+                )
+                writer.write_batch(record_batch)
 
         with open(os.path.join(path, "dataset_info.json"), "w") as f:
             json.dump(dataset_info, f)

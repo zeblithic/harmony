@@ -17,7 +17,6 @@ import array
 import ctypes
 import gc
 import os
-import resource
 import sys
 
 
@@ -29,13 +28,35 @@ def rss_kb() -> int:
     return -1
 
 
-_libc = ctypes.CDLL("libc.so.6", use_errno=True)
-_libc.malloc_trim.argtypes = [ctypes.c_int]
-_libc.malloc_trim.restype = ctypes.c_int
+# malloc_trim is glibc-specific — fall back to a no-op on macOS/musl so this
+# diagnostic can still run there (it just won't exercise the arena-release
+# path). pyarrow pool release below is cross-platform.
+try:
+    _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    _libc.malloc_trim.argtypes = [ctypes.c_int]
+    _libc.malloc_trim.restype = ctypes.c_int
+
+    def malloc_trim() -> None:
+        _libc.malloc_trim(0)
+except (OSError, AttributeError):
+    def malloc_trim() -> None:
+        pass
 
 
-def malloc_trim() -> None:
-    _libc.malloc_trim(0)
+try:
+    import pyarrow as _pa
+    _pa_pool = _pa.default_memory_pool()
+except (ImportError, AttributeError):
+    _pa_pool = None
+
+
+def release_all() -> None:
+    """Full drain: gc + pyarrow pool + glibc arena trim. Mirrors the path
+    prepare_data.py uses during streaming tokenization."""
+    gc.collect()
+    if _pa_pool is not None:
+        _pa_pool.release_unused()
+    malloc_trim()
 
 
 def report(label: str, n: int, tokens: int, t_start: float) -> None:
@@ -50,7 +71,7 @@ def report(label: str, n: int, tokens: int, t_start: float) -> None:
 
 def scenario_a_text_only(ds, n_docs: int) -> None:
     import time
-    print(f"\n=== A: iterate text only (no tokenizer, no accumulate) ===")
+    print("\n=== A: iterate text only (no tokenizer, no accumulate) ===")
     print(f"  baseline rss={rss_kb()/1024/1024:.2f}GB")
     t0 = time.time()
     n = 0
@@ -67,7 +88,7 @@ def scenario_a_text_only(ds, n_docs: int) -> None:
 
 def scenario_b_tokenize_only(ds, tokenizer, n_docs: int) -> None:
     import time
-    print(f"\n=== B: tokenize each text, discard result ===")
+    print("\n=== B: tokenize each text, discard result ===")
     print(f"  baseline rss={rss_kb()/1024/1024:.2f}GB")
     t0 = time.time()
     n = 0
@@ -88,7 +109,7 @@ def scenario_b_tokenize_only(ds, tokenizer, n_docs: int) -> None:
 
 def scenario_c_accumulate(ds, tokenizer, eos, n_docs: int) -> None:
     import time
-    print(f"\n=== C: tokenize + array.array accumulate (the current path) ===")
+    print("\n=== C: tokenize + array.array accumulate (the current path) ===")
     print(f"  baseline rss={rss_kb()/1024/1024:.2f}GB")
     t0 = time.time()
     stream = array.array("H")
@@ -111,8 +132,10 @@ def scenario_c_accumulate(ds, tokenizer, eos, n_docs: int) -> None:
 
 
 def scenario_d_accumulate_trim(ds, tokenizer, eos, n_docs: int) -> None:
+    """Same as C, but runs the same full drain prepare_data.py uses
+    (gc + pyarrow pool + glibc malloc_trim) every 10k docs."""
     import time
-    print(f"\n=== D: same as C, with malloc_trim(0) + gc.collect() every 10k docs ===")
+    print("\n=== D: same as C, with release_all() every 10k docs ===")
     print(f"  baseline rss={rss_kb()/1024/1024:.2f}GB")
     t0 = time.time()
     stream = array.array("H")
@@ -129,9 +152,8 @@ def scenario_d_accumulate_trim(ds, tokenizer, eos, n_docs: int) -> None:
         n += 1
         if n % 10_000 == 0:
             report("D", n, total_tokens, t0)
-            gc.collect()
-            malloc_trim()
-            print(f"    after gc+trim rss={rss_kb()/1024/1024:.2f}GB")
+            release_all()
+            print(f"    after release_all rss={rss_kb()/1024/1024:.2f}GB")
         if n >= n_docs:
             break
     print(f"  stream len={len(stream):,} final rss={rss_kb()/1024/1024:.2f}GB")
@@ -159,16 +181,16 @@ def main() -> None:
         )
 
     scenario_a_text_only(fresh(), n_docs)
-    gc.collect(); malloc_trim()
-    print(f"between scenarios (post gc+trim) rss={rss_kb()/1024/1024:.2f}GB")
+    release_all()
+    print(f"between scenarios (post release_all) rss={rss_kb()/1024/1024:.2f}GB")
 
     scenario_b_tokenize_only(fresh(), tokenizer, n_docs)
-    gc.collect(); malloc_trim()
-    print(f"between scenarios (post gc+trim) rss={rss_kb()/1024/1024:.2f}GB")
+    release_all()
+    print(f"between scenarios (post release_all) rss={rss_kb()/1024/1024:.2f}GB")
 
     scenario_c_accumulate(fresh(), tokenizer, eos, n_docs)
-    gc.collect(); malloc_trim()
-    print(f"between scenarios (post gc+trim) rss={rss_kb()/1024/1024:.2f}GB")
+    release_all()
+    print(f"between scenarios (post release_all) rss={rss_kb()/1024/1024:.2f}GB")
 
     scenario_d_accumulate_trim(fresh(), tokenizer, eos, n_docs)
 

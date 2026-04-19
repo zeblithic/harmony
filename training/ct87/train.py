@@ -44,14 +44,17 @@ def make_hf_dataloader(
 ) -> Iterator[torch.Tensor]:
     """Infinite dataloader from a pre-tokenized HuggingFace dataset.
 
-    Builds a flat token stream over the on-disk arrow data and yields random
-    windows of [seq_len + 1] tokens packed into batches.
+    Builds a flat int32 token stream over the on-disk arrow data and yields
+    random windows of [seq_len + 1] tokens packed into batches.
 
-    The stream is held as an int32 torch tensor viewing the arrow buffer
-    (12 B per 3 B tokens) instead of a Python list (~108 GB for the same —
-    list[int] + torch.tensor(list) materializes a PyLong per token and OOMs
-    on multi-billion-token corpora). Batches are cast to int64 at yield time
-    for compatibility with nn.Embedding.
+    Per-chunk conversion is zero-copy where arrow dtype already matches int32
+    (the new FixedSizeList prep output), but np.concatenate allocates a single
+    contiguous int32 buffer holding all tokens — peak memory during init is
+    ~4 B/token (12 GB for 3 B tokens) plus whatever arrow pages the OS faults
+    in during the concatenate pass. That buffer backs all_tokens_t for the
+    lifetime of the iterator. The old list[int] path materialized a PyLong
+    per token (~36 B/token; 108 GB for 3 B tokens) and OOM'd at ~1.4 B tokens.
+    Batches are cast to int64 at yield time for nn.Embedding compatibility.
 
     Raises ValueError if the dataset has fewer tokens than seq_len + 1
     (the minimum needed for one input/target pair).
@@ -65,10 +68,15 @@ def make_hf_dataloader(
     # uniformly for FixedSizeList (new prep output) and variable-length List
     # (legacy POC); both expose .values on each chunk as a flat int32 array.
     col = dataset.data.column("input_ids")
-    flat = np.concatenate([
+    chunk_arrays = [
         chunk.values.to_numpy(zero_copy_only=True).astype(np.int32, copy=False)
         for chunk in col.chunks
-    ])
+    ]
+    # A 0-row / 0-chunk dataset (e.g. prep saw fewer tokens than seq_len and
+    # dropped the partial chunk) produces an empty list. np.concatenate([])
+    # would raise its own unhelpful error; fall through to the informative
+    # `total < window` guard below instead.
+    flat = np.concatenate(chunk_arrays) if chunk_arrays else np.empty(0, dtype=np.int32)
     all_tokens_t = torch.from_numpy(flat)
     total = all_tokens_t.numel()
     window = seq_len + 1

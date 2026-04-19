@@ -5,7 +5,7 @@
 # Outputs:
 #   training/logs/prep_<tag>.log          — python stdout/stderr
 #   training/logs/prep_<tag>_rss.csv      — ts,rss_kb,vmhwm_kb,vmpeak_kb,vmsize_kb,state
-set -u
+set -eu
 
 OUT_DIR="${1:?output dir required}"
 MAX_TOKENS="${2:?max-tokens required}"
@@ -14,7 +14,7 @@ VAL_FRAC="${4:-0.01}"
 INTERVAL="${5:-3}"
 
 WT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$WT"
+cd "$WT" || exit 1
 
 TAG="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="training/logs"
