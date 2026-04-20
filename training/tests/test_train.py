@@ -126,6 +126,102 @@ class TestHfDataloaderGuard:
             with pytest.raises(ValueError, match="tokens are needed"):
                 make_hf_dataloader(tmpdir, seq_len=16, batch_size=1)
 
+    def test_rejects_zero_seq_len(self):
+        """make_hf_dataloader fails fast on seq_len=0 rather than silently
+        producing degenerate (batch, 1) windows."""
+        from ct87.train import make_hf_dataloader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="seq_len"):
+                make_hf_dataloader(tmpdir, seq_len=0, batch_size=1)
+
+    def test_rejects_zero_batch_size(self):
+        """batch_size=0 would later crash in torch.stack on an empty list —
+        fail up front with an actionable message."""
+        from ct87.train import make_hf_dataloader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="batch_size"):
+                make_hf_dataloader(tmpdir, seq_len=16, batch_size=0)
+
+    def test_datasetdict_raises_friendly_error(self):
+        """load_from_disk returns a DatasetDict when pointed at a multi-split
+        directory; make_hf_dataloader should fail with an actionable hint
+        instead of an opaque AttributeError on .data."""
+        from ct87.train import make_hf_dataloader
+        from datasets import Dataset, DatasetDict
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dd = DatasetDict(
+                {
+                    "train": Dataset.from_dict({"input_ids": [[1, 2, 3, 4]]}),
+                    "val": Dataset.from_dict({"input_ids": [[5, 6, 7, 8]]}),
+                }
+            )
+            dd.save_to_disk(tmpdir)
+            with pytest.raises(ValueError, match="DatasetDict"):
+                make_hf_dataloader(tmpdir, seq_len=2, batch_size=1)
+
+    def test_zero_rows_raises_friendly_error(self):
+        """A valid-but-empty dataset raises the informative ValueError instead
+        of numpy's `need at least one array to concatenate`. This case hits
+        when prepare_data saw fewer tokens than seq_len and dropped the whole
+        stream as an incomplete trailing chunk."""
+        import json
+        import os
+
+        import pyarrow as pa
+
+        from ct87.train import make_hf_dataloader
+
+        seq_len = 8
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Write a valid-but-empty HF dataset in the same format our prep
+            # produces: one streaming-IPC arrow file with zero record batches,
+            # plus the dataset_info.json / state.json sidecars.
+            arrow_path = os.path.join(tmpdir, "data-00000-of-00001.arrow")
+            schema = pa.schema(
+                [pa.field("input_ids", pa.list_(pa.int32(), list_size=seq_len))]
+            )
+            with (
+                pa.OSFile(arrow_path, "wb") as sink,
+                pa.ipc.new_stream(sink, schema),
+            ):
+                pass  # no batches written → 0-row dataset
+            with open(os.path.join(tmpdir, "dataset_info.json"), "w") as f:
+                json.dump(
+                    {
+                        "citation": "",
+                        "description": "",
+                        "features": {
+                            "input_ids": {
+                                "feature": {"dtype": "int32", "_type": "Value"},
+                                "length": seq_len,
+                                "_type": "Sequence",
+                            }
+                        },
+                        "homepage": "",
+                        "license": "",
+                    },
+                    f,
+                )
+            with open(os.path.join(tmpdir, "state.json"), "w") as f:
+                json.dump(
+                    {
+                        "_data_files": [{"filename": "data-00000-of-00001.arrow"}],
+                        "_fingerprint": "empty",
+                        "_format_columns": None,
+                        "_format_kwargs": {},
+                        "_format_type": None,
+                        "_output_all_columns": False,
+                        "_split": None,
+                    },
+                    f,
+                )
+
+            with pytest.raises(ValueError, match="tokens are needed"):
+                make_hf_dataloader(tmpdir, seq_len=seq_len, batch_size=1)
+
 
 class TestValidation:
     def test_returns_finite_float(self):

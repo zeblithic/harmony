@@ -44,22 +44,60 @@ def make_hf_dataloader(
 ) -> Iterator[torch.Tensor]:
     """Infinite dataloader from a pre-tokenized HuggingFace dataset.
 
-    Loads the dataset eagerly, concatenates all token sequences into one
-    long stream, then returns an iterator that yields random windows of
-    [seq_len + 1] tokens packed into batches.
+    Builds a flat int32 token stream over the on-disk arrow data and yields
+    random windows of [seq_len + 1] tokens packed into batches.
+
+    Per-chunk conversion is zero-copy where arrow dtype already matches int32
+    (the new FixedSizeList prep output), but np.concatenate allocates a single
+    contiguous int32 buffer holding all tokens — peak memory during init is
+    ~4 B/token (12 GB for 3 B tokens) plus whatever arrow pages the OS faults
+    in during the concatenate pass. That buffer backs all_tokens_t for the
+    lifetime of the iterator. The old list[int] path materialized a PyLong
+    per token (~36 B/token; 108 GB for 3 B tokens) and OOM'd at ~1.4 B tokens.
+    Batches are cast to int64 at yield time for nn.Embedding compatibility.
 
     Raises ValueError if the dataset has fewer tokens than seq_len + 1
     (the minimum needed for one input/target pair).
     """
-    from datasets import load_from_disk
+    # Fail fast on nonsense shape args. Without these, seq_len=0 slips
+    # through as window=1 and yields degenerate (B, 1) batches, and
+    # batch_size=0 only surfaces later as a cryptic torch.stack on an
+    # empty list.
+    if not isinstance(seq_len, int) or seq_len <= 0:
+        raise ValueError(f"seq_len must be a positive integer, got {seq_len!r}")
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+
+    import numpy as np
+    from datasets import DatasetDict, load_from_disk
 
     dataset = load_from_disk(data_path)
-    all_tokens: list[int] = []
-    for example in dataset:
-        all_tokens.extend(example["input_ids"])
-
-    all_tokens_t = torch.tensor(all_tokens, dtype=torch.long)
-    total = len(all_tokens_t)
+    # load_from_disk returns a DatasetDict when data_path points at a
+    # multi-split container. Our callers always want a single split — fail
+    # with an actionable hint rather than an opaque AttributeError on .data.
+    if isinstance(dataset, DatasetDict):
+        splits = ", ".join(dataset.keys())
+        raise ValueError(
+            f"load_from_disk({data_path!r}) returned a DatasetDict with splits "
+            f"[{splits}]. Pass a split directory such as {data_path}/train or "
+            f"{data_path}/val instead."
+        )
+    # Drop to the underlying pyarrow table to bypass HF 4.8's Column wrapper
+    # (which no longer returns numpy directly even with set_format). Works
+    # uniformly for FixedSizeList (new prep output) and variable-length List
+    # (legacy POC); both expose .values on each chunk as a flat int32 array.
+    col = dataset.data.column("input_ids")
+    chunk_arrays = [
+        chunk.values.to_numpy(zero_copy_only=True).astype(np.int32, copy=False)
+        for chunk in col.chunks
+    ]
+    # A 0-row / 0-chunk dataset (e.g. prep saw fewer tokens than seq_len and
+    # dropped the partial chunk) produces an empty list. np.concatenate([])
+    # would raise its own unhelpful error; fall through to the informative
+    # `total < window` guard below instead.
+    flat = np.concatenate(chunk_arrays) if chunk_arrays else np.empty(0, dtype=np.int32)
+    all_tokens_t = torch.from_numpy(flat)
+    total = all_tokens_t.numel()
     window = seq_len + 1
 
     if total < window:
@@ -70,12 +108,17 @@ def make_hf_dataloader(
         )
 
     def _iter() -> Iterator[torch.Tensor]:
+        # Keeps the arrow table and the concatenated buffer alive for the
+        # lifetime of the iterator (torch.from_numpy refs the numpy array, but
+        # holding `dataset` explicitly is defensive insurance against HF's
+        # internals closing mmap handles mid-run).
+        _keep_alive = (dataset, flat)  # noqa: F841
         rng = torch.Generator()
         rng.manual_seed(seed)
         while True:
             starts = torch.randint(0, total - window + 1, (batch_size,), generator=rng)
             batch = torch.stack([all_tokens_t[s : s + window] for s in starts])
-            yield batch
+            yield batch.to(torch.long)
 
     return _iter()
 

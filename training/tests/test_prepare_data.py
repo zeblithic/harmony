@@ -85,6 +85,48 @@ class TestSplitChunks:
         assert len(val) == 0
 
 
+class TestParameterValidation:
+    """run_prepare_data should reject nonsense parameters BEFORE the expensive
+    tokenization pass — discovering seq_len=0 or val_fraction=1.5 three hours
+    into a 3 B-token prep would be very expensive."""
+
+    def test_rejects_zero_seq_len(self):
+        import tempfile as _t
+
+        from ct87.prepare_data import run_prepare_data
+
+        with _t.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="seq_len"):
+                run_prepare_data(output_dir=tmpdir, seq_len=0)
+
+    def test_rejects_negative_seq_len(self):
+        import tempfile as _t
+
+        from ct87.prepare_data import run_prepare_data
+
+        with _t.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="seq_len"):
+                run_prepare_data(output_dir=tmpdir, seq_len=-1)
+
+    def test_rejects_negative_val_fraction(self):
+        import tempfile as _t
+
+        from ct87.prepare_data import run_prepare_data
+
+        with _t.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="val_fraction"):
+                run_prepare_data(output_dir=tmpdir, val_fraction=-0.1)
+
+    def test_rejects_full_val_fraction(self):
+        import tempfile as _t
+
+        from ct87.prepare_data import run_prepare_data
+
+        with _t.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="val_fraction"):
+                run_prepare_data(output_dir=tmpdir, val_fraction=1.0)
+
+
 class TestEndToEnd:
     @pytest.mark.network
     def test_smoke_prepare_data(self):
