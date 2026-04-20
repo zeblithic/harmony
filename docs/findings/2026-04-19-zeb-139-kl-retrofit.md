@@ -12,6 +12,8 @@
 
 **Adding a Memory-Decoder-style `KL(P_router || P_teacher)` term at λ=0.5 did NOT escape the maximum-entropy attractor on the cross-arch TinyLlama setup.** Both the real-oracle and shuffled-oracle KL+router cells converged to essentially identical val_loss (4.5636 vs 4.5637, Δ-diff = -0.0001 nats) and produced a router output with `cross_run_cos = +0.9999` between the two cells — the smoking gun for the cheap-win confound. KL forced both routers to the same content-independent average distribution rather than learning per-position content routing.
 
+**The λ=0.9 closure run (spec §12 q1) confirmed the verdict** with stronger signature: `cross_run_cos = +1.0000` (rounds to bit-exact), val_loss got *worse* (+0.027 nats over λ=0.5; +0.036 nats over the no-KL baseline), and the optimization shifted regime (g5 alpha goes negative under λ=0.9 vs positive under λ=0.5) but produced the same content-blind result. Higher KL pressure intensifies the cheap-win lever rather than escaping the attractor. **The KL-only axis at 40M is closed.**
+
 **Per spec §11 outer matrix this is the "KL-retrofit attractor HOLDS" outcome.** Combined with whatever ZEB-138 produces on the orthogonal teacher-architecture axis, it points toward either teacher-arch dominance (if ZEB-138 breaks) or a structural ceiling at 40M (if ZEB-138 also holds — Gemini §7 steelman).
 
 ---
@@ -126,9 +128,12 @@ ZEB-138's verdict is pending KRILE's Harmony-474M handoff and the corresponding 
 
 ## Open questions and next-step recommendations
 
-### 1. λ-sweep (spec §12 question 1)
+### 1. λ-sweep (spec §12 question 1) — DONE, see "λ=0.9 closure run" section below
 
-The spec says "If no break at 0.5, try 0.9 once before concluding." This is worth doing for completeness, but the `cross_run_cos = +0.9999` result strongly suggests a higher λ would just intensify the convergence to the average distribution — it cranks up the same lever that's already saturating. **Recommendation: run a single λ=0.9 cell-3 + cell-4 pair (~30 min on AVALON) to nail down the λ-sensitivity signal, then close the door on the KL-only axis at 40M.**
+The spec said "If no break at 0.5, try 0.9 once before concluding." Completed
+2026-04-19; results in the new "λ=0.9 closure run" section. Net: the higher λ
+intensified the cheap-win signature exactly as predicted (`cross_run_cos`
+1.0000, val_loss worse). KL-only axis at 40M is closed.
 
 ### 2. Same-arch teacher + KL (spec §10 follow-up)
 
@@ -144,6 +149,70 @@ Worth flagging that KL did monotonically decrease (1.27 → 1.22) and `max LM-he
 
 ---
 
+## λ=0.9 closure run
+
+Per spec §12 q1 ("if no break at 0.5, try 0.9 once before concluding"), reran
+cells 3+4 with `--kl-lambda 0.9`. Same setup otherwise (same data, same
+checkpoints-init-from, same seeds, same code). Wall time ~30 min.
+
+### Full λ-sweep matrix (cells 3+4 only — cells 1+2 are router-off, λ-independent)
+
+| λ | Cell 3 (real) | Cell 4 (shuf) | Δ-diff (real − shuf) | Δ vs no-KL baseline (cell 3) |
+| --- | --- | --- | --- | --- |
+| 0 (ZEB-136 router-on) | 4.5545 | 4.5543 | +0.0002 | — |
+| 0.5 | 4.5636 | 4.5637 | −0.0001 | +0.009 |
+| **0.9** | **4.5907** | **4.5912** | **−0.0005** | **+0.036** |
+
+**Two clean monotonic patterns**:
+1. Higher λ → val_loss strictly worse. KL pressure increasingly hurts the LM
+   objective at every step up the λ ladder.
+2. Δ-diff stays at noise across all λ values. **No content-dependence emerges
+   regardless of how hard we crank the KL lever.** This is the dispositive
+   answer to spec §12 q1.
+
+### Forensic fingerprint comparison (skip-to-logit probe)
+
+Pulled from `forensics/router_on_kl09.txt`:
+
+```text
+real: log_alpha=-1.7362  alpha=exp=0.1762  ||W_align||_F=0.5786
+shuf: log_alpha=-1.7377  alpha=exp=0.1759  ||W_align||_F=0.5709
+
+cross_run_cos engram_logits  =  +1.0000
+max LM-head row |cos|        =  0.9257
+engram_logit_entropy (nats)  =  10.3039  (log(vocab) = 10.3735)
+```
+
+| Metric | ZEB-136 (no KL) | λ=0.5 | **λ=0.9** | Trend |
+| --- | --- | --- | --- | --- |
+| `α` (real) | 0.1644 | 0.1762 | **0.1762** | Saturated in attractor band, λ-independent above 0.5 |
+| `‖W_align‖_F` (real) | 1.91 | 1.35 | **0.58** | Monotonically smaller — KL keeps the projection more contained at higher λ |
+| `cross_run_cos` | +0.7979 | +0.9999 | **+1.0000** | Higher λ → more perfect collapse to identical content-blind output |
+| `max LM-head row \|cos\|` | 0.22 | 0.78 | **0.93** | Router aligns with one average LM-head direction more strongly |
+| `engram_logit_entropy` (Δ from log V) | 0.0000 | 0.027 | **0.069** | Slowly moving away from log V but still well above the 0.1 break threshold |
+
+### Optimization-regime shift, same destination
+
+One curiosity: the L5 engram gate's behavior changes sign across λ. At λ=0.5,
+g5 (the post-tanh L5 gate alpha) grew positive (+0.40 at step 1800). At
+λ=0.9, g5 went negative (-0.41 at step 1500). The router under λ=0.9 is
+*subtracting* the L5 engram contribution from the hidden state instead of
+adding it — a different optimization regime entirely. Yet both regimes land
+at the same content-independent average distribution at the router's output
+(`cross_run_cos` = +1.0000). This further suggests the destination ("match
+the corpus average teacher distribution") is robust across optimizer
+trajectories, and that varying λ just changes HOW the model gets to the
+same useless attractor, not WHETHER.
+
+### Verdict
+
+KL-only axis at 40M is **definitively closed**. Higher λ intensifies the
+cheap-win lever but does not unlock content routing. ZEB-139's row of the
+spec §11 outer matrix is locked in as "Holds". Next move depends on
+ZEB-138's verdict (see open question §2 above).
+
+---
+
 ## Artifacts
 
 All under `/home/zebli/work/LOCAL/zeb139/`:
@@ -151,10 +220,10 @@ All under `/home/zebli/work/LOCAL/zeb139/`:
 - **Oracle**: `artifacts/oracle_tinyllama_10k.safetensors` (4.9 MB, [10K, 128] f32) and `_shuffled_seed0.safetensors`
 - **Teacher-logits sidecar**: `artifacts/oracle_tinyllama_10k_teacher_logits.safetensors` (611 MB, [10K, 32K] bf16) and `_shuffled_seed0_teacher_logits.safetensors`
 - **Stats**: `artifacts/oracle_tinyllama_10k.safetensors.stats.json` (PCA explained variance, populated rows, hash seeds)
-- **Per-cell training logs (CSV)**: `logs/run{1..4}_*.csv` (200 rows × 36 columns each, including the new `kl_loss` column)
-- **Per-cell checkpoints**: `checkpoints/zeb139_router_{off,on}_{real,shuf}{,_kl}/checkpoint.pt`
-- **Forensic outputs**: `forensics/router_off_no_kl.txt` (full 10-probe battery, pair A) and `forensics/router_on_kl.txt` (skip-to-logit diagnostics, pair B)
-- **Scripts**: `scripts/shuffle_oracle_and_sidecar.py`, `scripts/run_4cell_matrix.sh` (cells 1-4), `scripts/run_cells_3_and_4.sh` (re-run after stale-checkout fix), `scripts/run_forensics.sh`
+- **Per-cell training logs (CSV)**: `logs/run{1..4}_*.csv` (λ=0.5) and `logs/run{3,4}_router_on_{real,shuf}_kl09.csv` (λ=0.9 closure), 200 rows × 36 columns each, including the `kl_loss` column
+- **Per-cell checkpoints**: `checkpoints/zeb139_router_{off,on}_{real,shuf}{,_kl,_kl09}/checkpoint.pt`
+- **Forensic outputs**: `forensics/router_off_no_kl.txt` (full 10-probe battery, pair A), `forensics/router_on_kl.txt` (skip-to-logit diagnostics, λ=0.5), `forensics/router_on_kl09.txt` (skip-to-logit diagnostics, λ=0.9 closure)
+- **Scripts**: `scripts/shuffle_oracle_and_sidecar.py`, `scripts/run_4cell_matrix.sh` (cells 1-4), `scripts/run_cells_3_and_4.sh` (re-run after stale-checkout fix), `scripts/run_cells_3_and_4_lambda09.sh` (λ=0.9 closure), `scripts/run_forensics.sh`
 
 ZEB-136's prior forensics (`/home/zebli/work/LOCAL/zeb136/forensics/router_on.txt`) are the direct comparison point for the ZEB-139 (KL+CE) vs ZEB-136 (CE-only) contrast.
 
