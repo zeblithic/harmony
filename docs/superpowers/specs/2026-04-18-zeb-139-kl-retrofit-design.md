@@ -1,6 +1,6 @@
 # ZEB-139 — KL-Retrofit Objective-Axis Experiment (Design Spec)
 
-> **STATUS: DRAFT — blocked on PR #254 merge + teacher-logits extension.** This spec is written during the ZEB-137/138 wait so the experiment can launch immediately once the prereq PRs land on main. AVALON can execute end-to-end in ~4-6h once unblocked.
+> **STATUS: COMPLETE — see findings at `docs/findings/2026-04-19-zeb-139-kl-retrofit.md`.** Verdict: **attractor HOLDS** under λ=0.5 KL+CE on the cross-arch TinyLlama setup. `cross_run_cos = +0.9999` between the real-oracle and shuffled-oracle KL+router cells confirms the cheap-win confound (KL forces both routers to the same content-independent average distribution). Combined with ZEB-138's pending verdict, this fills the "KL-retrofit Holds" cell of the spec §11 outer matrix.
 
 **Linear:** [ZEB-139](https://linear.app/zeblith/issue/ZEB-139/kl-retrofit-experiment-objective-axis-diagnostic-for-engram-attractor)
 **Parent:** [ZEB-102](https://linear.app/zeblith/issue/ZEB-102)
