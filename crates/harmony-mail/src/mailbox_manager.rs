@@ -875,12 +875,13 @@ impl MailboxManager {
             read: false,
         };
 
-        // Load head page (or create one if folder has no pages)
+        // Load head page (or create one if folder has no pages).
+        // Pages are self-contained — folder.page_cids is the canonical index,
+        // see the wire-format policy doc for the ZEB-101 rationale.
         if folder.page_cids.is_empty() {
             // No pages yet — create one with just this entry
             let page = MailPage {
                 version: crate::mailbox::MAILBOX_VERSION,
-                next_page: None,
                 entries: vec![entry],
             };
             let page_cid = self.cas_ingest(&page.to_bytes()?)?;
@@ -895,7 +896,6 @@ impl MailboxManager {
                 // The old head page becomes the second page (unchanged in CAS).
                 let new_page = MailPage {
                     version: crate::mailbox::MAILBOX_VERSION,
-                    next_page: Some(head_cid),
                     entries: vec![entry],
                 };
                 let new_page_cid = self.cas_ingest(&new_page.to_bytes()?)?;
@@ -903,8 +903,6 @@ impl MailboxManager {
             } else {
                 // Prepend to existing head page
                 head_page.entries.insert(0, entry);
-                // Update next_page pointer if there's a following page
-                head_page.next_page = folder.page_cids.get(1).copied();
                 let new_head_cid = self.cas_ingest(&head_page.to_bytes()?)?;
                 folder.page_cids[0] = new_head_cid;
             }
