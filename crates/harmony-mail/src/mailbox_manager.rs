@@ -789,20 +789,13 @@ impl MailboxManager {
             .unwrap_or_default()
             .as_secs();
 
-        // Create an empty page (shared by all empty folders)
-        let empty_page = MailPage::new_empty();
-        let page_bytes = empty_page.to_bytes()?;
-        let page_cid = self.cas_ingest(&page_bytes)?;
-
-        // Create 4 empty folders, each pointing to the empty page
+        // Create 4 empty folders with no pages. insert_message handles the
+        // first-page creation when page_cids is empty — seeding a sentinel
+        // page here would waste a CAS ingest and leave orphaned "0-entry
+        // page" blobs the first time each folder receives mail.
         let mut folder_cids = [[0u8; CID_LEN]; FOLDER_COUNT];
         for folder_cid in &mut folder_cids {
-            let folder = MailFolder {
-                version: crate::mailbox::MAILBOX_VERSION,
-                message_count: 0,
-                unread_count: 0,
-                page_cids: vec![page_cid],
-            };
+            let folder = MailFolder::new_empty();
             let folder_bytes = folder.to_bytes()?;
             *folder_cid = self.cas_ingest(&folder_bytes)?;
         }
@@ -1175,7 +1168,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(folder.message_count as usize, PAGE_CAPACITY);
-        // The initial empty page + PAGE_CAPACITY replacements = still 1 page CID
+        // One page created on first insert, rewritten each time it stays
+        // under PAGE_CAPACITY — still 1 page CID after filling it.
         assert_eq!(folder.page_cids.len(), 1);
 
         // Insert one more — should trigger page split
