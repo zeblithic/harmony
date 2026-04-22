@@ -814,7 +814,7 @@ impl MailboxManager {
             updated_at: now,
             folders: folder_cids,
         };
-        let root_bytes = root.to_bytes();
+        let root_bytes = root.to_bytes()?;
         let root_cid = self.cas_ingest(&root_bytes)?;
 
         self.persist_root(address, &root_cid)?;
@@ -921,7 +921,7 @@ impl MailboxManager {
             .unwrap_or_default()
             .as_secs();
         let new_root = root.with_folder(FolderKind::Inbox, new_folder_cid, now);
-        let new_root_cid = self.cas_ingest(&new_root.to_bytes())?;
+        let new_root_cid = self.cas_ingest(&new_root.to_bytes()?)?;
 
         // Persist
         self.persist_root(user_address, &new_root_cid)?;
