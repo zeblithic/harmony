@@ -14,13 +14,18 @@
 //!   └─ pages: [MailPage CID, ...]
 //!
 //! MailPage (up to PAGE_CAPACITY message entries)
-//!   ├─ entries: [MessageEntry, ...]
-//!   └─ next: Option<MailPage CID>
+//!   └─ entries: [MessageEntry, ...]
 //! ```
 //!
 //! All objects are serialized to bytes, stored via harmony-content, and
 //! referenced by their 32-byte CID. The root CID is the only mutable
 //! pointer; everything else is immutable.
+//!
+//! Page navigation is folder-driven: `MailFolder.page_cids` is the canonical
+//! ordered index of pages in a folder. Pages themselves carry no linked-list
+//! pointer — see the wire-format policy in
+//! `docs/superpowers/specs/2026-04-22-mailbox-wire-format-policy.md` for the
+//! rationale (ZEB-101).
 
 use crate::error::MailboxError;
 use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
@@ -154,7 +159,14 @@ impl MailRoot {
         self
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, MailboxError> {
+        // Writers pin to the current version (see wire-format policy).
+        // Reject any in-memory struct whose version doesn't match so the
+        // caller's bug surfaces here instead of producing bytes no decoder
+        // will accept.
+        if self.version != MAILBOX_VERSION {
+            return Err(MailboxError::UnsupportedVersion(self.version));
+        }
         let mut buf = Vec::with_capacity(Self::WIRE_SIZE);
         buf.extend_from_slice(&ROOT_MAGIC);
         buf.push(MAILBOX_VERSION);
@@ -163,7 +175,7 @@ impl MailRoot {
         for folder_cid in &self.folders {
             buf.extend_from_slice(folder_cid);
         }
-        buf
+        Ok(buf)
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, MailboxError> {
@@ -251,6 +263,9 @@ impl MailFolder {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, MailboxError> {
+        if self.version != MAILBOX_VERSION {
+            return Err(MailboxError::UnsupportedVersion(self.version));
+        }
         if self.unread_count > self.message_count {
             return Err(MailboxError::TooManyEntries {
                 count: self.unread_count as usize,
@@ -461,35 +476,30 @@ impl MessageEntry {
 
 /// A page of message entries within a folder.
 ///
-/// NOTE: The folder's `page_cids` array is the canonical page index.
-/// The `next_page` field provides redundant linked-list traversal and
-/// must stay in sync with `page_cids` ordering. See ZEB-101 for the
-/// decision on whether to remove this dual linkage.
+/// Pages are self-contained: the enclosing `MailFolder.page_cids` array is
+/// the single source of truth for page ordering. See the wire-format policy
+/// doc for the ZEB-101 rationale.
 ///
 /// Wire format:
 /// ```text
 /// [4] magic ("MPAG")
 /// [1] version
-/// [1] has_next (0x00 | 0x01)
-/// [32?] next_page_cid (if has_next)
 /// [2] entry_count (big-endian u16)
 /// [variable * N] entries (MessageEntry wire format)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailPage {
     pub version: u8,
-    pub next_page: Option<[u8; CID_LEN]>,
     pub entries: Vec<MessageEntry>,
 }
 
 impl MailPage {
-    const MIN_SIZE: usize = 4 + 1 + 1 + 2; // magic + version + has_next + entry_count
+    const MIN_SIZE: usize = 4 + 1 + 2; // magic + version + entry_count
 
-    /// Create an empty page with no next link.
+    /// Create an empty page.
     pub fn new_empty() -> Self {
         Self {
             version: MAILBOX_VERSION,
-            next_page: None,
             entries: Vec::new(),
         }
     }
@@ -500,6 +510,9 @@ impl MailPage {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, MailboxError> {
+        if self.version != MAILBOX_VERSION {
+            return Err(MailboxError::UnsupportedVersion(self.version));
+        }
         if self.entries.len() > PAGE_CAPACITY {
             return Err(MailboxError::TooManyEntries {
                 count: self.entries.len(),
@@ -516,15 +529,6 @@ impl MailPage {
         let mut buf = Vec::with_capacity(256);
         buf.extend_from_slice(&PAGE_MAGIC);
         buf.push(MAILBOX_VERSION);
-
-        match &self.next_page {
-            Some(cid) => {
-                buf.push(0x01);
-                buf.extend_from_slice(cid);
-            }
-            None => buf.push(0x00),
-        }
-
         buf.extend_from_slice(&count.to_be_bytes());
         for entry in &self.entries {
             buf.extend_from_slice(&entry.to_bytes());
@@ -554,35 +558,6 @@ impl MailPage {
         }
 
         let mut pos = 5;
-        let has_next = data[pos];
-        pos += 1;
-
-        let next_page = match has_next {
-            0x00 => None,
-            0x01 => {
-                if data.len() < pos + CID_LEN {
-                    return Err(MailboxError::Truncated {
-                        expected: (pos + CID_LEN) - data.len(),
-                    });
-                }
-                let mut cid = [0u8; CID_LEN];
-                cid.copy_from_slice(&data[pos..pos + CID_LEN]);
-                pos += CID_LEN;
-                Some(cid)
-            }
-            _ => {
-                return Err(MailboxError::InvalidFlag {
-                    field: "has_next",
-                    value: has_next,
-                });
-            }
-        };
-
-        if data.len() < pos + 2 {
-            return Err(MailboxError::Truncated {
-                expected: (pos + 2) - data.len(),
-            });
-        }
         let entry_count = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
 
@@ -608,7 +583,6 @@ impl MailPage {
 
         Ok(Self {
             version,
-            next_page,
             entries,
         })
     }
@@ -653,7 +627,7 @@ mod tests {
             updated_at: 1744403200,
             folders: [dummy_cid(1), dummy_cid(2), dummy_cid(3), dummy_cid(4)],
         };
-        let bytes = root.to_bytes();
+        let bytes = root.to_bytes().unwrap();
         assert_eq!(bytes.len(), MailRoot::WIRE_SIZE);
         let decoded = MailRoot::from_bytes(&bytes).unwrap();
         assert_eq!(root, decoded);
@@ -662,7 +636,7 @@ mod tests {
     #[test]
     fn mail_root_rejects_trailing_bytes() {
         let root = MailRoot::new_empty(dummy_address(), 100);
-        let mut bytes = root.to_bytes();
+        let mut bytes = root.to_bytes().unwrap();
         bytes.push(0xFF);
         assert!(matches!(
             MailRoot::from_bytes(&bytes),
@@ -672,7 +646,7 @@ mod tests {
 
     #[test]
     fn mail_root_rejects_bad_magic() {
-        let mut bytes = MailRoot::new_empty(dummy_address(), 100).to_bytes();
+        let mut bytes = MailRoot::new_empty(dummy_address(), 100).to_bytes().unwrap();
         bytes[0] = b'X';
         assert!(matches!(
             MailRoot::from_bytes(&bytes),
@@ -683,7 +657,7 @@ mod tests {
     #[test]
     fn mail_root_empty() {
         let root = MailRoot::new_empty(dummy_address(), 1744403200);
-        let bytes = root.to_bytes();
+        let bytes = root.to_bytes().unwrap();
         let decoded = MailRoot::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.folders, [EMPTY_CID; FOLDER_COUNT]);
     }
@@ -763,7 +737,6 @@ mod tests {
     fn mail_page_roundtrip() {
         let page = MailPage {
             version: MAILBOX_VERSION,
-            next_page: Some(dummy_cid(0xAA)),
             entries: vec![dummy_entry(1), dummy_entry(2), dummy_entry(3)],
         };
         let bytes = page.to_bytes().unwrap();
@@ -772,35 +745,18 @@ mod tests {
     }
 
     #[test]
-    fn mail_page_no_next() {
-        let page = MailPage {
-            version: MAILBOX_VERSION,
-            next_page: None,
-            entries: vec![dummy_entry(5)],
-        };
+    fn mail_page_empty_roundtrip() {
+        let page = MailPage::new_empty();
         let bytes = page.to_bytes().unwrap();
         let decoded = MailPage::from_bytes(&bytes).unwrap();
-        assert!(decoded.next_page.is_none());
-        assert_eq!(decoded.entries.len(), 1);
-    }
-
-    #[test]
-    fn mail_page_rejects_invalid_has_next() {
-        let page = MailPage::new_empty();
-        let mut bytes = page.to_bytes().unwrap();
-        // has_next byte is at offset 5 (after magic + version)
-        bytes[5] = 0x02;
-        assert!(matches!(
-            MailPage::from_bytes(&bytes),
-            Err(MailboxError::InvalidFlag { field: "has_next", value: 0x02 })
-        ));
+        assert_eq!(decoded, page);
+        assert!(decoded.entries.is_empty());
     }
 
     #[test]
     fn mail_page_rejects_trailing_bytes() {
         let page = MailPage {
             version: MAILBOX_VERSION,
-            next_page: None,
             entries: vec![dummy_entry(1)],
         };
         let mut bytes = page.to_bytes().unwrap();
@@ -848,12 +804,11 @@ mod tests {
     fn mail_page_rejects_entry_count_over_capacity() {
         let page = MailPage {
             version: MAILBOX_VERSION,
-            next_page: None,
             entries: vec![dummy_entry(1)],
         };
         let mut bytes = page.to_bytes().unwrap();
-        // entry_count is a u16 at offset 6 (magic:4 + version:1 + has_next:1)
-        let count_offset = 6;
+        // entry_count is a u16 at offset 5 (magic:4 + version:1)
+        let count_offset = 5;
         let bad_count = (PAGE_CAPACITY as u16) + 1;
         bytes[count_offset..count_offset + 2].copy_from_slice(&bad_count.to_be_bytes());
         assert!(matches!(
@@ -913,5 +868,42 @@ mod tests {
         // 4-byte char: 😀 = F0 9F 98 80
         assert_eq!(truncate_utf8("a😀b", 2), "a");
         assert_eq!(truncate_utf8("a😀b", 5), "a😀");
+    }
+
+    // ── Writer-side version pinning ────────────────────────────────────
+    // The wire-format policy requires encoders to reject any in-memory
+    // struct whose `version` field doesn't match the current constant.
+    // These tests lock the guardrail in place — removing the version check
+    // from any to_bytes method must surface as a test failure, not as a
+    // silently miscoded blob.
+
+    #[test]
+    fn mail_root_to_bytes_rejects_mismatched_version() {
+        let mut root = MailRoot::new_empty(dummy_address(), 1);
+        root.version = MAILBOX_VERSION.wrapping_add(1);
+        assert!(matches!(
+            root.to_bytes(),
+            Err(MailboxError::UnsupportedVersion(v)) if v == MAILBOX_VERSION.wrapping_add(1)
+        ));
+    }
+
+    #[test]
+    fn mail_folder_to_bytes_rejects_mismatched_version() {
+        let mut folder = MailFolder::new_empty();
+        folder.version = MAILBOX_VERSION.wrapping_add(1);
+        assert!(matches!(
+            folder.to_bytes(),
+            Err(MailboxError::UnsupportedVersion(v)) if v == MAILBOX_VERSION.wrapping_add(1)
+        ));
+    }
+
+    #[test]
+    fn mail_page_to_bytes_rejects_mismatched_version() {
+        let mut page = MailPage::new_empty();
+        page.version = MAILBOX_VERSION.wrapping_add(1);
+        assert!(matches!(
+            page.to_bytes(),
+            Err(MailboxError::UnsupportedVersion(v)) if v == MAILBOX_VERSION.wrapping_add(1)
+        ));
     }
 }

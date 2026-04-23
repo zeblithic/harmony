@@ -2,6 +2,18 @@
 //!
 //! Binary wire format for HarmonyMessage -- the internal representation used
 //! after SMTP ingress and before Reticulum/Zenoh transport.
+//!
+//! ## Wire form = delivery form (ZEB-100)
+//!
+//! This format is the *delivery* serialization. BCC recipients are stripped
+//! from the bytes on encode and rejected on decode — there is no separate
+//! canonical-with-BCC wire form. BCC tracking for the sender's "sent" folder
+//! view, audit logs, or resend flows lives out of band (local state only) and
+//! never hits the content-addressed store. A forged or replayed blob
+//! therefore cannot reintroduce hidden recipients into client-visible state.
+//!
+//! See `docs/superpowers/specs/2026-04-22-mailbox-wire-format-policy.md` for
+//! the evolution rules governing this format.
 
 use crate::error::MailboxError;
 

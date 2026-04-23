@@ -789,20 +789,13 @@ impl MailboxManager {
             .unwrap_or_default()
             .as_secs();
 
-        // Create an empty page (shared by all empty folders)
-        let empty_page = MailPage::new_empty();
-        let page_bytes = empty_page.to_bytes()?;
-        let page_cid = self.cas_ingest(&page_bytes)?;
-
-        // Create 4 empty folders, each pointing to the empty page
+        // Create 4 empty folders with no pages. insert_message handles the
+        // first-page creation when page_cids is empty — seeding a sentinel
+        // page here would waste a CAS ingest and leave orphaned "0-entry
+        // page" blobs the first time each folder receives mail.
         let mut folder_cids = [[0u8; CID_LEN]; FOLDER_COUNT];
         for folder_cid in &mut folder_cids {
-            let folder = MailFolder {
-                version: crate::mailbox::MAILBOX_VERSION,
-                message_count: 0,
-                unread_count: 0,
-                page_cids: vec![page_cid],
-            };
+            let folder = MailFolder::new_empty();
             let folder_bytes = folder.to_bytes()?;
             *folder_cid = self.cas_ingest(&folder_bytes)?;
         }
@@ -814,7 +807,7 @@ impl MailboxManager {
             updated_at: now,
             folders: folder_cids,
         };
-        let root_bytes = root.to_bytes();
+        let root_bytes = root.to_bytes()?;
         let root_cid = self.cas_ingest(&root_bytes)?;
 
         self.persist_root(address, &root_cid)?;
@@ -875,12 +868,13 @@ impl MailboxManager {
             read: false,
         };
 
-        // Load head page (or create one if folder has no pages)
+        // Load head page (or create one if folder has no pages).
+        // Pages are self-contained — folder.page_cids is the canonical index,
+        // see the wire-format policy doc for the ZEB-101 rationale.
         if folder.page_cids.is_empty() {
             // No pages yet — create one with just this entry
             let page = MailPage {
                 version: crate::mailbox::MAILBOX_VERSION,
-                next_page: None,
                 entries: vec![entry],
             };
             let page_cid = self.cas_ingest(&page.to_bytes()?)?;
@@ -895,7 +889,6 @@ impl MailboxManager {
                 // The old head page becomes the second page (unchanged in CAS).
                 let new_page = MailPage {
                     version: crate::mailbox::MAILBOX_VERSION,
-                    next_page: Some(head_cid),
                     entries: vec![entry],
                 };
                 let new_page_cid = self.cas_ingest(&new_page.to_bytes()?)?;
@@ -903,8 +896,6 @@ impl MailboxManager {
             } else {
                 // Prepend to existing head page
                 head_page.entries.insert(0, entry);
-                // Update next_page pointer if there's a following page
-                head_page.next_page = folder.page_cids.get(1).copied();
                 let new_head_cid = self.cas_ingest(&head_page.to_bytes()?)?;
                 folder.page_cids[0] = new_head_cid;
             }
@@ -923,7 +914,7 @@ impl MailboxManager {
             .unwrap_or_default()
             .as_secs();
         let new_root = root.with_folder(FolderKind::Inbox, new_folder_cid, now);
-        let new_root_cid = self.cas_ingest(&new_root.to_bytes())?;
+        let new_root_cid = self.cas_ingest(&new_root.to_bytes()?)?;
 
         // Persist
         self.persist_root(user_address, &new_root_cid)?;
@@ -1177,7 +1168,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(folder.message_count as usize, PAGE_CAPACITY);
-        // The initial empty page + PAGE_CAPACITY replacements = still 1 page CID
+        // One page created on first insert, rewritten each time it stays
+        // under PAGE_CAPACITY — still 1 page CID after filling it.
         assert_eq!(folder.page_cids.len(), 1);
 
         // Insert one more — should trigger page split
