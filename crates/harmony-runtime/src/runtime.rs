@@ -7537,7 +7537,7 @@ mod tests {
         let (mut runtime, _actions) = make_runtime();
 
         let cid = ContentId::from_bytes([0x7A; 32]);
-        assert!(runtime.storage_tier_mut().cache_mut().pin(cid));
+        assert!(runtime.storage_tier_mut().pin(cid));
         assert!(runtime.storage_tier().cache().is_pinned(&cid));
     }
 }

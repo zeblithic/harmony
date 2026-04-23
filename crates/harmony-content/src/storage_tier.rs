@@ -371,9 +371,31 @@ impl<B: BookStore> StorageTier<B> {
         &self.cache
     }
 
-    /// Mutable access to the W-TinyLFU cache, for pin/unpin mutations
-    /// driven by user-facing content actions.
-    pub fn cache_mut(&mut self) -> &mut ContentStore<B> {
+    /// Pin a CID in the W-TinyLFU cache, exempting it from eviction.
+    ///
+    /// Exposed for user-driven content-lifecycle actions (e.g. ZEB-146
+    /// File Manager pin operations). Narrowed from a raw `&mut ContentStore`
+    /// accessor because direct cache mutation bypasses the tier's
+    /// eviction-buffer drain, `EvictionPush` emission, and broadcast-counter
+    /// bookkeeping — safe only for pin/unpin, which touch no eviction state.
+    ///
+    /// Returns `true` if the CID is pinned (or was already pinned); `false`
+    /// if the cache's pin quota ([`ContentStore::pin_limit`]) is reached.
+    pub fn pin(&mut self, cid: ContentId) -> bool {
+        self.cache.pin(cid)
+    }
+
+    /// Unpin a CID in the W-TinyLFU cache, making it eligible for eviction.
+    ///
+    /// Counterpart to [`StorageTier::pin`]; see that method's docs for why
+    /// this is narrowed from a full `&mut ContentStore` accessor.
+    pub fn unpin(&mut self, cid: &ContentId) {
+        self.cache.unpin(cid);
+    }
+
+    /// Mutable access to the underlying content store (crate-internal).
+    #[allow(dead_code)]
+    pub(crate) fn cache_mut(&mut self) -> &mut ContentStore<B> {
         &mut self.cache
     }
 
@@ -3500,7 +3522,9 @@ mod tests {
     }
 
     #[test]
-    fn cache_accessor_exposes_content_store() {
+    fn pin_delegates_and_cache_accessor_reads_through() {
+        use crate::book::MemoryBookStore;
+
         let (mut tier, _actions) = StorageTier::new(
             MemoryBookStore::new(),
             StorageBudget { cache_capacity: 100, max_pinned_bytes: 1000 },
@@ -3513,9 +3537,12 @@ mod tests {
             },
         );
 
-        // Pin a CID via cache_mut, read it back via cache.
         let cid = ContentId::from_bytes([0x42; 32]);
-        assert!(tier.cache_mut().pin(cid));
-        assert!(tier.cache().is_pinned(&cid));
+        assert!(!tier.cache().is_pinned(&cid));  // precondition: not yet pinned
+        assert!(tier.pin(cid));                   // pin returns true
+        assert!(tier.cache().is_pinned(&cid));    // visible through read accessor
+
+        tier.unpin(&cid);
+        assert!(!tier.cache().is_pinned(&cid));   // unpin takes effect
     }
 }
