@@ -1190,6 +1190,19 @@ impl<B: BookStore> NodeRuntime<B> {
         self.storage.metrics()
     }
 
+    /// Read-only access to the storage tier. Exposed so the event loop
+    /// owning this runtime can snapshot cache state for user-facing
+    /// content listings without duplicating StorageTier's internals.
+    pub fn storage_tier(&self) -> &StorageTier<B> {
+        &self.storage
+    }
+
+    /// Mutable access to the storage tier, for user-driven pin / unpin
+    /// mutations routed from Tauri commands through the event loop.
+    pub fn storage_tier_mut(&mut self) -> &mut StorageTier<B> {
+        &mut self.storage
+    }
+
     /// Number of pending Tier 1 (router) events.
     pub fn router_queue_len(&self) -> usize {
         self.router_queue.len()
@@ -7515,5 +7528,16 @@ mod tests {
                 .starts_with(harmony_zenoh::namespace::compute::CAPACITY),
             "CAPACITY_SUB should start with CAPACITY prefix"
         );
+    }
+
+    #[test]
+    fn storage_tier_accessor_exposes_cache_pin_state() {
+        use harmony_content::cid::ContentId;
+
+        let (mut runtime, _actions) = make_runtime();
+
+        let cid = ContentId::from_bytes([0x7A; 32]);
+        assert!(runtime.storage_tier_mut().cache_mut().pin(cid));
+        assert!(runtime.storage_tier().cache().is_pinned(&cid));
     }
 }

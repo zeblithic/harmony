@@ -364,6 +364,13 @@ impl<B: BookStore> StorageTier<B> {
         &self.metrics
     }
 
+    /// Read-only access to the W-TinyLFU cache. Exposed so higher layers
+    /// (e.g. clients that own the event loop) can inspect admission and
+    /// pin state without duplicating the pin/unpin logic.
+    pub fn cache(&self) -> &ContentStore<B> {
+        &self.cache
+    }
+
     /// Read-only access to the filter broadcast configuration.
     pub fn filter_config(&self) -> &FilterBroadcastConfig {
         &self.filter_config
@@ -574,9 +581,9 @@ impl<B: BookStore> StorageTier<B> {
         self.cache.get(cid)
     }
 
-    /// Mutable access to the underlying content store (crate-internal).
-    #[allow(dead_code)]
-    pub(crate) fn cache_mut(&mut self) -> &mut ContentStore<B> {
+    /// Mutable access to the W-TinyLFU cache, for pin/unpin mutations
+    /// driven by user-facing content actions.
+    pub fn cache_mut(&mut self) -> &mut ContentStore<B> {
         &mut self.cache
     }
 
@@ -3490,5 +3497,25 @@ mod tests {
             "no EvictionPush when CID is already on disk"
         );
         assert_eq!(tier.metrics().eviction_pushes, 0);
+    }
+
+    #[test]
+    fn cache_accessor_exposes_content_store() {
+        let (mut tier, _actions) = StorageTier::new(
+            MemoryBookStore::new(),
+            StorageBudget { cache_capacity: 100, max_pinned_bytes: 1000 },
+            ContentPolicy::default(),
+            FilterBroadcastConfig {
+                mutation_threshold: 10,
+                max_interval_ticks: 40,
+                expected_items: 32,
+                fp_rate: 0.01,
+            },
+        );
+
+        // Pin a CID via cache_mut, read it back via cache.
+        let cid = ContentId::from_bytes([0x42; 32]);
+        assert!(tier.cache_mut().pin(cid));
+        assert!(tier.cache().is_pinned(&cid));
     }
 }
