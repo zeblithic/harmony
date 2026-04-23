@@ -1190,6 +1190,35 @@ impl<B: BookStore> NodeRuntime<B> {
         self.storage.metrics()
     }
 
+    /// Read-only access to the storage tier. Exposed so the event loop
+    /// owning this runtime can snapshot cache state for user-facing
+    /// content listings without duplicating StorageTier's internals.
+    pub fn storage_tier(&self) -> &StorageTier<B> {
+        &self.storage
+    }
+
+    /// Pin a CID in the storage-tier cache, exempting it from eviction.
+    ///
+    /// Narrow delegate forwarding to [`StorageTier::pin`]. Exposed instead
+    /// of a full `&mut StorageTier` accessor because direct mutable access
+    /// would let callers invoke `handle()`, `enable_disk()`, and other
+    /// methods that bypass the runtime's event queue and action-processing
+    /// pipeline. Safe only for pin/unpin, which touch no router/queue state.
+    ///
+    /// Returns `true` if the CID is pinned (or was already pinned); `false`
+    /// if the cache's pin quota is reached.
+    pub fn pin_content(&mut self, cid: ContentId) -> bool {
+        self.storage.pin(cid)
+    }
+
+    /// Unpin a CID in the storage-tier cache, making it eligible for eviction.
+    ///
+    /// Counterpart to [`NodeRuntime::pin_content`]; see that method's docs
+    /// for why this is narrowed from a full `&mut StorageTier` accessor.
+    pub fn unpin_content(&mut self, cid: &ContentId) {
+        self.storage.unpin(cid);
+    }
+
     /// Number of pending Tier 1 (router) events.
     pub fn router_queue_len(&self) -> usize {
         self.router_queue.len()
@@ -7515,5 +7544,19 @@ mod tests {
                 .starts_with(harmony_zenoh::namespace::compute::CAPACITY),
             "CAPACITY_SUB should start with CAPACITY prefix"
         );
+    }
+
+    #[test]
+    fn pin_content_delegates_and_storage_tier_reads_through() {
+        use harmony_content::cid::ContentId;
+
+        let (mut runtime, _actions) = make_runtime();
+
+        let cid = ContentId::from_bytes([0x7A; 32]);
+        assert!(!runtime.storage_tier().cache().is_pinned(&cid));
+        assert!(runtime.pin_content(cid));
+        assert!(runtime.storage_tier().cache().is_pinned(&cid));
+        runtime.unpin_content(&cid);
+        assert!(!runtime.storage_tier().cache().is_pinned(&cid));
     }
 }

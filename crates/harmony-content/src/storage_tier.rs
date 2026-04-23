@@ -364,6 +364,41 @@ impl<B: BookStore> StorageTier<B> {
         &self.metrics
     }
 
+    /// Read-only access to the W-TinyLFU cache. Exposed so higher layers
+    /// (e.g. clients that own the event loop) can inspect admission and
+    /// pin state without duplicating the pin/unpin logic.
+    pub fn cache(&self) -> &ContentStore<B> {
+        &self.cache
+    }
+
+    /// Pin a CID in the W-TinyLFU cache, exempting it from eviction.
+    ///
+    /// Exposed for user-driven content-lifecycle actions (e.g. ZEB-146
+    /// File Manager pin operations). Narrowed from a raw `&mut ContentStore`
+    /// accessor because direct cache mutation bypasses the tier's
+    /// eviction-buffer drain, `EvictionPush` emission, and broadcast-counter
+    /// bookkeeping — safe only for pin/unpin, which touch no eviction state.
+    ///
+    /// Returns `true` if the CID is pinned (or was already pinned); `false`
+    /// if the cache's pin quota ([`ContentStore::pin_limit`]) is reached.
+    pub fn pin(&mut self, cid: ContentId) -> bool {
+        self.cache.pin(cid)
+    }
+
+    /// Unpin a CID in the W-TinyLFU cache, making it eligible for eviction.
+    ///
+    /// Counterpart to [`StorageTier::pin`]; see that method's docs for why
+    /// this is narrowed from a full `&mut ContentStore` accessor.
+    pub fn unpin(&mut self, cid: &ContentId) {
+        self.cache.unpin(cid);
+    }
+
+    /// Mutable access to the underlying content store (crate-internal).
+    #[allow(dead_code)]
+    pub(crate) fn cache_mut(&mut self) -> &mut ContentStore<B> {
+        &mut self.cache
+    }
+
     /// Read-only access to the filter broadcast configuration.
     pub fn filter_config(&self) -> &FilterBroadcastConfig {
         &self.filter_config
@@ -572,12 +607,6 @@ impl<B: BookStore> StorageTier<B> {
     /// Retrieve raw book data by CID from the underlying content store.
     pub fn get(&self, cid: &ContentId) -> Option<&[u8]> {
         self.cache.get(cid)
-    }
-
-    /// Mutable access to the underlying content store (crate-internal).
-    #[allow(dead_code)]
-    pub(crate) fn cache_mut(&mut self) -> &mut ContentStore<B> {
-        &mut self.cache
     }
 
     /// Process an event and return actions for the caller to execute.
@@ -3490,5 +3519,30 @@ mod tests {
             "no EvictionPush when CID is already on disk"
         );
         assert_eq!(tier.metrics().eviction_pushes, 0);
+    }
+
+    #[test]
+    fn pin_delegates_and_cache_accessor_reads_through() {
+        use crate::book::MemoryBookStore;
+
+        let (mut tier, _actions) = StorageTier::new(
+            MemoryBookStore::new(),
+            StorageBudget { cache_capacity: 100, max_pinned_bytes: 1000 },
+            ContentPolicy::default(),
+            FilterBroadcastConfig {
+                mutation_threshold: 10,
+                max_interval_ticks: 40,
+                expected_items: 32,
+                fp_rate: 0.01,
+            },
+        );
+
+        let cid = ContentId::from_bytes([0x42; 32]);
+        assert!(!tier.cache().is_pinned(&cid));  // precondition: not yet pinned
+        assert!(tier.pin(cid));                   // pin returns true
+        assert!(tier.cache().is_pinned(&cid));    // visible through read accessor
+
+        tier.unpin(&cid);
+        assert!(!tier.cache().is_pinned(&cid));   // unpin takes effect
     }
 }
