@@ -371,6 +371,12 @@ impl<B: BookStore> StorageTier<B> {
         &self.cache
     }
 
+    /// Mutable access to the W-TinyLFU cache, for pin/unpin mutations
+    /// driven by user-facing content actions.
+    pub fn cache_mut(&mut self) -> &mut ContentStore<B> {
+        &mut self.cache
+    }
+
     /// Read-only access to the filter broadcast configuration.
     pub fn filter_config(&self) -> &FilterBroadcastConfig {
         &self.filter_config
@@ -579,12 +585,6 @@ impl<B: BookStore> StorageTier<B> {
     /// Retrieve raw book data by CID from the underlying content store.
     pub fn get(&self, cid: &ContentId) -> Option<&[u8]> {
         self.cache.get(cid)
-    }
-
-    /// Mutable access to the W-TinyLFU cache, for pin/unpin mutations
-    /// driven by user-facing content actions.
-    pub fn cache_mut(&mut self) -> &mut ContentStore<B> {
-        &mut self.cache
     }
 
     /// Process an event and return actions for the caller to execute.
