@@ -1,12 +1,15 @@
-use crate::certs::{EnrollmentCert, EnrollmentIssuer, LivenessCert, ReclamationCert};
+use crate::certs::{EnrollmentCert, EnrollmentIssuer, LivenessCert};
 use crate::crdt::{RevocationSet, VouchingSet};
 use crate::OwnerError;
 use ed25519_dalek::VerifyingKey;
 use std::collections::HashMap;
 
 /// Aggregate state for one owner identity: enrollment certs per device,
-/// vouching CRDT, revocation set, latest liveness per device, optional
-/// reclamation cert if this identity claims continuity from a predecessor.
+/// vouching CRDT, revocation set, latest liveness per device.
+///
+/// Reclamation continuity is evaluated functionally via
+/// `lifecycle::reclamation::evaluate_reclamation` against any candidate
+/// `ReclamationCert`; it is not held as state here (no current consumer).
 #[derive(Debug, Clone, Default)]
 pub struct OwnerState {
     pub owner_id: [u8; 16],
@@ -14,7 +17,6 @@ pub struct OwnerState {
     pub vouching: VouchingSet,
     pub revocations: RevocationSet,
     pub liveness: HashMap<[u8; 16], LivenessCert>,
-    pub reclamation: Option<ReclamationCert>,
 }
 
 impl OwnerState {

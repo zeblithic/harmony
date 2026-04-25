@@ -127,44 +127,47 @@ mod tests {
 
     #[test]
     fn equal_timestamp_tie_breaks_deterministically() {
-        let target = [2u8; 16];
-        // Two distinct keys → two distinct signers; cells are separate.
-        // To exercise the equal-timestamp tie-break inside one cell, we
-        // need TWO certs from the SAME key with the same timestamp; the
-        // signatures will differ because Ed25519 is not deterministic in
-        // ed25519-dalek's default code path under fresh key+message? It
-        // actually IS deterministic per RFC8032. To force two distinct
-        // signatures over the same payload, we need different stances OR
-        // different (signer, target) keys but per-cell tie-break only
-        // fires when (signer, target, timestamp) collide. Build two
-        // certs from the same key with same target+stance+ts; if their
-        // signatures are equal we skip (deterministic Ed25519 path).
-        let sk = SigningKey::generate(&mut OsRng);
-        let (_, c1) = make_cert_with_key(&sk, target, Stance::Vouch, 100);
-        let (_, c2) = make_cert_with_key(&sk, target, Stance::Vouch, 100);
-        if c1.signature == c2.signature {
-            // Deterministic Ed25519 — payloads are identical so the certs
-            // are byte-identical too. The tie-break is a no-op in this
-            // case (insert is idempotent), which is the correct behavior.
-            return;
-        }
+        // Same signer + target + issued_at → same cell key. Different stance
+        // produces a different signed payload (stance is part of the signing
+        // payload), which produces a different signature even under
+        // deterministic Ed25519. Both certs land in the same cell — tie-break
+        // decides which wins.
+        let signer_sk = SigningKey::generate(&mut OsRng);
+        let target = [9u8; 16];
 
-        let (lower, higher) = if c1.signature < c2.signature { (c1, c2) } else { (c2, c1) };
+        let c_vouch = VouchingCert::sign(&signer_sk, [1u8; 16], target, Stance::Vouch, 100).unwrap();
+        let c_challenge =
+            VouchingCert::sign(&signer_sk, [1u8; 16], target, Stance::Challenge, 100).unwrap();
+        assert_ne!(
+            c_vouch.signature, c_challenge.signature,
+            "different stances must produce different signatures"
+        );
+        // Sanity: same cell key (signer, target).
+        assert_eq!(c_vouch.signer, c_challenge.signer);
+        assert_eq!(c_vouch.target, c_challenge.target);
+        assert_eq!(c_vouch.issued_at, c_challenge.issued_at);
 
-        // Order A: insert lower first, then higher
-        let mut set_a = VouchingSet::new();
-        set_a.insert(lower.clone());
-        set_a.insert(higher.clone());
+        let (lower, higher) = if c_vouch.signature < c_challenge.signature {
+            (c_vouch.clone(), c_challenge.clone())
+        } else {
+            (c_challenge.clone(), c_vouch.clone())
+        };
 
-        // Order B: insert higher first, then lower
-        let mut set_b = VouchingSet::new();
-        set_b.insert(higher.clone());
-        set_b.insert(lower.clone());
+        // Order A: lower then higher → tie-break should replace lower with higher
+        let mut s_a = VouchingSet::new();
+        s_a.insert(lower.clone());
+        s_a.insert(higher.clone());
 
-        // Both should converge on the higher-signature cert
-        let a_winner = set_a.iter().next().unwrap();
-        let b_winner = set_b.iter().next().unwrap();
-        assert_eq!(a_winner.signature, b_winner.signature);
+        // Order B: higher then lower → tie-break should keep higher (lower not
+        // inserted because cert.signature > existing.signature is false).
+        let mut s_b = VouchingSet::new();
+        s_b.insert(higher.clone());
+        s_b.insert(lower.clone());
+
+        // Both replicas converge on `higher`.
+        let a_winner = s_a.iter().next().unwrap();
+        let b_winner = s_b.iter().next().unwrap();
         assert_eq!(a_winner.signature, higher.signature);
+        assert_eq!(b_winner.signature, higher.signature);
     }
 }

@@ -108,23 +108,47 @@ mod tests {
 
     #[test]
     fn equal_timestamp_revocation_tie_breaks_deterministically() {
+        // Same signing key + target + issued_at, but DIFFERENT reasons →
+        // different signed payloads → different signatures even under
+        // deterministic Ed25519. Both certs land in the same cell (keyed by
+        // target only) and the tie-break decides which wins.
+        let sk = SigningKey::generate(&mut OsRng);
         let target = [9u8; 16];
 
-        let r1 = make_self_revocation(target, 100);
-        let r2 = make_self_revocation(target, 100);
-        assert_ne!(r1.signature, r2.signature);
+        let r_decom =
+            RevocationCert::sign_self(&sk, [0u8; 16], target, 100, RevocationReason::Decommissioned)
+                .unwrap();
+        let r_lost = RevocationCert::sign_self(&sk, [0u8; 16], target, 100, RevocationReason::Lost)
+            .unwrap();
+        assert_ne!(
+            r_decom.signature, r_lost.signature,
+            "different reasons must produce different signatures"
+        );
 
-        let (lower, higher) = if r1.signature < r2.signature { (r1, r2) } else { (r2, r1) };
+        let (lower, higher) = if r_decom.signature < r_lost.signature {
+            (r_decom.clone(), r_lost.clone())
+        } else {
+            (r_lost.clone(), r_decom.clone())
+        };
 
+        // Order A: lower then higher → tie-break should replace lower with higher
         let mut s_a = RevocationSet::new();
         s_a.insert(lower.clone());
         s_a.insert(higher.clone());
 
+        // Order B: higher then lower → tie-break should keep higher
         let mut s_b = RevocationSet::new();
         s_b.insert(higher.clone());
         s_b.insert(lower.clone());
 
-        assert_eq!(s_a.cert_for(target).unwrap().signature, s_b.cert_for(target).unwrap().signature);
-        assert_eq!(s_a.cert_for(target).unwrap().signature, higher.signature);
+        // Both replicas converge on `higher`.
+        assert_eq!(
+            s_a.cert_for(target).unwrap().signature,
+            higher.signature
+        );
+        assert_eq!(
+            s_b.cert_for(target).unwrap().signature,
+            higher.signature
+        );
     }
 }

@@ -23,15 +23,6 @@ pub enum OwnerError {
     #[error("quorum requires at least {min} signers, got {got}")]
     InsufficientQuorum { min: usize, got: usize },
 
-    #[error("trust state snapshot is older than freshness window ({age_days}d > 30d)")]
-    StaleTrustState { age_days: u64 },
-
-    #[error("identity in contested state — competing master/sibling assertions")]
-    Contested,
-
-    #[error("reclamation refuted by predecessor liveness")]
-    ReclamationRefuted,
-
     #[error("certificate owner_id {got:?} does not match state owner_id {expected:?}")]
     WrongOwner { expected: [u8; 16], got: [u8; 16] },
 
