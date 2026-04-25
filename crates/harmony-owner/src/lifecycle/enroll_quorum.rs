@@ -1,4 +1,5 @@
 use crate::cbor;
+use crate::certs::enrollment::EnrollmentSigningPayload;
 use crate::certs::{EnrollmentCert, EnrollmentIssuer, Stance, VouchingCert};
 use crate::lifecycle::EnrollResult;
 use crate::pubkey_bundle::PubKeyBundle;
@@ -6,20 +7,6 @@ use crate::signing::{sign_with_tag, tags};
 use crate::state::OwnerState;
 use crate::OwnerError;
 use ed25519_dalek::SigningKey;
-use serde::Serialize;
-
-/// Mirrors `EnrollmentSigningPayload` in `certs/enrollment.rs` and `state::quorum_signing_payload` exactly.
-#[derive(Serialize)]
-struct EnrollmentSigningPayload<'a> {
-    version: u8,
-    owner_id: [u8; 16],
-    device_id: [u8; 16],
-    device_pubkeys: &'a PubKeyBundle,
-    issued_at: u64,
-    expires_at: Option<u64>,
-    issuer_kind: u8,
-    issuer_data: Vec<u8>,
-}
 
 /// Enroll a new device using K=2 quorum of existing siblings (no recovery
 /// artifact needed). Returns the new device's enrollment cert + auto-vouches.

@@ -138,32 +138,18 @@ impl OwnerState {
 }
 
 /// Compute the canonical payload bytes used for quorum signature verification.
-/// Reproduces the exact same `EnrollmentSigningPayload` that `enrollment.rs`
-/// produces, so that quorum member signatures can be verified here.
+/// Uses the shared `EnrollmentSigningPayload` from `certs/enrollment.rs` so
+/// signing and verification cannot drift apart.
 fn quorum_signing_payload(cert: &EnrollmentCert) -> Result<Vec<u8>, OwnerError> {
     use crate::cbor;
-    use crate::pubkey_bundle::PubKeyBundle;
-    use serde::Serialize;
-
-    /// Mirrors `EnrollmentSigningPayload` in `certs/enrollment.rs` exactly.
-    #[derive(Serialize)]
-    struct EnrollmentSigningPayload<'a> {
-        version: u8,
-        owner_id: [u8; 16],
-        device_id: [u8; 16],
-        device_pubkeys: &'a PubKeyBundle,
-        issued_at: u64,
-        expires_at: Option<u64>,
-        issuer_kind: u8,
-        issuer_data: Vec<u8>,
-    }
+    use crate::certs::enrollment::EnrollmentSigningPayload;
 
     let signers = match &cert.issuer {
         EnrollmentIssuer::Quorum { signers, .. } => signers,
         _ => return Err(OwnerError::InvalidSignature { cert_type: "Enrollment-Quorum-Member" }),
     };
 
-    // issuer_data for Quorum = cbor(signers list), same as enrollment.rs line ~141
+    // issuer_data for Quorum = cbor(signers list), same as enrollment.rs
     let issuer_data = cbor::to_canonical(signers)?;
 
     cbor::to_canonical(&EnrollmentSigningPayload {

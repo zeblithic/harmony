@@ -65,7 +65,7 @@ fn revoked_device_cannot_be_un_revoked() {
     state.add_revocation(rev).unwrap();
     assert!(state.is_revoked(device_a_id));
 
-    // Even a "newer" revocation insertion does not un-revoke (it stays revoked).
+    // Even an "older" revocation insertion does not un-revoke (it stays revoked, with the earliest cert kept).
     let rev2 = RevocationCert::sign_self(&device_a_sk, state.owner_id, device_a_id, 999_000, RevocationReason::Other("test".into())).unwrap();
     state.add_revocation(rev2).unwrap();
     assert!(state.is_revoked(device_a_id));

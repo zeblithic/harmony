@@ -34,15 +34,15 @@ pub enum EnrollmentIssuer {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct EnrollmentSigningPayload<'a> {
-    version: u8,
-    owner_id: [u8; 16],
-    device_id: [u8; 16],
-    device_pubkeys: &'a PubKeyBundle,
-    issued_at: u64,
-    expires_at: Option<u64>,
-    issuer_kind: u8, // 0 = Master, 1 = Quorum
-    issuer_data: Vec<u8>, // CBOR-encoded inner data of the EnrollmentIssuer
+pub(crate) struct EnrollmentSigningPayload<'a> {
+    pub(crate) version: u8,
+    pub(crate) owner_id: [u8; 16],
+    pub(crate) device_id: [u8; 16],
+    pub(crate) device_pubkeys: &'a PubKeyBundle,
+    pub(crate) issued_at: u64,
+    pub(crate) expires_at: Option<u64>,
+    pub(crate) issuer_kind: u8, // 0 = Master, 1 = Quorum
+    pub(crate) issuer_data: Vec<u8>, // CBOR-encoded inner data of the EnrollmentIssuer
 }
 
 impl EnrollmentCert {

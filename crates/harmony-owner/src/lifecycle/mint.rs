@@ -7,7 +7,6 @@ use rand_core::{OsRng, RngCore};
 use zeroize::Zeroize;
 
 /// 32-byte master seed. Format BIP39-wraps to 24 mnemonic words. Drop wipes.
-#[derive(Clone)]
 pub struct RecoveryArtifact {
     seed: [u8; 32],
 }

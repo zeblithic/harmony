@@ -11,7 +11,8 @@ for the full design.
 ```rust
 use harmony_owner::lifecycle::mint_owner;
 
-let mint = mint_owner(unix_now()).unwrap();
+let unix_now: u64 = 1_744_000_000;
+let mint = mint_owner(unix_now).unwrap();
 // Save mint.recovery_artifact (BIP39 mnemonic via ZEB-175)
 // Use mint.device_signing_key for ongoing device #1 operations
 // mint.state has device #1 enrolled

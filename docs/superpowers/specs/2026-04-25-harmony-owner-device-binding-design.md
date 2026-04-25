@@ -248,7 +248,7 @@ After a successful reclamation (window expires with no refutation), peers MAY tr
 
 When peer P encounters device `D` claiming to act under owner `M`:
 
-```
+```text
 1. Fetch trust state for M (gossip cache; fall back to queryable).
 2. Verify Enrollment Cert chain to a Master-signed root.
 3. Build active sibling set: enrolled devices with LivenessCert within active window.
@@ -280,7 +280,7 @@ All certs serialize as deterministic CBOR (RFC 8949 with canonical encoding) and
 2. Type-distinguishable encoding avoids ambiguity (no "is this string or bytes" guessing).
 3. Existing `harmony-mailbox` and related crates already use CBOR.
 
-A `BindingFormatVersion: u8` byte prefixes every cert (initial value `0x01`). Per the mailbox wire-format policy precedent: bumps are breaking; readers reject unknown versions; writers pin to current.
+A `version: u8` field is part of every cert payload (initial value `0x01`) and is included in the canonical CBOR object covered by the signature. Per the mailbox wire-format policy precedent: bumps are breaking; readers reject unknown versions; writers pin to current.
 
 ### Domain-separated signatures
 
