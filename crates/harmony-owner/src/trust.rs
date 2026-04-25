@@ -89,7 +89,7 @@ mod tests {
     fn enroll_via_master(state: &mut OwnerState, master_sk: &SigningKey, master_bundle: PubKeyBundle, device_bundle: PubKeyBundle, ts: u64) -> [u8; 16] {
         let device_id = device_bundle.identity_hash();
         let cert = EnrollmentCert::sign_master(master_sk, master_bundle, device_id, device_bundle, ts, None).unwrap();
-        state.add_enrollment(cert).unwrap();
+        state.add_enrollment(cert, ts, DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
         device_id
     }
 

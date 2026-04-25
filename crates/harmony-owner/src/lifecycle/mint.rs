@@ -22,6 +22,29 @@ impl RecoveryArtifact {
     pub fn master_signing_key(&self) -> SigningKey {
         SigningKey::from_bytes(&self.seed)
     }
+    /// Reconstruct the master `PubKeyBundle` from the seed. This is the
+    /// canonical source of truth for the master pubkey shape — every call
+    /// site that needs the master bundle must use this method (or the
+    /// shared `master_pubkey_bundle_from_sk` helper at mint time), not
+    /// build the bundle inline, so any future change (e.g., HKDF-derived
+    /// X25519) propagates uniformly.
+    pub fn master_pubkey_bundle(&self) -> PubKeyBundle {
+        master_pubkey_bundle_from_sk(&self.master_signing_key())
+    }
+}
+
+/// Construct a master `PubKeyBundle` from a master signing key. Shared by
+/// `mint_owner` (where we don't yet have a `RecoveryArtifact`) and by
+/// `RecoveryArtifact::master_pubkey_bundle`. Single source of truth for
+/// the master pubkey shape.
+pub(crate) fn master_pubkey_bundle_from_sk(sk: &SigningKey) -> PubKeyBundle {
+    PubKeyBundle {
+        classical: ClassicalKeys {
+            ed25519_verify: sk.verifying_key().to_bytes(),
+            x25519_pub: [0u8; 32], // TODO v1.1: derive via HKDF from same seed
+        },
+        post_quantum: None,
+    }
 }
 
 impl Drop for RecoveryArtifact {
@@ -49,13 +72,7 @@ pub fn mint_owner(now: u64) -> Result<MintResult, OwnerError> {
     let mut seed = [0u8; 32];
     OsRng.fill_bytes(&mut seed);
     let master_sk = SigningKey::from_bytes(&seed);
-    let master_bundle = PubKeyBundle {
-        classical: ClassicalKeys {
-            ed25519_verify: master_sk.verifying_key().to_bytes(),
-            x25519_pub: [0u8; 32], // TODO: derive real X25519 from same seed via HKDF in v1.1
-        },
-        post_quantum: None,
-    };
+    let master_bundle = master_pubkey_bundle_from_sk(&master_sk);
     let owner_id = master_bundle.identity_hash();
 
     let device_sk = SigningKey::generate(&mut OsRng);
@@ -78,7 +95,9 @@ pub fn mint_owner(now: u64) -> Result<MintResult, OwnerError> {
     )?;
 
     let mut state = OwnerState::new(owner_id);
-    state.add_enrollment(cert)?;
+    // Master enrollment bypasses the active-signer check, so the active
+    // window value here is irrelevant; pass the trust default for consistency.
+    state.add_enrollment(cert, now, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS)?;
 
     let recovery_artifact = RecoveryArtifact::from_seed(seed);
     seed.zeroize();

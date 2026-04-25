@@ -98,7 +98,7 @@ mod tests {
         };
         let r1 = enroll_via_master(&state, &mint.recovery_artifact, &device_b_sk, device_b_bundle.clone(), 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
         let device_b_id = device_b_bundle.identity_hash();
-        state.add_enrollment(r1.enrollment_cert).unwrap();
+        state.add_enrollment(r1.enrollment_cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
         for v in r1.auto_vouch_certs { state.add_vouching(v).unwrap(); }
         state.add_liveness(LivenessCert::sign(&device_b_sk, state.owner_id, device_b_id, 1_001_001).unwrap()).unwrap();
 
@@ -121,7 +121,7 @@ mod tests {
             crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
         ).unwrap();
 
-        state.add_enrollment(r2.enrollment_cert).unwrap();
+        state.add_enrollment(r2.enrollment_cert, 1_002_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
         for v in r2.auto_vouch_certs { state.add_vouching(v).unwrap(); }
 
         // Verify Device C is now enrolled

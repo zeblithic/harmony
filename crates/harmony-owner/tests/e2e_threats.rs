@@ -35,7 +35,7 @@ fn stolen_master_attacker_device_remains_provisional_when_real_devices_dont_vouc
     let (attacker_sk, attacker_bundle) = fresh_device();
     let attacker_id = attacker_bundle.identity_hash();
     let r = enroll_via_master(&state, &mint.recovery_artifact, &attacker_sk, attacker_bundle, 1_500_000, DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
-    state.add_enrollment(r.enrollment_cert).unwrap();
+    state.add_enrollment(r.enrollment_cert, 1_500_000, DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
     for v in r.auto_vouch_certs { state.add_vouching(v).unwrap(); }
     state.add_liveness(LivenessCert::sign(&attacker_sk, state.owner_id, attacker_id, 1_500_001).unwrap()).unwrap();
 

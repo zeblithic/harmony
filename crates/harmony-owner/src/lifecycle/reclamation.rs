@@ -18,13 +18,7 @@ pub fn mint_reclaimed(
     let mint = mint_owner(now)?;
     // Reconstruct master to sign the reclamation cert
     let master_sk = mint.recovery_artifact.master_signing_key();
-    let master_pubkey = crate::pubkey_bundle::PubKeyBundle {
-        classical: crate::pubkey_bundle::ClassicalKeys {
-            ed25519_verify: master_sk.verifying_key().to_bytes(),
-            x25519_pub: [0u8; 32],
-        },
-        post_quantum: None,
-    };
+    let master_pubkey = mint.recovery_artifact.master_pubkey_bundle();
     let reclamation_cert = ReclamationCert::sign(
         &master_sk,
         master_pubkey,

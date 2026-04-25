@@ -27,7 +27,7 @@ pub fn enroll_via_master(
 ) -> Result<EnrollResult, OwnerError> {
     // Reconstruct master from artifact (transient).
     let master_sk = artifact.master_signing_key();
-    let master_pubkey = master_pubkey_from_sk(&master_sk);
+    let master_pubkey = artifact.master_pubkey_bundle();
 
     if master_pubkey.identity_hash() != state.owner_id {
         return Err(OwnerError::WrongOwner {
@@ -62,14 +62,6 @@ pub fn enroll_via_master(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(EnrollResult { enrollment_cert, auto_vouch_certs })
-}
-
-fn master_pubkey_from_sk(sk: &SigningKey) -> PubKeyBundle {
-    use crate::pubkey_bundle::ClassicalKeys;
-    PubKeyBundle {
-        classical: ClassicalKeys { ed25519_verify: sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
-        post_quantum: None,
-    }
 }
 
 #[cfg(test)]
@@ -109,7 +101,7 @@ mod tests {
         ).unwrap();
 
         // Apply to state
-        state.add_enrollment(result.enrollment_cert.clone()).unwrap();
+        state.add_enrollment(result.enrollment_cert.clone(), 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
         for v in &result.auto_vouch_certs {
             state.add_vouching(v.clone()).unwrap();
         }

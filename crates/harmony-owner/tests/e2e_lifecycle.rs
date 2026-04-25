@@ -41,7 +41,7 @@ fn full_three_device_lifecycle() {
     let (device_b_sk, device_b_bundle) = fresh_device();
     let device_b_id = device_b_bundle.identity_hash();
     let r1 = enroll_via_master(&state, &mint.recovery_artifact, &device_b_sk, device_b_bundle, 1_001_000, DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
-    state.add_enrollment(r1.enrollment_cert).unwrap();
+    state.add_enrollment(r1.enrollment_cert, 1_001_000, DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
     for v in r1.auto_vouch_certs { state.add_vouching(v).unwrap(); }
     state.add_liveness(LivenessCert::sign(&device_b_sk, state.owner_id, device_b_id, 1_001_001).unwrap()).unwrap();
 
@@ -71,7 +71,7 @@ fn full_three_device_lifecycle() {
         1_002_000,
         DEFAULT_ACTIVE_WINDOW_SECS,
     ).unwrap();
-    state.add_enrollment(r2.enrollment_cert).unwrap();
+    state.add_enrollment(r2.enrollment_cert, 1_002_000, DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
     for v in r2.auto_vouch_certs { state.add_vouching(v).unwrap(); }
     state.add_liveness(LivenessCert::sign(&device_c_sk, state.owner_id, device_c_id, 1_002_001).unwrap()).unwrap();
 

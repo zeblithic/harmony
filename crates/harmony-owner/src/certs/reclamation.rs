@@ -44,6 +44,9 @@ impl ReclamationCert {
         note: String,
     ) -> Result<Self, OwnerError> {
         let new_owner_id = new_owner_pubkey.identity_hash();
+        if challenge_window_secs == 0 {
+            return Err(OwnerError::InvalidChallengeWindow);
+        }
         let challenge_window_end = issued_at
             .checked_add(challenge_window_secs)
             .ok_or(OwnerError::InvalidChallengeWindow)?;
@@ -73,7 +76,7 @@ impl ReclamationCert {
         if self.version != RECLAMATION_VERSION {
             return Err(OwnerError::UnknownVersion(self.version));
         }
-        if self.challenge_window_end < self.issued_at {
+        if self.challenge_window_end <= self.issued_at {
             return Err(OwnerError::InvalidChallengeWindow);
         }
         if self.new_owner_pubkey.identity_hash() != self.new_owner_id {
@@ -151,6 +154,33 @@ mod tests {
         ).unwrap();
         // Manually corrupt window_end to be before issued_at
         cert.challenge_window_end = cert.issued_at - 1;
+        let result = cert.verify();
+        assert!(matches!(result, Err(OwnerError::InvalidChallengeWindow)));
+    }
+
+    #[test]
+    fn zero_length_window_rejected_in_sign() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let bundle = PubKeyBundle {
+            classical: ClassicalKeys { ed25519_verify: sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
+            post_quantum: None,
+        };
+        let result = ReclamationCert::sign(&sk, bundle, [9u8; 16], 1_000_000, 0, "n/a".into());
+        assert!(matches!(result, Err(OwnerError::InvalidChallengeWindow)));
+    }
+
+    #[test]
+    fn zero_length_window_rejected_in_verify() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let bundle = PubKeyBundle {
+            classical: ClassicalKeys { ed25519_verify: sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
+            post_quantum: None,
+        };
+        let mut cert = ReclamationCert::sign(
+            &sk, bundle, [9u8; 16], 1_000_000, DEFAULT_CHALLENGE_WINDOW_SECS, "n/a".into()
+        ).unwrap();
+        // Force end == start (zero-length on the wire)
+        cert.challenge_window_end = cert.issued_at;
         let result = cert.verify();
         assert!(matches!(result, Err(OwnerError::InvalidChallengeWindow)));
     }
