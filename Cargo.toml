@@ -137,7 +137,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CLI and config
 serde = { version = "1", default-features = false }
-serde_bytes = "0.11"
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 base64 = { version = "0.22", default-features = false }
 toml = "0.8"
@@ -175,7 +174,7 @@ harmony-runtime = { path = "crates/harmony-runtime", default-features = false }
 harmony-sdjwt = { path = "crates/harmony-sdjwt", default-features = false }
 harmony-roxy = { path = "crates/harmony-roxy", default-features = false }
 harmony-oluo = { path = "crates/harmony-oluo", default-features = false }
-harmony-owner = { path = "crates/harmony-owner" }
+harmony-owner = { path = "crates/harmony-owner", default-features = false }
 harmony-semantic = { path = "crates/harmony-semantic", default-features = false }
 harmony-trust = { path = "crates/harmony-trust", default-features = false }
 harmony-tunnel = { path = "crates/harmony-tunnel", default-features = false }
