@@ -274,7 +274,7 @@ When only one device is active (the most common state for users new to harmony, 
 
 ## Wire formats
 
-All certs serialize as deterministic CBOR (RFC 8949 with canonical encoding) and sign over the canonical bytes. CBOR rather than JCS-JSON because:
+All certs serialize as **RFC 8949 §4.2 canonical CBOR** and sign over the canonical bytes. Map entries are sorted by length-then-bytewise-lex on the canonically-encoded key bytes; integers use shortest form; containers are definite-length. The implementation in `harmony-owner::cbor::to_canonical` enforces §4.2 by serializing through `ciborium::value::Value`, recursively sorting map entries, and re-encoding via `ciborium::ser::into_writer`. This guarantees byte-for-byte interop with any RFC 8949 §4.2-compliant CBOR library — second implementations of this protocol are not coupled to ciborium. CBOR rather than JCS-JSON because:
 
 1. Smaller wire size for binary-heavy payloads (signatures, public keys).
 2. Type-distinguishable encoding avoids ambiguity (no "is this string or bytes" guessing).
