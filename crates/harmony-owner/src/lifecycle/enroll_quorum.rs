@@ -21,7 +21,52 @@ pub fn enroll_via_quorum(
     if quorum_signers.len() < 2 {
         return Err(OwnerError::InsufficientQuorum { min: 2, got: quorum_signers.len() });
     }
+
+    // Fail-fast validation of quorum signers: distinct, enrolled, not
+    // revoked, active, and the provided signing key matches the enrollment's
+    // pubkey. State.add_enrollment performs the same checks at apply time;
+    // surfacing them here means callers get an error before signing instead
+    // of an opaque rejection downstream.
+    let active = state.active_devices(now, active_window_secs);
+    let active_set: std::collections::HashSet<[u8; 16]> = active.into_iter().collect();
+    let signer_id_set: std::collections::HashSet<[u8; 16]> =
+        quorum_signers.iter().map(|(_, id)| *id).collect();
+    if signer_id_set.len() != quorum_signers.len() {
+        return Err(OwnerError::InvalidSignature {
+            cert_type: "Enrollment-Quorum-Duplicate-Signer",
+        });
+    }
+    for (sk, id) in &quorum_signers {
+        // Must be enrolled
+        let _enrollment = state
+            .enrollments
+            .get(id)
+            .ok_or(OwnerError::NotEnrolled { owner: state.owner_id, device: *id })?;
+        // Must not be revoked
+        if state.is_revoked(*id) {
+            return Err(OwnerError::Revoked { device: *id });
+        }
+        // Must be active
+        if !active_set.contains(id) {
+            return Err(OwnerError::InvalidSignature {
+                cert_type: "Enrollment-Quorum-Inactive-Signer",
+            });
+        }
+        // Provided signing key must match the enrollment's pubkey
+        let derived_id =
+            PubKeyBundle::classical_only(sk.verifying_key().to_bytes()).identity_hash();
+        if derived_id != *id {
+            return Err(OwnerError::IdentityHashMismatch);
+        }
+    }
+
     let device_id = new_device_pubkey.identity_hash();
+    // Validate the new device's signing key matches its claimed pubkey.
+    let derived_id =
+        PubKeyBundle::classical_only(new_device_sk.verifying_key().to_bytes()).identity_hash();
+    if derived_id != device_id {
+        return Err(OwnerError::IdentityHashMismatch);
+    }
     let signers: Vec<[u8; 16]> = quorum_signers.iter().map(|(_, id)| *id).collect();
 
     // issuer_data for Quorum = cbor(signers list) — matches state.rs verification.
@@ -152,6 +197,72 @@ mod tests {
             crate::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
         );
         assert_eq!(decision, crate::trust::TrustDecision::Full);
+    }
+
+    #[test]
+    fn enroll_via_quorum_with_inactive_signer_fails_fast() {
+        // Setup: mint M (which produces device A enrolled+alive), enroll B via
+        // master but do NOT publish liveness for B → B is enrolled but inactive.
+        // Try to enroll C via quorum [A, B] → should fail-fast with
+        // Enrollment-Quorum-Inactive-Signer.
+        let mint = mint_owner(1_000_000).unwrap();
+        let mut state = mint.state;
+        let device_a_id = *state.enrollments.keys().next().unwrap();
+        let device_a_sk = mint.device_signing_key;
+        state
+            .add_liveness(LivenessCert::sign(&device_a_sk, state.owner_id, 1_000_001).unwrap())
+            .unwrap();
+
+        let device_b_sk = SigningKey::generate(&mut OsRng);
+        let device_b_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: device_b_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let r1 = enroll_via_master(
+            &state,
+            &mint.recovery_artifact,
+            &device_b_sk,
+            device_b_bundle.clone(),
+            1_001_000,
+            crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+        )
+        .unwrap();
+        let device_b_id = device_b_bundle.identity_hash();
+        state
+            .add_enrollment(
+                r1.enrollment_cert,
+                1_001_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
+        for v in r1.auto_vouch_certs {
+            state.add_vouching(v).unwrap();
+        }
+        // Note: B does NOT publish liveness, so B is enrolled but inactive.
+
+        let device_c_sk = SigningKey::generate(&mut OsRng);
+        let device_c_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: device_c_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let result = enroll_via_quorum(
+            &state,
+            vec![(&device_a_sk, device_a_id), (&device_b_sk, device_b_id)],
+            &device_c_sk,
+            device_c_bundle,
+            1_002_000,
+            crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+        );
+        assert!(matches!(
+            result,
+            Err(OwnerError::InvalidSignature { cert_type: "Enrollment-Quorum-Inactive-Signer" })
+        ));
     }
 
     #[test]

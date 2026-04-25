@@ -83,6 +83,23 @@ impl OwnerState {
                 )?;
             }
         }
+        // Reject older enrollments for an existing device_id (prevents
+        // rollback). If the existing cert has the same issued_at, accept
+        // idempotently if the content matches; reject as a conflict if not
+        // (two different certs with the same timestamp is a forge attempt or
+        // replica drift that should not silently overwrite).
+        if let Some(existing) = self.enrollments.get(&cert.device_id) {
+            if existing.issued_at > cert.issued_at {
+                return Err(OwnerError::InvalidSignature {
+                    cert_type: "Enrollment-Rollback-Rejected",
+                });
+            }
+            if existing.issued_at == cert.issued_at && existing != &cert {
+                return Err(OwnerError::InvalidSignature {
+                    cert_type: "Enrollment-Conflict",
+                });
+            }
+        }
         self.enrollments.insert(cert.device_id, cert);
         Ok(())
     }
@@ -456,6 +473,46 @@ mod tests {
         let liveness = LivenessCert::sign(&sk_a, owner_id, 1_001_000).unwrap();
         let result = state.add_liveness(liveness);
         assert!(matches!(result, Err(OwnerError::Revoked { device }) if device == id_a));
+    }
+
+    #[test]
+    fn rollback_enrollment_rejected() {
+        let (master_sk, master_bundle) = keypair_and_bundle();
+        let owner_id = master_bundle.identity_hash();
+        let (_, device_bundle) = keypair_and_bundle();
+        let device_id = device_bundle.identity_hash();
+        let mut state = OwnerState::new(owner_id);
+
+        // Newer enrollment (issued at later timestamp) is added first
+        let newer = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle.clone(),
+            device_id,
+            device_bundle.clone(),
+            2_000_000,
+            None,
+        )
+        .unwrap();
+        state
+            .add_enrollment(newer, 2_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+
+        // Older enrollment for same device — should be rejected as rollback
+        let older = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000_000,
+            None,
+        )
+        .unwrap();
+        let result =
+            state.add_enrollment(older, 2_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS);
+        assert!(matches!(
+            result,
+            Err(OwnerError::InvalidSignature { cert_type: "Enrollment-Rollback-Rejected" })
+        ));
     }
 
     #[test]

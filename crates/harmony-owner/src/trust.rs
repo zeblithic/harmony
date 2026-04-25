@@ -37,10 +37,22 @@ pub fn evaluate_trust(
     let active = state.active_devices(now, active_window_secs);
     let active_set: HashSet<_> = active.iter().copied().collect();
 
-    // Freshness: at least one cert in the state must be within freshness window.
+    // Freshness: scoped to ACTIVE siblings (which already excludes revoked
+    // devices via active_devices). Unrelated traffic from non-active devices
+    // does NOT satisfy freshness, narrowing the suppression-attack surface:
+    // a stale state cannot be revived by an attacker replaying old certs from
+    // long-departed devices.
     let cutoff = now.saturating_sub(freshness_window_secs);
-    let any_fresh = state.liveness.values().any(|l| l.timestamp >= cutoff)
-        || state.vouching.iter().any(|v| v.issued_at >= cutoff);
+    let any_fresh = state
+        .liveness
+        .values()
+        .filter(|l| active_set.contains(&l.signer))
+        .any(|l| l.timestamp >= cutoff)
+        || state
+            .vouching
+            .iter()
+            .filter(|v| active_set.contains(&v.signer))
+            .any(|v| v.issued_at >= cutoff);
     if !any_fresh {
         return TrustDecision::Refused(RefusalReason::StaleTrustState);
     }
@@ -168,6 +180,64 @@ mod tests {
 
         let decision = evaluate_trust(&state, id_b, 1_500_000, DEFAULT_ACTIVE_WINDOW_SECS, DEFAULT_FRESHNESS_WINDOW_SECS);
         assert_eq!(decision, TrustDecision::Refused(RefusalReason::ChallengedBySibling));
+    }
+
+    #[test]
+    fn revoked_device_liveness_does_not_satisfy_freshness() {
+        // A and B are both alive at 1_500_000; B is then revoked at 1_500_500.
+        // Jump well past the freshness window relative to when A was last alive.
+        // Since B's liveness predates the freshness cutoff AND B is no longer
+        // active, B's liveness must NOT satisfy freshness for the family.
+        // A's liveness is also stale → refusal expected.
+        let (master_sk, master_bundle) = keypair_and_bundle();
+        let owner_id = master_bundle.identity_hash();
+        let (sk_a, bundle_a) = keypair_and_bundle();
+        let (sk_b, bundle_b) = keypair_and_bundle();
+
+        let mut state = OwnerState::new(owner_id);
+        let id_a = enroll_via_master(
+            &mut state,
+            &master_sk,
+            master_bundle.clone(),
+            bundle_a.clone(),
+            1_000_000,
+        );
+        let id_b = enroll_via_master(
+            &mut state,
+            &master_sk,
+            master_bundle,
+            bundle_b.clone(),
+            1_000_001,
+        );
+
+        state
+            .add_liveness(LivenessCert::sign(&sk_a, owner_id, 1_500_000).unwrap())
+            .unwrap();
+        state
+            .add_liveness(LivenessCert::sign(&sk_b, owner_id, 1_500_000).unwrap())
+            .unwrap();
+        let rev = crate::certs::RevocationCert::sign_self(
+            &sk_b,
+            owner_id,
+            id_b,
+            1_500_500,
+            crate::certs::RevocationReason::Compromised,
+        )
+        .unwrap();
+        state.add_revocation(rev).unwrap();
+
+        // Now jump WAY past freshness. A's liveness is stale; B's is also stale
+        // (and B is revoked anyway). Freshness scoped to active siblings → no
+        // active sibling has fresh signal → refuse with StaleTrustState.
+        let now = 1_500_000 + DEFAULT_FRESHNESS_WINDOW_SECS + 1;
+        let decision = evaluate_trust(
+            &state,
+            id_a,
+            now,
+            DEFAULT_ACTIVE_WINDOW_SECS,
+            DEFAULT_FRESHNESS_WINDOW_SECS,
+        );
+        assert_eq!(decision, TrustDecision::Refused(RefusalReason::StaleTrustState));
     }
 
     #[test]

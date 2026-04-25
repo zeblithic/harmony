@@ -55,6 +55,12 @@ impl LivenessCert {
         if self.version != LIVENESS_VERSION {
             return Err(OwnerError::UnknownVersion(self.version));
         }
+        // Bind the signer field to the provided verifying key so that a cert
+        // claiming to be from device-A can never verify under device-B's key.
+        let expected_signer = PubKeyBundle::classical_only(signer_pubkey.to_bytes()).identity_hash();
+        if self.signer != expected_signer {
+            return Err(OwnerError::IdentityHashMismatch);
+        }
         let payload_bytes = cbor::to_canonical(&LivenessSigningPayload {
             version: self.version,
             owner_id: self.owner_id,
@@ -83,6 +89,25 @@ mod tests {
         let sk_b = SigningKey::generate(&mut OsRng);
         let cert = LivenessCert::sign(&sk_a, [1u8; 16], 1).unwrap();
         let result = cert.verify(&sk_b.verifying_key());
-        assert!(matches!(result, Err(OwnerError::InvalidSignature { .. })));
+        // Either IdentityHashMismatch (signer-binding catches it first) or
+        // InvalidSignature is acceptable — both prove the cert is rejected.
+        assert!(matches!(
+            result,
+            Err(OwnerError::IdentityHashMismatch) | Err(OwnerError::InvalidSignature { .. })
+        ));
+    }
+
+    #[test]
+    fn cert_with_lying_signer_field_rejected_by_verify() {
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let lying_signer =
+            PubKeyBundle::classical_only(sk_b.verifying_key().to_bytes()).identity_hash();
+        let mut cert = LivenessCert::sign(&sk_a, [1u8; 16], 1).unwrap();
+        cert.signer = lying_signer;
+        // Verifying with A's pubkey (the actual signer) should now fail because
+        // cert.signer doesn't match A's identity hash.
+        let result = cert.verify(&sk_a.verifying_key());
+        assert!(matches!(result, Err(OwnerError::IdentityHashMismatch)));
     }
 }

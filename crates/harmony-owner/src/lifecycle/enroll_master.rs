@@ -37,6 +37,15 @@ pub fn enroll_via_master(
     }
 
     let device_id = new_device_pubkey.identity_hash();
+    // Validate the new device's signing key matches its claimed pubkey: a
+    // mismatch means subsequent vouches/liveness signed by `new_device_sk`
+    // would not verify against this enrollment, leaving the device unable to
+    // function. Fail-fast at enroll time instead.
+    let derived_id =
+        PubKeyBundle::classical_only(new_device_sk.verifying_key().to_bytes()).identity_hash();
+    if derived_id != device_id {
+        return Err(OwnerError::IdentityHashMismatch);
+    }
     let enrollment_cert = EnrollmentCert::sign_master(
         &master_sk,
         master_pubkey,
@@ -108,6 +117,24 @@ mod tests {
         // Auto-vouch should reach exactly device A (and not B itself)
         assert_eq!(result.auto_vouch_certs.len(), 1);
         assert_eq!(result.auto_vouch_certs[0].target, device_a_id);
+    }
+
+    #[test]
+    fn enroll_via_master_with_mismatched_sk_pubkey_rejected() {
+        let mint = mint_owner(1_000_000).unwrap();
+        let new_sk = SigningKey::generate(&mut OsRng);
+        // Build a pubkey bundle for a DIFFERENT signing key
+        let other_sk = SigningKey::generate(&mut OsRng);
+        let mismatched_bundle = PubKeyBundle::classical_only(other_sk.verifying_key().to_bytes());
+        let result = enroll_via_master(
+            &mint.state,
+            &mint.recovery_artifact,
+            &new_sk,                  // sk for one identity
+            mismatched_bundle,        // pubkey for a different identity
+            1_001_000,
+            crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+        );
+        assert!(matches!(result, Err(OwnerError::IdentityHashMismatch)));
     }
 
     #[test]
