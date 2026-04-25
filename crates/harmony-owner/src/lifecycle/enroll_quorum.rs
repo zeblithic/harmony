@@ -85,7 +85,7 @@ mod tests {
         let mut state = mint.state;
         let device_a_id = *state.enrollments.keys().next().unwrap();
         let device_a_sk = mint.device_signing_key;
-        state.add_liveness(LivenessCert::sign(&device_a_sk, device_a_id, 1_000_001).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&device_a_sk, state.owner_id, device_a_id, 1_000_001).unwrap()).unwrap();
 
         // Enroll device B via master
         let device_b_sk = SigningKey::generate(&mut OsRng);
@@ -100,7 +100,7 @@ mod tests {
         let device_b_id = device_b_bundle.identity_hash();
         state.add_enrollment(r1.enrollment_cert).unwrap();
         for v in r1.auto_vouch_certs { state.add_vouching(v).unwrap(); }
-        state.add_liveness(LivenessCert::sign(&device_b_sk, device_b_id, 1_001_001).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&device_b_sk, state.owner_id, device_b_id, 1_001_001).unwrap()).unwrap();
 
         // Now enroll device C via quorum of A+B
         let device_c_sk = SigningKey::generate(&mut OsRng);

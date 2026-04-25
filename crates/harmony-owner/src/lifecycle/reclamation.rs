@@ -91,7 +91,7 @@ mod tests {
     fn refuted_by_predecessor_liveness() {
         let result = mint_reclaimed([9u8; 16], DEFAULT_CHALLENGE_WINDOW_SECS, "lost".into(), 1_000_000).unwrap();
         let predecessor_sk = SigningKey::generate(&mut OsRng);
-        let liveness = LivenessCert::sign(&predecessor_sk, [9u8; 16], 1_000_500).unwrap();
+        let liveness = LivenessCert::sign(&predecessor_sk, [9u8; 16], [9u8; 16], 1_000_500).unwrap();
         let status = evaluate_reclamation(&result.reclamation_cert, &[liveness], 1_000_500);
         assert_eq!(status, ReclamationStatus::Refuted);
     }
@@ -100,7 +100,7 @@ mod tests {
     fn liveness_before_reclamation_does_not_refute() {
         let result = mint_reclaimed([9u8; 16], DEFAULT_CHALLENGE_WINDOW_SECS, "lost".into(), 1_000_000).unwrap();
         let predecessor_sk = SigningKey::generate(&mut OsRng);
-        let liveness = LivenessCert::sign(&predecessor_sk, [9u8; 16], 999_999).unwrap();
+        let liveness = LivenessCert::sign(&predecessor_sk, [9u8; 16], [9u8; 16], 999_999).unwrap();
         let status = evaluate_reclamation(&result.reclamation_cert, &[liveness], 1_000_500);
         assert_eq!(status, ReclamationStatus::Pending);
     }

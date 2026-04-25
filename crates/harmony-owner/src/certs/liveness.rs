@@ -9,6 +9,7 @@ pub const LIVENESS_VERSION: u8 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LivenessCert {
     pub version: u8,
+    pub owner_id: [u8; 16],
     pub signer: [u8; 16],
     pub timestamp: u64,
     #[serde(with = "serde_bytes")]
@@ -18,19 +19,32 @@ pub struct LivenessCert {
 #[derive(Debug, Clone, Serialize)]
 struct LivenessSigningPayload {
     version: u8,
+    owner_id: [u8; 16],
     signer: [u8; 16],
     timestamp: u64,
 }
 
 impl LivenessCert {
-    pub fn sign(signer_sk: &SigningKey, signer: [u8; 16], timestamp: u64) -> Result<Self, OwnerError> {
+    pub fn sign(
+        signer_sk: &SigningKey,
+        owner_id: [u8; 16],
+        signer: [u8; 16],
+        timestamp: u64,
+    ) -> Result<Self, OwnerError> {
         let payload_bytes = cbor::to_canonical(&LivenessSigningPayload {
             version: LIVENESS_VERSION,
+            owner_id,
             signer,
             timestamp,
         })?;
         let signature = sign_with_tag(signer_sk, tags::LIVENESS, &payload_bytes);
-        Ok(LivenessCert { version: LIVENESS_VERSION, signer, timestamp, signature })
+        Ok(LivenessCert {
+            version: LIVENESS_VERSION,
+            owner_id,
+            signer,
+            timestamp,
+            signature,
+        })
     }
 
     pub fn verify(&self, signer_pubkey: &VerifyingKey) -> Result<(), OwnerError> {
@@ -39,6 +53,7 @@ impl LivenessCert {
         }
         let payload_bytes = cbor::to_canonical(&LivenessSigningPayload {
             version: self.version,
+            owner_id: self.owner_id,
             signer: self.signer,
             timestamp: self.timestamp,
         })?;
@@ -54,7 +69,7 @@ mod tests {
     #[test]
     fn liveness_roundtrip() {
         let sk = SigningKey::generate(&mut OsRng);
-        let cert = LivenessCert::sign(&sk, [1u8; 16], 1_700_000_000).unwrap();
+        let cert = LivenessCert::sign(&sk, [1u8; 16], [2u8; 16], 1_700_000_000).unwrap();
         cert.verify(&sk.verifying_key()).unwrap();
     }
 
@@ -62,7 +77,7 @@ mod tests {
     fn liveness_rejected_with_wrong_key() {
         let sk_a = SigningKey::generate(&mut OsRng);
         let sk_b = SigningKey::generate(&mut OsRng);
-        let cert = LivenessCert::sign(&sk_a, [1u8; 16], 1).unwrap();
+        let cert = LivenessCert::sign(&sk_a, [1u8; 16], [2u8; 16], 1).unwrap();
         let result = cert.verify(&sk_b.verifying_key());
         assert!(matches!(result, Err(OwnerError::InvalidSignature { .. })));
     }

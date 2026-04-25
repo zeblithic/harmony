@@ -71,6 +71,9 @@ impl OwnerState {
     }
 
     pub fn add_liveness(&mut self, cert: LivenessCert) -> Result<(), OwnerError> {
+        if cert.owner_id != self.owner_id {
+            return Err(OwnerError::WrongOwner { expected: self.owner_id, got: cert.owner_id });
+        }
         let enrollment = self.enrollments.get(&cert.signer)
             .ok_or(OwnerError::NotEnrolled { owner: self.owner_id, device: cert.signer })?;
         let vk = VerifyingKey::from_bytes(&enrollment.device_pubkeys.classical.ed25519_verify)
@@ -195,7 +198,7 @@ mod tests {
         let mut state = OwnerState::new(owner_id);
         state.add_enrollment(enrollment).unwrap();
 
-        let liveness = LivenessCert::sign(&device_sk, device_id, 1_500_000).unwrap();
+        let liveness = LivenessCert::sign(&device_sk, owner_id, device_id, 1_500_000).unwrap();
         state.add_liveness(liveness).unwrap();
 
         let active = state.active_devices(1_500_000, 24 * 60 * 60);
@@ -216,7 +219,7 @@ mod tests {
         let mut state = OwnerState::new(owner_id);
         state.add_enrollment(enrollment).unwrap();
 
-        let liveness = LivenessCert::sign(&device_sk, device_id, 1_500_000).unwrap();
+        let liveness = LivenessCert::sign(&device_sk, owner_id, device_id, 1_500_000).unwrap();
         state.add_liveness(liveness).unwrap();
 
         let revocation = crate::certs::RevocationCert::sign_self(
