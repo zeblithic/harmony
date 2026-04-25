@@ -23,6 +23,17 @@ pub struct PqKeys {
 }
 
 impl PubKeyBundle {
+    /// Convenience constructor for a classical-only bundle from a verifying key.
+    /// X25519 stub — see TODO in mint.rs for HKDF derivation in v1.1. Used by
+    /// VouchingCert / LivenessCert sign() to derive the signer identity hash
+    /// from the signing key without requiring callers to pass it explicitly.
+    pub fn classical_only(ed25519_verify: [u8; 32]) -> Self {
+        Self {
+            classical: ClassicalKeys { ed25519_verify, x25519_pub: [0u8; 32] },
+            post_quantum: None,
+        }
+    }
+
     /// Derive the 128-bit IdentityHash from SIGNING-only material:
     /// `SHA256(ed25519_verify || optional ml_dsa_verify)[:16]`.
     ///

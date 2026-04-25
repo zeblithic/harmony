@@ -29,7 +29,7 @@ fn full_three_device_lifecycle() {
     let device_a_id = *mint.state.enrollments.keys().next().unwrap();
     let device_a_sk = mint.device_signing_key;
     let mut state = mint.state;
-    state.add_liveness(LivenessCert::sign(&device_a_sk, state.owner_id, device_a_id, 1_000_001).unwrap()).unwrap();
+    state.add_liveness(LivenessCert::sign(&device_a_sk, state.owner_id, 1_000_001).unwrap()).unwrap();
 
     // Single-device → Full trust
     assert_eq!(
@@ -43,7 +43,7 @@ fn full_three_device_lifecycle() {
     let r1 = enroll_via_master(&state, &mint.recovery_artifact, &device_b_sk, device_b_bundle, 1_001_000, DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
     state.add_enrollment(r1.enrollment_cert, 1_001_000, DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
     for v in r1.auto_vouch_certs { state.add_vouching(v).unwrap(); }
-    state.add_liveness(LivenessCert::sign(&device_b_sk, state.owner_id, device_b_id, 1_001_001).unwrap()).unwrap();
+    state.add_liveness(LivenessCert::sign(&device_b_sk, state.owner_id, 1_001_001).unwrap()).unwrap();
 
     // Device B is provisional (auto-vouches don't count for B because B vouched for A, not the other way)
     assert_eq!(
@@ -52,7 +52,7 @@ fn full_three_device_lifecycle() {
     );
 
     // Device A ratifies B
-    state.add_vouching(VouchingCert::sign(&device_a_sk, state.owner_id, device_a_id, device_b_id, Stance::Vouch, 1_001_500).unwrap()).unwrap();
+    state.add_vouching(VouchingCert::sign(&device_a_sk, state.owner_id, device_b_id, Stance::Vouch, 1_001_500).unwrap()).unwrap();
 
     // Device B is now Full
     assert_eq!(
@@ -73,10 +73,10 @@ fn full_three_device_lifecycle() {
     ).unwrap();
     state.add_enrollment(r2.enrollment_cert, 1_002_000, DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
     for v in r2.auto_vouch_certs { state.add_vouching(v).unwrap(); }
-    state.add_liveness(LivenessCert::sign(&device_c_sk, state.owner_id, device_c_id, 1_002_001).unwrap()).unwrap();
+    state.add_liveness(LivenessCert::sign(&device_c_sk, state.owner_id, 1_002_001).unwrap()).unwrap();
 
     // Device A ratifies C
-    state.add_vouching(VouchingCert::sign(&device_a_sk, state.owner_id, device_a_id, device_c_id, Stance::Vouch, 1_002_500).unwrap()).unwrap();
+    state.add_vouching(VouchingCert::sign(&device_a_sk, state.owner_id, device_c_id, Stance::Vouch, 1_002_500).unwrap()).unwrap();
 
     assert_eq!(
         evaluate_trust(&state, device_c_id, 1_002_500, DEFAULT_ACTIVE_WINDOW_SECS, DEFAULT_FRESHNESS_WINDOW_SECS),
@@ -94,7 +94,7 @@ fn full_three_device_lifecycle() {
 
     // T4: Device C goes silent for 91 days. Active set should drop C.
     let way_later = 1_003_000 + 91 * 24 * 60 * 60;
-    state.add_liveness(LivenessCert::sign(&device_a_sk, state.owner_id, device_a_id, way_later).unwrap()).unwrap();
+    state.add_liveness(LivenessCert::sign(&device_a_sk, state.owner_id, way_later).unwrap()).unwrap();
     let active_now = state.active_devices(way_later, DEFAULT_ACTIVE_WINDOW_SECS);
     assert_eq!(active_now, vec![device_a_id]);
 }

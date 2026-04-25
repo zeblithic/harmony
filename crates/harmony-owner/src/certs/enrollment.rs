@@ -108,8 +108,17 @@ impl EnrollmentCert {
             EnrollmentIssuer::Quorum { signers, signatures } => {
                 // Quorum verification is delegated to OwnerState (which has access to
                 // the full set of signer Enrollment Certs). This standalone verify()
-                // only checks the signature count matches signers count.
+                // performs the structural checks that don't require state lookup:
+                // minimum quorum size, signers/signatures parity, distinct signers,
+                // and device-id consistency.
+                if signers.len() < 2 {
+                    return Err(OwnerError::InsufficientQuorum { min: 2, got: signers.len() });
+                }
                 if signers.len() != signatures.len() {
+                    return Err(OwnerError::InvalidSignature { cert_type: "Enrollment" });
+                }
+                let unique: std::collections::HashSet<[u8; 16]> = signers.iter().copied().collect();
+                if unique.len() != signers.len() {
                     return Err(OwnerError::InvalidSignature { cert_type: "Enrollment" });
                 }
                 if self.device_pubkeys.identity_hash() != self.device_id {

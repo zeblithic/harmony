@@ -43,6 +43,16 @@ pub enum ReclamationStatus {
 
 /// Evaluate a reclamation cert's status given the current time and any
 /// observed liveness from devices under the predecessor identity.
+///
+/// # Caller contract
+///
+/// `predecessor_liveness_certs` MUST be pre-verified by the caller — each
+/// cert's signature MUST already have been validated against the
+/// corresponding device's pubkey (looked up via the predecessor identity's
+/// `OwnerState`), and the signer MUST already have been confirmed to be
+/// enrolled under the predecessor identity. This function only inspects
+/// timestamps; passing forged or unverified certs leads to incorrect
+/// `ReclamationStatus` results.
 pub fn evaluate_reclamation(
     cert: &ReclamationCert,
     predecessor_liveness_certs: &[LivenessCert],
@@ -85,7 +95,7 @@ mod tests {
     fn refuted_by_predecessor_liveness() {
         let result = mint_reclaimed([9u8; 16], DEFAULT_CHALLENGE_WINDOW_SECS, "lost".into(), 1_000_000).unwrap();
         let predecessor_sk = SigningKey::generate(&mut OsRng);
-        let liveness = LivenessCert::sign(&predecessor_sk, [9u8; 16], [9u8; 16], 1_000_500).unwrap();
+        let liveness = LivenessCert::sign(&predecessor_sk, [9u8; 16], 1_000_500).unwrap();
         let status = evaluate_reclamation(&result.reclamation_cert, &[liveness], 1_000_500);
         assert_eq!(status, ReclamationStatus::Refuted);
     }
@@ -94,7 +104,7 @@ mod tests {
     fn liveness_before_reclamation_does_not_refute() {
         let result = mint_reclaimed([9u8; 16], DEFAULT_CHALLENGE_WINDOW_SECS, "lost".into(), 1_000_000).unwrap();
         let predecessor_sk = SigningKey::generate(&mut OsRng);
-        let liveness = LivenessCert::sign(&predecessor_sk, [9u8; 16], [9u8; 16], 999_999).unwrap();
+        let liveness = LivenessCert::sign(&predecessor_sk, [9u8; 16], 999_999).unwrap();
         let status = evaluate_reclamation(&result.reclamation_cert, &[liveness], 1_000_500);
         assert_eq!(status, ReclamationStatus::Pending);
     }

@@ -138,7 +138,7 @@ impl OwnerState {
             crate::certs::RevocationIssuer::Quorum { .. } => {
                 return Err(OwnerError::QuorumRevocationNotImplemented);
             }
-            _ => {
+            crate::certs::RevocationIssuer::Master { .. } => {
                 cert.verify(None)?;
             }
         }
@@ -221,7 +221,7 @@ mod tests {
         let mut state = OwnerState::new(owner_id);
         state.add_enrollment(enrollment, 1_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
 
-        let liveness = LivenessCert::sign(&device_sk, owner_id, device_id, 1_500_000).unwrap();
+        let liveness = LivenessCert::sign(&device_sk, owner_id, 1_500_000).unwrap();
         state.add_liveness(liveness).unwrap();
 
         let active = state.active_devices(1_500_000, 24 * 60 * 60);
@@ -242,7 +242,7 @@ mod tests {
         let mut state = OwnerState::new(owner_id);
         state.add_enrollment(enrollment, 1_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
 
-        let liveness = LivenessCert::sign(&device_sk, owner_id, device_id, 1_500_000).unwrap();
+        let liveness = LivenessCert::sign(&device_sk, owner_id, 1_500_000).unwrap();
         state.add_liveness(liveness).unwrap();
 
         let revocation = crate::certs::RevocationCert::sign_self(
@@ -333,7 +333,16 @@ mod tests {
             signature: Vec::new(),
         };
         let result = state.add_enrollment(cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS);
-        assert!(matches!(result, Err(OwnerError::InvalidSignature { cert_type: "Enrollment-Quorum-Duplicate-Signer" })));
+        // Defense-in-depth: EnrollmentCert::verify now also catches duplicate
+        // signers (returning cert_type "Enrollment"), and that fires before
+        // OwnerState's own "Enrollment-Quorum-Duplicate-Signer" check. Either
+        // rejection path is correct — both surface the same invariant.
+        assert!(matches!(
+            result,
+            Err(OwnerError::InvalidSignature {
+                cert_type: "Enrollment" | "Enrollment-Quorum-Duplicate-Signer"
+            })
+        ));
     }
 
     #[test]
@@ -387,7 +396,7 @@ mod tests {
         ).unwrap();
 
         // A publishes liveness, C does not.
-        state.add_liveness(LivenessCert::sign(&sk_a, owner_id, id_a, 1_000_500).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&sk_a, owner_id, 1_000_500).unwrap()).unwrap();
 
         // Attempt quorum enrollment of new device D using [A, C] — C is inactive.
         use crate::cbor;
@@ -444,7 +453,7 @@ mod tests {
         ).unwrap();
         state.add_revocation(rev).unwrap();
 
-        let liveness = LivenessCert::sign(&sk_a, owner_id, id_a, 1_001_000).unwrap();
+        let liveness = LivenessCert::sign(&sk_a, owner_id, 1_001_000).unwrap();
         let result = state.add_liveness(liveness);
         assert!(matches!(result, Err(OwnerError::Revoked { device }) if device == id_a));
     }
@@ -466,7 +475,7 @@ mod tests {
         state.add_revocation(rev).unwrap();
 
         let vouch = crate::certs::VouchingCert::sign(
-            &sk_a, owner_id, id_a, [9u8; 16], crate::certs::Stance::Vouch, 1_001_000
+            &sk_a, owner_id, [9u8; 16], crate::certs::Stance::Vouch, 1_001_000
         ).unwrap();
         let result = state.add_vouching(vouch);
         assert!(matches!(result, Err(OwnerError::Revoked { device }) if device == id_a));

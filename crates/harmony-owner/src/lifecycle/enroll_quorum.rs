@@ -61,7 +61,6 @@ pub fn enroll_via_quorum(
         .map(|sibling_id| VouchingCert::sign(
             new_device_sk,
             state.owner_id,
-            device_id,
             *sibling_id,
             Stance::Vouch,
             now,
@@ -85,7 +84,7 @@ mod tests {
         let mut state = mint.state;
         let device_a_id = *state.enrollments.keys().next().unwrap();
         let device_a_sk = mint.device_signing_key;
-        state.add_liveness(LivenessCert::sign(&device_a_sk, state.owner_id, device_a_id, 1_000_001).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&device_a_sk, state.owner_id, 1_000_001).unwrap()).unwrap();
 
         // Enroll device B via master
         let device_b_sk = SigningKey::generate(&mut OsRng);
@@ -100,7 +99,7 @@ mod tests {
         let device_b_id = device_b_bundle.identity_hash();
         state.add_enrollment(r1.enrollment_cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
         for v in r1.auto_vouch_certs { state.add_vouching(v).unwrap(); }
-        state.add_liveness(LivenessCert::sign(&device_b_sk, state.owner_id, device_b_id, 1_001_001).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&device_b_sk, state.owner_id, 1_001_001).unwrap()).unwrap();
 
         // Now enroll device C via quorum of A+B
         let device_c_sk = SigningKey::generate(&mut OsRng);
@@ -126,6 +125,33 @@ mod tests {
 
         // Verify Device C is now enrolled
         assert!(state.enrollments.contains_key(&device_c_bundle.identity_hash()));
+
+        // Trust evaluation: enroll_via_quorum auto-vouches C-for-each-active-sibling,
+        // i.e. C vouches FOR A and FOR B. A and B have NOT vouched FOR C yet, so C
+        // is Provisional initially. Once A explicitly ratifies C, C transitions to Full.
+        state.add_liveness(LivenessCert::sign(&device_c_sk, state.owner_id, 1_002_001).unwrap()).unwrap();
+        let device_c_id = device_c_bundle.identity_hash();
+        let decision = crate::trust::evaluate_trust(
+            &state, device_c_id,
+            1_002_001,
+            crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            crate::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
+        );
+        assert_eq!(decision, crate::trust::TrustDecision::Provisional);
+
+        // After A explicitly ratifies C, trust → Full
+        let vouch = crate::certs::VouchingCert::sign(
+            &device_a_sk, state.owner_id, device_c_id,
+            crate::certs::Stance::Vouch, 1_002_500,
+        ).unwrap();
+        state.add_vouching(vouch).unwrap();
+        let decision = crate::trust::evaluate_trust(
+            &state, device_c_id,
+            1_002_500,
+            crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            crate::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
+        );
+        assert_eq!(decision, crate::trust::TrustDecision::Full);
     }
 
     #[test]

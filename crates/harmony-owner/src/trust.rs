@@ -102,7 +102,7 @@ mod tests {
         let mut state = OwnerState::new(owner_id);
         let device_id = enroll_via_master(&mut state, &master_sk, master_bundle, device_bundle, 1_000_000);
 
-        let liveness = LivenessCert::sign(&device_sk, owner_id, device_id, 1_500_000).unwrap();
+        let liveness = LivenessCert::sign(&device_sk, owner_id, 1_500_000).unwrap();
         state.add_liveness(liveness).unwrap();
 
         let decision = evaluate_trust(&state, device_id, 1_500_000, DEFAULT_ACTIVE_WINDOW_SECS, DEFAULT_FRESHNESS_WINDOW_SECS);
@@ -117,11 +117,11 @@ mod tests {
         let (sk_b, bundle_b) = keypair_and_bundle();
 
         let mut state = OwnerState::new(owner_id);
-        let id_a = enroll_via_master(&mut state, &master_sk, master_bundle.clone(), bundle_a.clone(), 1_000_000);
+        let _id_a = enroll_via_master(&mut state, &master_sk, master_bundle.clone(), bundle_a.clone(), 1_000_000);
         let id_b = enroll_via_master(&mut state, &master_sk, master_bundle, bundle_b.clone(), 1_000_001);
 
-        state.add_liveness(LivenessCert::sign(&sk_a, owner_id, id_a, 1_500_000).unwrap()).unwrap();
-        state.add_liveness(LivenessCert::sign(&sk_b, owner_id, id_b, 1_500_000).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&sk_a, owner_id, 1_500_000).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&sk_b, owner_id, 1_500_000).unwrap()).unwrap();
 
         let decision = evaluate_trust(&state, id_b, 1_500_000, DEFAULT_ACTIVE_WINDOW_SECS, DEFAULT_FRESHNESS_WINDOW_SECS);
         assert_eq!(decision, TrustDecision::Provisional);
@@ -135,13 +135,13 @@ mod tests {
         let (sk_b, bundle_b) = keypair_and_bundle();
 
         let mut state = OwnerState::new(owner_id);
-        let id_a = enroll_via_master(&mut state, &master_sk, master_bundle.clone(), bundle_a.clone(), 1_000_000);
+        let _id_a = enroll_via_master(&mut state, &master_sk, master_bundle.clone(), bundle_a.clone(), 1_000_000);
         let id_b = enroll_via_master(&mut state, &master_sk, master_bundle, bundle_b.clone(), 1_000_001);
 
-        state.add_liveness(LivenessCert::sign(&sk_a, owner_id, id_a, 1_500_000).unwrap()).unwrap();
-        state.add_liveness(LivenessCert::sign(&sk_b, owner_id, id_b, 1_500_000).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&sk_a, owner_id, 1_500_000).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&sk_b, owner_id, 1_500_000).unwrap()).unwrap();
 
-        let vouch = VouchingCert::sign(&sk_a, owner_id, id_a, id_b, Stance::Vouch, 1_400_000).unwrap();
+        let vouch = VouchingCert::sign(&sk_a, owner_id, id_b, Stance::Vouch, 1_400_000).unwrap();
         state.add_vouching(vouch).unwrap();
 
         let decision = evaluate_trust(&state, id_b, 1_500_000, DEFAULT_ACTIVE_WINDOW_SECS, DEFAULT_FRESHNESS_WINDOW_SECS);
@@ -156,15 +156,15 @@ mod tests {
         let (sk_b, bundle_b) = keypair_and_bundle();
 
         let mut state = OwnerState::new(owner_id);
-        let id_a = enroll_via_master(&mut state, &master_sk, master_bundle.clone(), bundle_a.clone(), 1_000_000);
+        let _id_a = enroll_via_master(&mut state, &master_sk, master_bundle.clone(), bundle_a.clone(), 1_000_000);
         let id_b = enroll_via_master(&mut state, &master_sk, master_bundle, bundle_b.clone(), 1_000_001);
 
-        state.add_liveness(LivenessCert::sign(&sk_a, owner_id, id_a, 1_500_000).unwrap()).unwrap();
-        state.add_liveness(LivenessCert::sign(&sk_b, owner_id, id_b, 1_500_000).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&sk_a, owner_id, 1_500_000).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&sk_b, owner_id, 1_500_000).unwrap()).unwrap();
 
         // Vouch first, then challenge from same signer
-        state.add_vouching(VouchingCert::sign(&sk_a, owner_id, id_a, id_b, Stance::Vouch, 1_400_000).unwrap()).unwrap();
-        state.add_vouching(VouchingCert::sign(&sk_a, owner_id, id_a, id_b, Stance::Challenge, 1_450_000).unwrap()).unwrap();
+        state.add_vouching(VouchingCert::sign(&sk_a, owner_id, id_b, Stance::Vouch, 1_400_000).unwrap()).unwrap();
+        state.add_vouching(VouchingCert::sign(&sk_a, owner_id, id_b, Stance::Challenge, 1_450_000).unwrap()).unwrap();
 
         let decision = evaluate_trust(&state, id_b, 1_500_000, DEFAULT_ACTIVE_WINDOW_SECS, DEFAULT_FRESHNESS_WINDOW_SECS);
         assert_eq!(decision, TrustDecision::Refused(RefusalReason::ChallengedBySibling));
@@ -178,7 +178,7 @@ mod tests {
 
         let mut state = OwnerState::new(owner_id);
         let id_a = enroll_via_master(&mut state, &master_sk, master_bundle, bundle_a.clone(), 1_000_000);
-        state.add_liveness(LivenessCert::sign(&sk_a, owner_id, id_a, 1_000_001).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&sk_a, owner_id, 1_000_001).unwrap()).unwrap();
 
         // `now` is far past the freshness window
         let now = 1_000_001 + DEFAULT_FRESHNESS_WINDOW_SECS + 1;

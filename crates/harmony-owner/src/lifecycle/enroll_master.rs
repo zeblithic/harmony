@@ -54,7 +54,6 @@ pub fn enroll_via_master(
         .map(|sibling_id| VouchingCert::sign(
             new_device_sk,
             state.owner_id,
-            device_id,
             *sibling_id,
             Stance::Vouch,
             now,
@@ -79,7 +78,7 @@ mod tests {
         // Device #1 is alive
         let device_a_id = *mint.state.enrollments.keys().next().unwrap();
         let mut state = mint.state;
-        state.add_liveness(LivenessCert::sign(&mint.device_signing_key, state.owner_id, device_a_id, 1_000_001).unwrap()).unwrap();
+        state.add_liveness(LivenessCert::sign(&mint.device_signing_key, state.owner_id, 1_000_001).unwrap()).unwrap();
 
         // Generate device #2
         let device_b_sk = SigningKey::generate(&mut OsRng);
