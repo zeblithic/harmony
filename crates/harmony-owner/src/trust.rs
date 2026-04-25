@@ -52,7 +52,7 @@ pub fn evaluate_trust(
 
     // Challenges from active siblings
     let challenged = state.vouching.challenges_against(target)
-        .any(|c| active_set.contains(&c.signer));
+        .any(|c| active_set.contains(&c.signer) && c.signer != target);
     if challenged {
         return TrustDecision::Refused(RefusalReason::ChallengedBySibling);
     }

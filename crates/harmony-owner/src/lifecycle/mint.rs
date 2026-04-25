@@ -82,6 +82,7 @@ pub fn mint_owner(now: u64) -> Result<MintResult, OwnerError> {
     state.add_enrollment(cert)?;
 
     let recovery_artifact = RecoveryArtifact::from_seed(seed);
+    seed.zeroize();
     // master_sk is dropped here, signaling intent to wipe master from RAM
     // (callers should ensure they don't retain master_sk anywhere).
     drop(master_sk);

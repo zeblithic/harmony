@@ -29,6 +29,13 @@ pub fn enroll_via_master(
     let master_sk = artifact.master_signing_key();
     let master_pubkey = master_pubkey_from_sk(&master_sk);
 
+    if master_pubkey.identity_hash() != state.owner_id {
+        return Err(OwnerError::WrongOwner {
+            expected: state.owner_id,
+            got: master_pubkey.identity_hash(),
+        });
+    }
+
     let device_id = new_device_pubkey.identity_hash();
     let enrollment_cert = EnrollmentCert::sign_master(
         &master_sk,
@@ -110,5 +117,31 @@ mod tests {
         // Auto-vouch should reach exactly device A (and not B itself)
         assert_eq!(result.auto_vouch_certs.len(), 1);
         assert_eq!(result.auto_vouch_certs[0].target, device_a_id);
+    }
+
+    #[test]
+    fn enroll_via_master_with_wrong_artifact_rejected() {
+        // Mint two separate identities
+        let mint_a = mint_owner(1_000_000).unwrap();
+        let mint_b = mint_owner(1_000_001).unwrap();
+
+        // Try to enroll a new device into mint_a's state using mint_b's artifact
+        let new_sk = SigningKey::generate(&mut OsRng);
+        let new_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: new_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let result = enroll_via_master(
+            &mint_a.state,
+            &mint_b.recovery_artifact, // wrong artifact
+            &new_sk,
+            new_bundle,
+            1_002_000,
+            crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+        );
+        assert!(matches!(result, Err(crate::OwnerError::WrongOwner { .. })));
     }
 }

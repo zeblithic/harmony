@@ -115,8 +115,7 @@ impl RevocationCert {
                 verify_with_tag(&vk, tags::REVOCATION, &payload_bytes, &self.signature, "Revocation")
             }
             (RevocationIssuer::Quorum { .. }, _) => {
-                // Delegated to OwnerState.
-                Ok(())
+                Err(OwnerError::QuorumRevocationNotImplemented)
             }
             (RevocationIssuer::SelfDevice, None) => {
                 Err(OwnerError::InvalidSignature { cert_type: "Revocation" })

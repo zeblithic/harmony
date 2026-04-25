@@ -44,7 +44,9 @@ impl ReclamationCert {
         note: String,
     ) -> Result<Self, OwnerError> {
         let new_owner_id = new_owner_pubkey.identity_hash();
-        let challenge_window_end = issued_at + challenge_window_secs;
+        let challenge_window_end = issued_at
+            .checked_add(challenge_window_secs)
+            .ok_or(OwnerError::InvalidChallengeWindow)?;
         let payload_bytes = cbor::to_canonical(&ReclamationSigningPayload {
             version: RECLAMATION_VERSION,
             new_owner_id,
@@ -71,6 +73,9 @@ impl ReclamationCert {
         if self.version != RECLAMATION_VERSION {
             return Err(OwnerError::UnknownVersion(self.version));
         }
+        if self.challenge_window_end < self.issued_at {
+            return Err(OwnerError::InvalidChallengeWindow);
+        }
         if self.new_owner_pubkey.identity_hash() != self.new_owner_id {
             return Err(OwnerError::IdentityHashMismatch);
         }
@@ -92,7 +97,7 @@ impl ReclamationCert {
     /// any device under the predecessor identity refutes this reclamation.
     /// (The actual lookup of "any device under predecessor" is OwnerState's job.)
     pub fn is_refuted_by_timestamp(&self, liveness_timestamp: u64) -> bool {
-        liveness_timestamp > self.issued_at
+        liveness_timestamp > self.issued_at && liveness_timestamp <= self.challenge_window_end
     }
 
     pub fn is_window_expired(&self, now: u64) -> bool {
@@ -132,5 +137,35 @@ mod tests {
         assert!(!cert.is_refuted_by_timestamp(1_000_000));
         assert!(cert.is_window_expired(1_001_000));
         assert!(!cert.is_window_expired(1_000_500));
+    }
+
+    #[test]
+    fn reclamation_with_inverted_window_rejected_in_verify() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let bundle = PubKeyBundle {
+            classical: ClassicalKeys { ed25519_verify: sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
+            post_quantum: None,
+        };
+        let mut cert = ReclamationCert::sign(
+            &sk, bundle.clone(), [9u8; 16], 1_000_000, DEFAULT_CHALLENGE_WINDOW_SECS, "n/a".into()
+        ).unwrap();
+        // Manually corrupt window_end to be before issued_at
+        cert.challenge_window_end = cert.issued_at - 1;
+        let result = cert.verify();
+        assert!(matches!(result, Err(OwnerError::InvalidChallengeWindow)));
+    }
+
+    #[test]
+    fn refutation_outside_window_does_not_refute() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let bundle = PubKeyBundle {
+            classical: ClassicalKeys { ed25519_verify: sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
+            post_quantum: None,
+        };
+        let cert = ReclamationCert::sign(&sk, bundle, [9u8; 16], 1_000_000, 1000, "n/a".into()).unwrap();
+        // Liveness AFTER window expires (window ends at 1_001_000)
+        assert!(!cert.is_refuted_by_timestamp(1_002_000));
+        // Liveness AT window end is still valid (boundary is inclusive)
+        assert!(cert.is_refuted_by_timestamp(1_001_000));
     }
 }

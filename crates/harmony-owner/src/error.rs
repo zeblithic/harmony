@@ -31,6 +31,15 @@ pub enum OwnerError {
 
     #[error("reclamation refuted by predecessor liveness")]
     ReclamationRefuted,
+
+    #[error("certificate owner_id {got:?} does not match state owner_id {expected:?}")]
+    WrongOwner { expected: [u8; 16], got: [u8; 16] },
+
+    #[error("quorum revocation not yet implemented (use SelfDevice or Master variants)")]
+    QuorumRevocationNotImplemented,
+
+    #[error("invalid reclamation challenge window (end < start, or arithmetic overflow)")]
+    InvalidChallengeWindow,
 }
 
 #[cfg(test)]
