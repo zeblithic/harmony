@@ -12,6 +12,7 @@ harmony-crypto = { workspace = true }
 harmony-identity = { workspace = true }
 ciborium = { workspace = true }
 serde = { workspace = true, features = ["derive", "alloc"] }
+serde_bytes = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 ed25519-dalek = { workspace = true }
