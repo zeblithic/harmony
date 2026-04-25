@@ -17,9 +17,17 @@ impl VouchingSet {
     /// already exists with a newer-or-equal timestamp, this is a no-op.
     pub fn insert(&mut self, cert: VouchingCert) {
         let key = (cert.signer, cert.target);
-        match self.cells.get(&key) {
-            Some(existing) if existing.issued_at >= cert.issued_at => { /* no-op: older */ }
-            _ => { self.cells.insert(key, cert); }
+        let should_replace = match self.cells.get(&key) {
+            None => true,
+            Some(existing) if existing.issued_at < cert.issued_at => true,
+            Some(existing) if existing.issued_at == cert.issued_at => {
+                // Deterministic tie-break: keep the lex-greater signature.
+                cert.signature > existing.signature
+            }
+            _ => false,
+        };
+        if should_replace {
+            self.cells.insert(key, cert);
         }
     }
 
@@ -103,5 +111,34 @@ mod tests {
 
         set1.merge(set2);
         assert_eq!(set1.vouches_for(target).count(), 2);
+    }
+
+    #[test]
+    fn equal_timestamp_tie_breaks_deterministically() {
+        let signer = [1u8; 16];
+        let target = [2u8; 16];
+
+        // Two certs with same timestamp but different signatures (different signing keys produce different sigs)
+        let c1 = make_cert(signer, target, Stance::Vouch, 100);
+        let c2 = make_cert(signer, target, Stance::Vouch, 100);
+        assert_ne!(c1.signature, c2.signature, "different signing keys should produce different sigs");
+
+        let (lower, higher) = if c1.signature < c2.signature { (c1, c2) } else { (c2, c1) };
+
+        // Order A: insert lower first, then higher
+        let mut set_a = VouchingSet::new();
+        set_a.insert(lower.clone());
+        set_a.insert(higher.clone());
+
+        // Order B: insert higher first, then lower
+        let mut set_b = VouchingSet::new();
+        set_b.insert(higher.clone());
+        set_b.insert(lower.clone());
+
+        // Both should converge on the higher-signature cert
+        let a_winner = set_a.iter().next().unwrap();
+        let b_winner = set_b.iter().next().unwrap();
+        assert_eq!(a_winner.signature, b_winner.signature);
+        assert_eq!(a_winner.signature, higher.signature);
     }
 }

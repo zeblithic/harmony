@@ -17,9 +17,17 @@ impl RevocationSet {
     }
 
     pub fn insert(&mut self, cert: RevocationCert) {
-        match self.cells.get(&cert.target) {
-            Some(existing) if existing.issued_at <= cert.issued_at => { /* keep earlier */ }
-            _ => { self.cells.insert(cert.target, cert); }
+        let should_replace = match self.cells.get(&cert.target) {
+            None => true,
+            Some(existing) if existing.issued_at > cert.issued_at => true,
+            Some(existing) if existing.issued_at == cert.issued_at => {
+                // Deterministic tie-break: keep the lex-greater signature.
+                cert.signature > existing.signature
+            }
+            _ => false,
+        };
+        if should_replace {
+            self.cells.insert(cert.target, cert);
         }
     }
 
@@ -96,5 +104,27 @@ mod tests {
         s1.merge(s2);
         assert!(s1.is_revoked(target_a));
         assert!(s1.is_revoked(target_b));
+    }
+
+    #[test]
+    fn equal_timestamp_revocation_tie_breaks_deterministically() {
+        let target = [9u8; 16];
+
+        let r1 = make_self_revocation(target, 100);
+        let r2 = make_self_revocation(target, 100);
+        assert_ne!(r1.signature, r2.signature);
+
+        let (lower, higher) = if r1.signature < r2.signature { (r1, r2) } else { (r2, r1) };
+
+        let mut s_a = RevocationSet::new();
+        s_a.insert(lower.clone());
+        s_a.insert(higher.clone());
+
+        let mut s_b = RevocationSet::new();
+        s_b.insert(higher.clone());
+        s_b.insert(lower.clone());
+
+        assert_eq!(s_a.cert_for(target).unwrap().signature, s_b.cert_for(target).unwrap().signature);
+        assert_eq!(s_a.cert_for(target).unwrap().signature, higher.signature);
     }
 }
