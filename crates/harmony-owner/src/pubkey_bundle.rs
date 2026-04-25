@@ -23,7 +23,7 @@ pub struct PqKeys {
 }
 
 impl PubKeyBundle {
-    /// Derive the 128-bit IdentityHash: SHA256(canonical_cbor(self))[:16].
+    /// Derive the 128-bit IdentityHash: first 16 bytes of SHA256(canonical_cbor(self)).
     pub fn identity_hash(&self) -> [u8; 16] {
         let bytes = crate::cbor::to_canonical(self).expect("PubKeyBundle always encodes");
         let digest: [u8; 32] = harmony_crypto::hash::full_hash(&bytes);
