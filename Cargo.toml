@@ -101,7 +101,7 @@ xxhash-rust = { version = "0.8", default-features = false, features = ["xxh64"] 
 ciborium = { version = "0.2", default-features = false }
 
 # Identity recovery (BIP39 mnemonic + passphrase wrapping)
-bip39 = { version = "2", default-features = false, features = ["std"] }
+bip39 = { version = "2", default-features = false, features = ["std", "zeroize"] }
 secrecy = "0.10"
 
 # Email discovery
