@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::recovery::error::RecoveryError;
 use crate::recovery::wire::{
-    serialize_header, HEADER_LEN, KDF_M_KIB, KDF_OUT_LEN, KDF_P, KDF_T, NONCE_LEN, SALT_LEN,
+    parse_header, serialize_header, HEADER_LEN, KDF_M_KIB, KDF_OUT_LEN, KDF_P, KDF_T, MAX_FILE_LEN,
+    MIN_FILE_LEN, NONCE_LEN, SALT_LEN,
 };
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -54,7 +55,10 @@ fn encrypt_core(
     let ct = cipher
         .encrypt(
             XNonce::from_slice(nonce),
-            Payload { msg: plaintext, aad: &header },
+            Payload {
+                msg: plaintext,
+                aad: &header,
+            },
         )
         .expect("XChaCha20-Poly1305 encryption is infallible for in-bounds inputs");
     let mut out = Vec::with_capacity(HEADER_LEN + SALT_LEN + NONCE_LEN + ct.len());
@@ -93,16 +97,14 @@ pub fn encrypt_with_params_for_test(
     // seed bytes. Without this wrapper the Vec drops unzeroized after
     // encrypt_core returns. This pattern propagates to the production
     // to_encrypted_file path landing in Task 11.
-    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
-        crate::cbor::to_canonical(body).expect("body always encodes"),
-    );
+    let plaintext: Zeroizing<Vec<u8>> =
+        Zeroizing::new(crate::cbor::to_canonical(body).expect("body always encodes"));
     encrypt_core(passphrase, &plaintext, salt, nonce)
 }
 
 #[cfg(all(test, feature = "test-fixtures"))]
 mod fixture_helper_tests {
     use super::*;
-    use crate::recovery::wire::MIN_FILE_LEN;
 
     #[test]
     fn deterministic_with_fixed_inputs() {
@@ -153,8 +155,6 @@ mod body_tests {
     }
 }
 
-use crate::recovery::wire::{parse_header, MAX_FILE_LEN, MIN_FILE_LEN};
-
 /// Decrypt + parse a recovery-file byte slice into the seed and metadata.
 /// Returns the raw seed (caller wraps it back into a `RecoveryArtifact`)
 /// and the metadata fields.
@@ -184,16 +184,18 @@ pub(crate) fn decrypt_inner(
     let plaintext_vec = cipher
         .decrypt(
             XNonce::from_slice(nonce),
-            Payload { msg: ciphertext_and_tag, aad: &header },
+            Payload {
+                msg: ciphertext_and_tag,
+                aad: &header,
+            },
         )
         .map_err(|_| RecoveryError::WrongPassphraseOrCorrupt)?;
     // Wrap plaintext in Zeroizing so it's wiped after we finish parsing.
     let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(plaintext_vec);
 
-    let body: RecoveryFileBody = ciborium::de::from_reader(&plaintext[..])
-        .map_err(|_| RecoveryError::PayloadDecodeFailed(
-            "CBOR payload could not be parsed".to_string()
-        ))?;
+    let body: RecoveryFileBody = ciborium::de::from_reader(&plaintext[..]).map_err(|_| {
+        RecoveryError::PayloadDecodeFailed("CBOR payload could not be parsed".to_string())
+    })?;
 
     if body.format != FORMAT_STRING {
         return Err(RecoveryError::UnexpectedPayloadFormat {
@@ -246,5 +248,79 @@ mod decrypt_tests {
         assert_eq!(seed, [11u8; 32]);
         assert_eq!(mint_at, Some(1_700_000_000));
         assert_eq!(comment.as_deref(), Some("primary owner"));
+    }
+}
+
+use rand_core::{OsRng, RngCore};
+
+/// Production encrypt entry point: random salt + nonce per call. The body
+/// is built by the caller from the seed + metadata.
+pub(crate) fn encrypt_inner(
+    passphrase: &SecretString,
+    seed: &[u8; 32],
+    mint_at: Option<u64>,
+    comment: Option<String>,
+) -> Result<Vec<u8>, RecoveryError> {
+    if let Some(c) = comment.as_ref() {
+        if c.len() > MAX_COMMENT_LEN {
+            return Err(RecoveryError::CommentTooLong {
+                actual: c.len(),
+                max: MAX_COMMENT_LEN,
+            });
+        }
+    }
+    let body = RecoveryFileBody {
+        format: FORMAT_STRING.into(),
+        seed: *seed,
+        mint_at,
+        comment,
+    };
+    let plaintext: Zeroizing<Vec<u8>> =
+        Zeroizing::new(crate::cbor::to_canonical(&body).expect("body always encodes"));
+    let mut salt = [0u8; SALT_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce);
+    Ok(encrypt_core(passphrase, &plaintext, &salt, &nonce))
+}
+
+#[cfg(test)]
+mod prod_encrypt_tests {
+    use super::*;
+
+    #[test]
+    fn salt_rotates_per_encode() {
+        let pass = SecretString::from("salt-rot".to_string());
+        let a = encrypt_inner(&pass, &[5u8; 32], None, None).unwrap();
+        let b = encrypt_inner(&pass, &[5u8; 32], None, None).unwrap();
+        // Same payload, fresh salt + nonce → different ciphertexts.
+        assert_ne!(a, b, "salt + nonce regen must produce different bytes");
+        // Salts (offset HEADER_LEN..HEADER_LEN+SALT_LEN) must differ.
+        assert_ne!(
+            &a[HEADER_LEN..HEADER_LEN + SALT_LEN],
+            &b[HEADER_LEN..HEADER_LEN + SALT_LEN]
+        );
+    }
+
+    #[test]
+    fn comment_at_max_length_succeeds() {
+        let pass = SecretString::from("max-len".to_string());
+        let max_comment = "a".repeat(MAX_COMMENT_LEN);
+        let r = encrypt_inner(&pass, &[5u8; 32], None, Some(max_comment));
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn comment_over_max_fails_at_encode() {
+        let pass = SecretString::from("over-len".to_string());
+        let too_long = "a".repeat(MAX_COMMENT_LEN + 1);
+        let err = encrypt_inner(&pass, &[5u8; 32], None, Some(too_long)).unwrap_err();
+        assert!(matches!(
+            err,
+            RecoveryError::CommentTooLong {
+                actual: 257,
+                max: 256
+            }
+        ));
     }
 }
