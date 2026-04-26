@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::recovery::error::RecoveryError;
 use crate::recovery::wire::{
     serialize_header, HEADER_LEN, KDF_M_KIB, KDF_OUT_LEN, KDF_P, KDF_T, NONCE_LEN, SALT_LEN,
 };
@@ -149,5 +150,101 @@ mod body_tests {
         let bytes = crate::cbor::to_canonical(&body).unwrap();
         let back: RecoveryFileBody = ciborium::de::from_reader(&bytes[..]).unwrap();
         assert_eq!(back, body);
+    }
+}
+
+use crate::recovery::wire::{parse_header, MAX_FILE_LEN, MIN_FILE_LEN};
+
+/// Decrypt + parse a recovery-file byte slice into the seed and metadata.
+/// Returns the raw seed (caller wraps it back into a `RecoveryArtifact`)
+/// and the metadata fields.
+pub(crate) fn decrypt_inner(
+    bytes: &[u8],
+    passphrase: &SecretString,
+) -> Result<([u8; 32], Option<u64>, Option<String>), RecoveryError> {
+    if bytes.len() < MIN_FILE_LEN {
+        return Err(RecoveryError::TooSmall(bytes.len()));
+    }
+    if bytes.len() > MAX_FILE_LEN {
+        return Err(RecoveryError::TooLarge(bytes.len()));
+    }
+    parse_header(&bytes[..HEADER_LEN])?;
+
+    let salt: &[u8; SALT_LEN] = bytes[HEADER_LEN..HEADER_LEN + SALT_LEN]
+        .try_into()
+        .expect("range matches SALT_LEN");
+    let nonce: &[u8; NONCE_LEN] = bytes[HEADER_LEN + SALT_LEN..HEADER_LEN + SALT_LEN + NONCE_LEN]
+        .try_into()
+        .expect("range matches NONCE_LEN");
+    let ciphertext_and_tag = &bytes[HEADER_LEN + SALT_LEN + NONCE_LEN..];
+
+    let header = serialize_header();
+    let key = derive_key_argon2id(passphrase, salt);
+    let cipher = XChaCha20Poly1305::new(key.as_ref().into());
+    let plaintext_vec = cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload { msg: ciphertext_and_tag, aad: &header },
+        )
+        .map_err(|_| RecoveryError::WrongPassphraseOrCorrupt)?;
+    // Wrap plaintext in Zeroizing so it's wiped after we finish parsing.
+    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(plaintext_vec);
+
+    let body: RecoveryFileBody = ciborium::de::from_reader(&plaintext[..])
+        .map_err(|_| RecoveryError::PayloadDecodeFailed(
+            "CBOR payload could not be parsed".to_string()
+        ))?;
+
+    if body.format != FORMAT_STRING {
+        return Err(RecoveryError::UnexpectedPayloadFormat {
+            found: body.format,
+            expected: FORMAT_STRING,
+        });
+    }
+    if let Some(c) = body.comment.as_ref() {
+        if c.len() > MAX_COMMENT_LEN {
+            return Err(RecoveryError::CommentTooLong {
+                actual: c.len(),
+                max: MAX_COMMENT_LEN,
+            });
+        }
+    }
+    Ok((body.seed, body.mint_at, body.comment))
+}
+
+#[cfg(all(test, feature = "test-fixtures"))]
+mod decrypt_tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_minimal() {
+        let pass = SecretString::from("rt-test".to_string());
+        let body = RecoveryFileBody {
+            format: FORMAT_STRING.into(),
+            seed: [9u8; 32],
+            mint_at: None,
+            comment: None,
+        };
+        let bytes = encrypt_with_params_for_test(&pass, &body, &[1u8; SALT_LEN], &[2u8; NONCE_LEN]);
+        let (seed, mint_at, comment) = decrypt_inner(&bytes, &pass).unwrap();
+        assert_eq!(seed, [9u8; 32]);
+        assert_eq!(mint_at, None);
+        assert_eq!(comment, None);
+    }
+
+    #[test]
+    fn round_trip_with_full_metadata() {
+        let pass = SecretString::from("rt-full".to_string());
+        let body = RecoveryFileBody {
+            format: FORMAT_STRING.into(),
+            seed: [11u8; 32],
+            mint_at: Some(1_700_000_000),
+            comment: Some("primary owner".into()),
+        };
+        let bytes = encrypt_with_params_for_test(&pass, &body, &[3u8; SALT_LEN], &[4u8; NONCE_LEN]);
+        let (seed, mint_at, comment) = decrypt_inner(&bytes, &pass).unwrap();
+        assert_eq!(seed, [11u8; 32]);
+        assert_eq!(mint_at, Some(1_700_000_000));
+        assert_eq!(comment.as_deref(), Some("primary owner"));
     }
 }
