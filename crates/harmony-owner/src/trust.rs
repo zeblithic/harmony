@@ -16,7 +16,6 @@ pub enum TrustDecision {
 pub enum RefusalReason {
     NotEnrolled,
     Revoked,
-    Contested,
     StaleTrustState,
     ChallengedBySibling,
 }

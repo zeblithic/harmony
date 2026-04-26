@@ -13,8 +13,12 @@ impl VouchingSet {
         Self::default()
     }
 
-    /// Insert a cert. If a cert from the same signer about the same target
-    /// already exists with a newer-or-equal timestamp, this is a no-op.
+    /// Insert a cert. For the same `(signer, target)` cell:
+    /// - newer `issued_at` replaces older
+    /// - equal `issued_at` resolves via deterministic signature tie-break
+    ///   (lex-greater signature wins) — equal-timestamp inserts may
+    ///   replace the existing cell when the incoming signature sorts higher
+    /// - older `issued_at` is ignored
     pub fn insert(&mut self, cert: VouchingCert) {
         let key = (cert.signer, cert.target);
         let should_replace = match self.cells.get(&key) {

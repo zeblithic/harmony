@@ -127,6 +127,7 @@ Periodic signed timestamp:
 
 ```rust
 struct LivenessCert {
+    owner_id: IdentityHash,       // owner M
     signer: IdentityHash,         // device D
     timestamp: u64,
     signature: Vec<u8>,
@@ -229,7 +230,7 @@ enum RevocationIssuer { SelfDevice, Master, Quorum { signers, signatures } }
 enum RevocationReason { Decommissioned, Lost, Compromised, Other(String) }
 ```
 
-2. **Master / quorum revocation:** for stolen / compromised devices that may still be online and refusing to self-revoke. Same authority rules as enrollment.
+1. **Master / quorum revocation:** for stolen / compromised devices that may still be online and refusing to self-revoke. Same authority rules as enrollment.
 
 **Compromised-master detection:** if `M` issues a flurry of revocations against currently-active devices, those devices counter-sign `LivenessCert`s with timestamp > revocation. Verifiers see a contested state at the whole-identity level and degrade trust pending out-of-band resolution. The compromise is visibly suspicious rather than a silent takeover.
 
