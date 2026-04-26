@@ -70,17 +70,22 @@ fn wire_format_v1_pinned() {
     let path = fixture_path();
     let regen = std::env::var("HARMONY_REGENERATE_RECOVERY_WIRE_FIXTURE").is_ok();
 
-    if regen || !path.exists() {
+    if regen {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(&path, deterministic_bytes()).unwrap();
-        if regen {
-            // Honor the explicit regen request — pass the test, the
-            // operator just told us this run is for fixture rewrite.
-            return;
-        }
+        // Explicit regeneration run — operator opted into rewrite.
+        return;
     }
+    assert!(
+        path.exists(),
+        "wire-format fixture {FIXTURE_REL_PATH} is missing. The committed \
+         binary fixture is the load-bearing pin for the v1 wire format. \
+         If this is intentional (you're regenerating the fixture for a \
+         format change), re-run with HARMONY_REGENERATE_RECOVERY_WIRE_FIXTURE=1 \
+         and commit the new bytes alongside the format_version bump."
+    );
 
     let on_disk = std::fs::read(&path).unwrap();
     let expected = deterministic_bytes();
