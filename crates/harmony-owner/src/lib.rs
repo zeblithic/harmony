@@ -39,4 +39,7 @@ pub mod signing;
 pub mod state;
 pub mod trust;
 
+#[cfg(feature = "recovery")]
+pub mod recovery;
+
 pub use error::OwnerError;
