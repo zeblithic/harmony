@@ -30,8 +30,11 @@ pub enum RecoveryError {
     #[error("recovery file format version {0:#x} is not supported by this build")]
     UnsupportedVersion(u8),
 
-    #[error("recovery file uses unsupported KDF id {0:#x} or non-standard parameters")]
-    UnsupportedKdfParams(u8),
+    #[error("recovery file uses unsupported KDF id {0:#x}")]
+    UnsupportedKdfId(u8),
+
+    #[error("recovery file KDF id {id:#x} present but parameters are non-standard")]
+    UnsupportedKdfParams { id: u8 },
 
     #[error("wrong passphrase or corrupted recovery file (AEAD tag rejected)")]
     WrongPassphraseOrCorrupt,
@@ -72,6 +75,14 @@ mod tests {
         assert_eq!(
             RecoveryError::UnsupportedVersion(0x02).to_string(),
             "recovery file format version 0x2 is not supported by this build"
+        );
+        assert_eq!(
+            RecoveryError::UnsupportedKdfId(0x99).to_string(),
+            "recovery file uses unsupported KDF id 0x99"
+        );
+        assert_eq!(
+            RecoveryError::UnsupportedKdfParams { id: 0x01 }.to_string(),
+            "recovery file KDF id 0x1 present but parameters are non-standard"
         );
         assert_eq!(
             RecoveryError::UnexpectedPayloadFormat {
