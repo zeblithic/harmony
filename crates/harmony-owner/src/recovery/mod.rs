@@ -10,4 +10,4 @@ pub mod wire;
 pub mod mnemonic;
 pub mod encrypted_file;
 
-// pub use error::RecoveryError;  // re-enabled in Task 3 once the enum exists
+pub use error::RecoveryError;
