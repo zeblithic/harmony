@@ -118,8 +118,8 @@ enum Stance { Vouch, Challenge }
 
 The trust state is two CRDTs at different layers:
 
-1. **VouchingCerts — LWW per `(signer, target)` cell.** Each device can publish at most one current `VouchingCert` per target; newer entries from the same signer supersede older ones. Correct under partition healing because no other signer can override a given signer's cell — flip-flopping reflects the human signer changing their mind, which is intended behavior.
-2. **Revocation set — strict Remove-Wins / monotonic add-only.** Once a `RevocationCert` for `(owner, target)` is in network history, no subsequent enrollment of the same `device_id` is honored, and no vouch can resurrect it. This protects against the partition-race failure mode documented in production "Last-Writer-Wins" / "Add-Wins" CRDT designs — including Apple iCloud Keychain's "one or the other is chosen" merge — where a compromised offline node could re-enable a revoked key by publishing a newer-timestamped delegation. We adopt the strict Remove-Wins pattern recommended by UCAN's Policy-CRDT literature.
+1. **VouchingCerts — LWW per `(signer, target)` cell.** Each device can publish at most one current `VouchingCert` per target; newer entries from the same signer supersede older ones. If `issued_at` is equal across two certs in the same cell, replicas MUST apply a deterministic tie-break: the cert with the lexicographically greater `signature` byte string wins. This guarantees CRDT convergence without relying on wall-clock equality being avoidable. Correct under partition healing because no other signer can override a given signer's cell — flip-flopping reflects the human signer changing their mind, which is intended behavior.
+2. **Revocation set — strict Remove-Wins / monotonic add-only.** Once a `RevocationCert` for `(owner, target)` is in network history, no subsequent enrollment of the same `device_id` is honored, and no vouch can resurrect it. The earliest `issued_at` revocation cert per target wins (so replays of older state don't lose information about already-known revocations); ties at equal `issued_at` resolve via lex-greater `signature` byte string. This protects against the partition-race failure mode documented in production "Last-Writer-Wins" / "Add-Wins" CRDT designs — including Apple iCloud Keychain's "one or the other is chosen" merge — where a compromised offline node could re-enable a revoked key by publishing a newer-timestamped delegation. We adopt the strict Remove-Wins pattern recommended by UCAN's Policy-CRDT literature.
 
 ### Liveness Cert
 
@@ -256,7 +256,7 @@ When peer P encounters device `D` claiming to act under owner `M`:
 4. Count active vouches FOR D from active siblings (excluding D itself).
 5. Count active challenges AGAINST D from active siblings.
 6. Check for whole-identity contested state (master-vs-sibling Liveness conflicts).
-7. Check trust-state freshness: reject the snapshot if its newest signed entry is older than the freshness window (default: 30 days). Trust state must be re-published periodically; this prevents network-suppression attacks where an adversary isolates P from the gossip topic and feeds P a stale view that omits a recent revocation.
+7. Check trust-state freshness using **active-signer evidence**: at least one currently-active sibling (a device with `LivenessCert` within the active window) MUST have produced fresh evidence — either a `LivenessCert` or a `VouchingCert` — within the freshness window (default: 30 days). If no active sibling has been heard from within that window, refuse with `StaleTrustState`. Scoping freshness to active siblings (rather than to any cert in state) prevents a network-suppression attack from being masked by traffic from devices that the verifier has reason to discount (revoked, archived, or otherwise inactive).
 8. Decide:
     - identity contested                   → refuse, surface contested UI
     - trust state stale (>30d)             → refuse, surface stale-state UI; encourage P to re-fetch via queryable
@@ -282,6 +282,14 @@ All certs serialize as **RFC 8949 §4.2 canonical CBOR** and sign over the canon
 3. Existing `harmony-mailbox` and related crates already use CBOR.
 
 A `version: u8` field is part of every cert payload (initial value `0x01`) and is included in the canonical CBOR object covered by the signature. Per the mailbox wire-format policy precedent: bumps are breaking; readers reject unknown versions; writers pin to current.
+
+### Byte-typed field encoding
+
+All fields representing raw bytes — `IdentityHash` (16-byte), `ed25519_verify` / `x25519_pub` / `ml_dsa_verify` / `ml_kem_pub` (variable), `signature`, `issuer_data`, and the per-element entries of `signers` / `signatures` lists — are encoded as **CBOR byte strings** (major type 2), NOT as arrays of integers (major type 4). This matches the natural CBOR encoding for byte-typed data and is what second implementations using any standard CBOR library will produce. Encoding `[u8; N]` as integer arrays would inflate wire size and break interop.
+
+### Quorum signer verification
+
+Each entry in a Quorum cert's `signers` list is a `device_id` (16-byte identity hash), not a pubkey. Verifiers fetch the corresponding signing pubkey by looking up the signer's `EnrollmentCert` in the local state. Since `device_id = identity_hash(signing_material)` (see Identity hash above), the same `device_id` can never have two enrollments with different signing pubkeys — different signing keys produce different identity hashes. Encryption-key rotation (changing X25519 / ML-KEM) does not affect signing-key lookup or signature verification.
 
 ### Domain-separated signatures
 
