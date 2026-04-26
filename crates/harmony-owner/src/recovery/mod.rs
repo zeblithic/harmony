@@ -77,6 +77,16 @@ impl RecoveryArtifact {
     }
 
     /// Encode this artifact + metadata as a passphrase-encrypted file.
+    ///
+    /// Output is a self-contained portable artifact: header || salt || nonce
+    /// || ciphertext || tag, capped at 1024 bytes total. Each call generates
+    /// a fresh random salt + nonce, so re-encoding the same artifact +
+    /// passphrase produces different bytes (decrypt yields the same seed).
+    ///
+    /// Returns [`RecoveryError::CommentTooLong`] if `metadata.comment`
+    /// exceeds 256 bytes. All other failure modes are infallible after
+    /// argument validation (Argon2id and XChaCha20-Poly1305 cannot fail
+    /// for in-bounds inputs).
     pub fn to_encrypted_file(
         &self,
         passphrase: &SecretString,
@@ -91,6 +101,23 @@ impl RecoveryArtifact {
     }
 
     /// Decode a passphrase-encrypted recovery file.
+    ///
+    /// Errors map to specific failure modes:
+    /// - [`RecoveryError::TooSmall`] / [`RecoveryError::TooLarge`]: file
+    ///   length out of [69, 1024] byte range — rejected before Argon2id runs.
+    /// - [`RecoveryError::UnrecognizedFormat`]: not a Harmony recovery file
+    ///   (magic byte mismatch).
+    /// - [`RecoveryError::UnsupportedVersion`]: format version known but
+    ///   not implemented by this build.
+    /// - [`RecoveryError::UnsupportedKdfId`] / [`RecoveryError::UnsupportedKdfParams`]:
+    ///   non-standard KDF (defends against attacker-controlled DoS via
+    ///   absurd Argon2 memory params — header is bound as AEAD AAD so
+    ///   tampering is rejected here, BEFORE the expensive KDF runs).
+    /// - [`RecoveryError::WrongPassphraseOrCorrupt`]: AEAD tag rejected.
+    ///   The two are deliberately conflated: distinguishing them requires
+    ///   speculative info the AEAD does not (and should not) reveal.
+    /// - [`RecoveryError::PayloadDecodeFailed`] / [`RecoveryError::UnexpectedPayloadFormat`]:
+    ///   AEAD passed but the inner payload is malformed or schema-mismatched.
     pub fn from_encrypted_file(
         bytes: &[u8],
         passphrase: &SecretString,
