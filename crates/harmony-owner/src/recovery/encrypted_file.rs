@@ -13,6 +13,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
+use rand_core::{OsRng, RngCore};
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
@@ -249,9 +250,100 @@ mod decrypt_tests {
         assert_eq!(mint_at, Some(1_700_000_000));
         assert_eq!(comment.as_deref(), Some("primary owner"));
     }
-}
 
-use rand_core::{OsRng, RngCore};
+    fn fixture_bytes() -> Vec<u8> {
+        let body = RecoveryFileBody {
+            format: FORMAT_STRING.into(),
+            seed: [13u8; 32],
+            mint_at: Some(1_700_000_000),
+            comment: Some("neg".into()),
+        };
+        encrypt_with_params_for_test(
+            &SecretString::from("correct".to_string()),
+            &body,
+            &[7u8; SALT_LEN],
+            &[8u8; NONCE_LEN],
+        )
+    }
+
+    #[test]
+    fn wrong_passphrase_fails_aead() {
+        let bytes = fixture_bytes();
+        let err = decrypt_inner(&bytes, &SecretString::from("wrong".to_string())).unwrap_err();
+        assert!(matches!(err, RecoveryError::WrongPassphraseOrCorrupt));
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails() {
+        let mut bytes = fixture_bytes();
+        let len = bytes.len();
+        // Flip a byte in the middle of the ciphertext region.
+        let ct_start = HEADER_LEN + SALT_LEN + NONCE_LEN;
+        bytes[ct_start + (len - ct_start) / 2] ^= 0x01;
+        let err = decrypt_inner(&bytes, &SecretString::from("correct".to_string())).unwrap_err();
+        assert!(matches!(err, RecoveryError::WrongPassphraseOrCorrupt));
+    }
+
+    #[test]
+    fn tampered_header_fails_via_aad() {
+        let mut bytes = fixture_bytes();
+        // Flip the kdf_t byte AFTER serialization but ONLY in the on-disk
+        // bytes; parse_header's strict check would catch this first, so we
+        // test a header byte the strict check ignores. Actually all 13 header
+        // bytes are strict-checked, so tampering here returns one of the
+        // strict errors instead of WrongPassphraseOrCorrupt. Test via the
+        // strict path:
+        bytes[10] ^= 0x01; // mutates kdf_t low byte: 3 → 2
+        let err = decrypt_inner(&bytes, &SecretString::from("correct".to_string())).unwrap_err();
+        assert!(matches!(
+            err,
+            RecoveryError::UnsupportedKdfParams { id: 0x01 }
+        ));
+    }
+
+    #[test]
+    fn tampered_kdf_params_rejected_before_argon2() {
+        let mut bytes = fixture_bytes();
+        // Set kdf_m_kib to a small value — the strict check must reject
+        // this BEFORE we run Argon2id with attacker-controlled params.
+        bytes[6..10].copy_from_slice(&1024u32.to_be_bytes());
+        let err = decrypt_inner(&bytes, &SecretString::from("correct".to_string())).unwrap_err();
+        assert!(matches!(
+            err,
+            RecoveryError::UnsupportedKdfParams { id: 0x01 }
+        ));
+    }
+
+    #[test]
+    fn wrong_magic_rejected() {
+        let mut bytes = fixture_bytes();
+        bytes[0] = b'X';
+        let err = decrypt_inner(&bytes, &SecretString::from("correct".to_string())).unwrap_err();
+        assert!(matches!(err, RecoveryError::UnrecognizedFormat));
+    }
+
+    #[test]
+    fn unsupported_version_rejected() {
+        let mut bytes = fixture_bytes();
+        bytes[4] = 0x02;
+        let err = decrypt_inner(&bytes, &SecretString::from("correct".to_string())).unwrap_err();
+        assert!(matches!(err, RecoveryError::UnsupportedVersion(0x02)));
+    }
+
+    #[test]
+    fn too_small_rejected() {
+        let bytes = vec![0u8; 50];
+        let err = decrypt_inner(&bytes, &SecretString::from("correct".to_string())).unwrap_err();
+        assert!(matches!(err, RecoveryError::TooSmall(50)));
+    }
+
+    #[test]
+    fn too_large_rejected() {
+        let bytes = vec![0u8; 2048];
+        let err = decrypt_inner(&bytes, &SecretString::from("correct".to_string())).unwrap_err();
+        assert!(matches!(err, RecoveryError::TooLarge(2048)));
+    }
+}
 
 /// Production encrypt entry point: random salt + nonce per call. The body
 /// is built by the caller from the seed + metadata.
