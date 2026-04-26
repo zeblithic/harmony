@@ -10,7 +10,9 @@ pub const LIVENESS_VERSION: u8 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LivenessCert {
     pub version: u8,
+    #[serde(with = "crate::cbor::arr16")]
     pub owner_id: [u8; 16],
+    #[serde(with = "crate::cbor::arr16")]
     pub signer: [u8; 16],
     pub timestamp: u64,
     #[serde(with = "serde_bytes")]
@@ -20,7 +22,9 @@ pub struct LivenessCert {
 #[derive(Debug, Clone, Serialize)]
 struct LivenessSigningPayload {
     version: u8,
+    #[serde(with = "crate::cbor::arr16")]
     owner_id: [u8; 16],
+    #[serde(with = "crate::cbor::arr16")]
     signer: [u8; 16],
     timestamp: u64,
 }

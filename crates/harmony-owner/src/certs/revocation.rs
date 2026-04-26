@@ -19,13 +19,20 @@ pub enum RevocationReason {
 pub enum RevocationIssuer {
     SelfDevice,
     Master { master_pubkey: PubKeyBundle },
-    Quorum { signers: Vec<[u8; 16]>, signatures: Vec<Vec<u8>> },
+    Quorum {
+        #[serde(with = "crate::cbor::arr16_vec")]
+        signers: Vec<[u8; 16]>,
+        #[serde(with = "crate::cbor::bytes_vec")]
+        signatures: Vec<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevocationCert {
     pub version: u8,
+    #[serde(with = "crate::cbor::arr16")]
     pub owner_id: [u8; 16],
+    #[serde(with = "crate::cbor::arr16")]
     pub target: [u8; 16],
     pub issued_at: u64,
     pub issuer: RevocationIssuer,
@@ -37,10 +44,13 @@ pub struct RevocationCert {
 #[derive(Debug, Clone, Serialize)]
 struct RevocationSigningPayload<'a> {
     version: u8,
+    #[serde(with = "crate::cbor::arr16")]
     owner_id: [u8; 16],
+    #[serde(with = "crate::cbor::arr16")]
     target: [u8; 16],
     issued_at: u64,
     issuer_kind: u8,
+    #[serde(with = "serde_bytes")]
     issuer_data: Vec<u8>,
     reason: &'a RevocationReason,
 }

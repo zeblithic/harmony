@@ -10,7 +10,9 @@ pub const ENROLLMENT_VERSION: u8 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollmentCert {
     pub version: u8,
+    #[serde(with = "crate::cbor::arr16")]
     pub owner_id: [u8; 16],
+    #[serde(with = "crate::cbor::arr16")]
     pub device_id: [u8; 16],
     pub device_pubkeys: PubKeyBundle,
     pub issued_at: u64,
@@ -28,7 +30,9 @@ pub enum EnrollmentIssuer {
     /// K-quorum: each signer has its own EnrollmentCert under the same owner.
     /// Verifier walks back to those certs to fetch signers' pubkeys.
     Quorum {
+        #[serde(with = "crate::cbor::arr16_vec")]
         signers: Vec<[u8; 16]>,
+        #[serde(with = "crate::cbor::bytes_vec")]
         signatures: Vec<Vec<u8>>,
     },
 }
@@ -36,12 +40,15 @@ pub enum EnrollmentIssuer {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EnrollmentSigningPayload<'a> {
     pub(crate) version: u8,
+    #[serde(with = "crate::cbor::arr16")]
     pub(crate) owner_id: [u8; 16],
+    #[serde(with = "crate::cbor::arr16")]
     pub(crate) device_id: [u8; 16],
     pub(crate) device_pubkeys: &'a PubKeyBundle,
     pub(crate) issued_at: u64,
     pub(crate) expires_at: Option<u64>,
     pub(crate) issuer_kind: u8, // 0 = Master, 1 = Quorum
+    #[serde(with = "serde_bytes")]
     pub(crate) issuer_data: Vec<u8>, // CBOR-encoded inner data of the EnrollmentIssuer
 }
 

@@ -13,8 +13,10 @@ pub const DEFAULT_CHALLENGE_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReclamationCert {
     pub version: u8,
+    #[serde(with = "crate::cbor::arr16")]
     pub new_owner_id: [u8; 16],
     pub new_owner_pubkey: PubKeyBundle,
+    #[serde(with = "crate::cbor::arr16")]
     pub claimed_predecessor: [u8; 16],
     pub issued_at: u64,
     pub challenge_window_end: u64,
@@ -26,8 +28,10 @@ pub struct ReclamationCert {
 #[derive(Debug, Clone, Serialize)]
 struct ReclamationSigningPayload<'a> {
     version: u8,
+    #[serde(with = "crate::cbor::arr16")]
     new_owner_id: [u8; 16],
     new_owner_pubkey: &'a PubKeyBundle,
+    #[serde(with = "crate::cbor::arr16")]
     claimed_predecessor: [u8; 16],
     issued_at: u64,
     challenge_window_end: u64,

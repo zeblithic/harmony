@@ -68,6 +68,112 @@ fn canonicalize(v: Value) -> Result<Value, OwnerError> {
     }
 }
 
+/// Serde codec: encode `[u8; 16]` as CBOR byte string (not an array of ints).
+pub mod arr16 {
+    use serde::{de::{Error, Visitor}, Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(v: &[u8; 16], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(v)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 16], D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = [u8; 16];
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a 16-byte byte string")
+            }
+            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                if v.len() != 16 {
+                    return Err(E::invalid_length(v.len(), &self));
+                }
+                let mut out = [0u8; 16];
+                out.copy_from_slice(v);
+                Ok(out)
+            }
+            fn visit_borrowed_bytes<E: Error>(self, v: &'de [u8]) -> Result<Self::Value, E> {
+                self.visit_bytes(v)
+            }
+            fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                self.visit_bytes(&v)
+            }
+        }
+        d.deserialize_bytes(V)
+    }
+}
+
+/// Serde codec: encode `Vec<[u8; 16]>` as a CBOR array of byte strings
+/// (not an array of arrays of ints).
+pub mod arr16_vec {
+    use serde::{de::{Error, SeqAccess, Visitor}, ser::SerializeSeq, Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(v: &Vec<[u8; 16]>, s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(v.len()))?;
+        for arr in v {
+            seq.serialize_element(serde_bytes::Bytes::new(arr))?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<[u8; 16]>, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Vec<[u8; 16]>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a sequence of 16-byte byte strings")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(b) = seq.next_element::<serde_bytes::ByteBuf>()? {
+                    if b.len() != 16 {
+                        return Err(A::Error::invalid_length(b.len(), &"16-byte byte string"));
+                    }
+                    let mut a = [0u8; 16];
+                    a.copy_from_slice(&b);
+                    out.push(a);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_seq(V)
+    }
+}
+
+/// Serde codec: encode `Vec<Vec<u8>>` (variable-length signature list) as a
+/// CBOR array of byte strings.
+pub mod bytes_vec {
+    use serde::{de::{SeqAccess, Visitor}, ser::SerializeSeq, Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(v: &Vec<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(v.len()))?;
+        for bytes in v {
+            seq.serialize_element(serde_bytes::Bytes::new(bytes))?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Vec<Vec<u8>>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a sequence of byte strings")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(b) = seq.next_element::<serde_bytes::ByteBuf>()? {
+                    out.push(b.into_vec());
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_seq(V)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,6 +199,49 @@ mod tests {
         let b1 = to_canonical(&v).unwrap();
         let b2 = to_canonical(&v).unwrap();
         assert_eq!(b1, b2, "encoding must be deterministic");
+    }
+
+    #[test]
+    fn arr16_encodes_as_byte_string() {
+        use serde::Serialize;
+        #[derive(Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct W(#[serde(with = "super::arr16")] [u8; 16]);
+        let v = W([0xAB; 16]);
+        let bytes = to_canonical(&v).unwrap();
+        // CBOR major type 2 (bstr) with length 16 = 0x50; followed by 16 bytes
+        assert_eq!(bytes[0], 0x50);
+        assert_eq!(bytes.len(), 17);
+        let decoded: W = from_bytes(&bytes).unwrap();
+        assert_eq!(v, decoded);
+    }
+
+    #[test]
+    fn arr16_vec_encodes_as_array_of_byte_strings() {
+        use serde::Serialize;
+        #[derive(Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct W(#[serde(with = "super::arr16_vec")] Vec<[u8; 16]>);
+        let v = W(vec![[1u8; 16], [2u8; 16]]);
+        let bytes = to_canonical(&v).unwrap();
+        // Outer = CBOR array of length 2 (0x82); each element = bstr-16 (0x50 + 16 bytes)
+        assert_eq!(bytes[0], 0x82);
+        assert_eq!(bytes[1], 0x50);
+        let decoded: W = from_bytes(&bytes).unwrap();
+        assert_eq!(v, decoded);
+    }
+
+    #[test]
+    fn bytes_vec_encodes_as_array_of_byte_strings() {
+        use serde::Serialize;
+        #[derive(Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct W(#[serde(with = "super::bytes_vec")] Vec<Vec<u8>>);
+        let v = W(vec![vec![0xAA; 64], vec![0xBB; 64]]);
+        let bytes = to_canonical(&v).unwrap();
+        // Outer array of 2; each element bstr-64 (0x58 0x40 ... 64 bytes)
+        assert_eq!(bytes[0], 0x82);
+        assert_eq!(bytes[1], 0x58);  // bstr with 1-byte length
+        assert_eq!(bytes[2], 0x40);  // length = 64
+        let decoded: W = from_bytes(&bytes).unwrap();
+        assert_eq!(v, decoded);
     }
 
     #[test]

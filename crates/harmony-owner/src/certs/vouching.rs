@@ -16,8 +16,11 @@ pub enum Stance {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VouchingCert {
     pub version: u8,
+    #[serde(with = "crate::cbor::arr16")]
     pub owner_id: [u8; 16],
+    #[serde(with = "crate::cbor::arr16")]
     pub signer: [u8; 16],
+    #[serde(with = "crate::cbor::arr16")]
     pub target: [u8; 16],
     pub stance: Stance,
     pub issued_at: u64,
@@ -28,8 +31,11 @@ pub struct VouchingCert {
 #[derive(Debug, Clone, Serialize)]
 struct VouchingSigningPayload {
     version: u8,
+    #[serde(with = "crate::cbor::arr16")]
     owner_id: [u8; 16],
+    #[serde(with = "crate::cbor::arr16")]
     signer: [u8; 16],
+    #[serde(with = "crate::cbor::arr16")]
     target: [u8; 16],
     stance: Stance,
     issued_at: u64,

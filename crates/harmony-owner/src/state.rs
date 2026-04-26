@@ -66,7 +66,9 @@ impl OwnerState {
             }
             // Verify quorum signatures: each signer in `signers` must have an
             // existing enrollment, and each signature in `signatures` must be
-            // valid for that signer's pubkey.
+            // valid for that signer's pubkey. The signing payload is invariant
+            // across iterations — compute it once.
+            let payload_bytes = quorum_signing_payload(&cert)?;
             for (signer_id, sig) in signers.iter().zip(signatures.iter()) {
                 let signer_enrollment = self.enrollments.get(signer_id)
                     .ok_or(OwnerError::NotEnrolled { owner: self.owner_id, device: *signer_id })?;
@@ -75,7 +77,6 @@ impl OwnerState {
                 }
                 let vk = VerifyingKey::from_bytes(&signer_enrollment.device_pubkeys.classical.ed25519_verify)
                     .map_err(|_| OwnerError::InvalidSignature { cert_type: "Enrollment-Quorum-Member" })?;
-                let payload_bytes = quorum_signing_payload(&cert)?;
                 crate::signing::verify_with_tag(
                     &vk,
                     crate::signing::tags::ENROLLMENT,

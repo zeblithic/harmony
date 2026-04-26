@@ -27,8 +27,10 @@ pub fn enroll_via_quorum(
     // pubkey. State.add_enrollment performs the same checks at apply time;
     // surfacing them here means callers get an error before signing instead
     // of an opaque rejection downstream.
+    // Compute active devices once and reuse for the auto-vouch step below to
+    // avoid scanning enrollments + liveness twice on the same `now`.
     let active = state.active_devices(now, active_window_secs);
-    let active_set: std::collections::HashSet<[u8; 16]> = active.into_iter().collect();
+    let active_set: std::collections::HashSet<[u8; 16]> = active.iter().copied().collect();
     let signer_id_set: std::collections::HashSet<[u8; 16]> =
         quorum_signers.iter().map(|(_, id)| *id).collect();
     if signer_id_set.len() != quorum_signers.len() {
@@ -100,7 +102,7 @@ pub fn enroll_via_quorum(
         signature: Vec::new(),
     };
 
-    let active = state.active_devices(now, active_window_secs);
+    // Reuse `active` from the fail-fast block (computed once at function entry).
     let auto_vouch_certs: Vec<VouchingCert> = active.iter()
         .filter(|s| **s != device_id)
         .map(|sibling_id| VouchingCert::sign(
