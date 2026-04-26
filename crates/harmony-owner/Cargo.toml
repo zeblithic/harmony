@@ -1,0 +1,29 @@
+[package]
+name = "harmony-owner"
+description = "Two-tier owner→device identity binding: enrollment, vouching CRDT, lifecycle, trust evaluation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harmony-crypto = { workspace = true }
+harmony-identity = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true, features = ["derive", "alloc"] }
+serde_bytes = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+rand_core = { workspace = true, features = ["getrandom"] }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+rand = { workspace = true }
+
+[features]
+default = []

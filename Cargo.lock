@@ -3660,6 +3660,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-owner"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "ed25519-dalek",
+ "harmony-crypto",
+ "harmony-identity",
+ "hex",
+ "hkdf",
+ "rand 0.8.5",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_bytes",
+ "sha2",
+ "thiserror 2.0.18",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "harmony-peers"
 version = "0.1.0"
 dependencies = [
