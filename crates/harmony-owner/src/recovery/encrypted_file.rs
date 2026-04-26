@@ -293,7 +293,7 @@ mod decrypt_tests {
         // bytes are strict-checked, so tampering here returns one of the
         // strict errors instead of WrongPassphraseOrCorrupt. Test via the
         // strict path:
-        bytes[10] ^= 0x01; // mutates kdf_t low byte: 3 → 2
+        bytes[11] ^= 0x01; // mutates kdf_t low byte: 3 → 2
         let err = decrypt_inner(&bytes, &SecretString::from("correct".to_string())).unwrap_err();
         assert!(matches!(
             err,
