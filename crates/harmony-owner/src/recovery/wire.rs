@@ -36,6 +36,11 @@ pub const TAG_LEN: usize = 16;
 /// Wire-layer minimum: header + salt + nonce + 0-byte ciphertext + tag.
 /// A valid file in practice is larger because the smallest CBOR-encoded
 /// `RecoveryFileBody` exceeds zero bytes; this is the parse-time guard.
+///
+/// Both bounds are enforced by `encrypted_file::decrypt_inner` (Task 10),
+/// not by `parse_header` — the parser is scoped to the 13-byte header
+/// slice and does not see the full file length. Defining the constants
+/// here keeps the v1 wire-format facts in one place.
 pub const MIN_FILE_LEN: usize = HEADER_LEN + SALT_LEN + NONCE_LEN + TAG_LEN; // 69
 pub const MAX_FILE_LEN: usize = 1024;
 
@@ -105,6 +110,24 @@ mod tests {
         assert_eq!(u32::from_be_bytes(h[6..10].try_into().unwrap()), 65536);
         assert_eq!(u16::from_be_bytes(h[10..12].try_into().unwrap()), 3);
         assert_eq!(h[12], 1);
+    }
+
+    /// Golden vector: locks the v1 wire-format header byte-for-byte. Any
+    /// future refactor that consistently flips both serialize and parse
+    /// would silently pass `serialize_header_layout_is_exact` and
+    /// `parse_header_round_trips` together — this test is the canary that
+    /// catches that class of regression.
+    #[test]
+    fn serialize_header_matches_frozen_golden() {
+        let expected: [u8; 13] = [
+            0x48, 0x52, 0x4d, 0x52,   // "HRMR"
+            0x01,                       // format_version
+            0x01,                       // kdf_id (Argon2id)
+            0x00, 0x01, 0x00, 0x00,   // kdf_m_kib = 65536 (BE u32)
+            0x00, 0x03,                 // kdf_t = 3 (BE u16)
+            0x01,                       // kdf_p
+        ];
+        assert_eq!(serialize_header(), expected);
     }
 
     #[test]
