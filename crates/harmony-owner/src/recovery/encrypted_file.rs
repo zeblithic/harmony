@@ -88,14 +88,20 @@ pub fn encrypt_with_params_for_test(
     salt: &[u8; SALT_LEN],
     nonce: &[u8; NONCE_LEN],
 ) -> Vec<u8> {
-    let plaintext = crate::cbor::to_canonical(body).expect("body always encodes");
+    // Wrap in Zeroizing: the CBOR-encoded plaintext contains the 32-byte
+    // seed bytes. Without this wrapper the Vec drops unzeroized after
+    // encrypt_core returns. This pattern propagates to the production
+    // to_encrypted_file path landing in Task 11.
+    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
+        crate::cbor::to_canonical(body).expect("body always encodes"),
+    );
     encrypt_core(passphrase, &plaintext, salt, nonce)
 }
 
 #[cfg(all(test, feature = "test-fixtures"))]
 mod fixture_helper_tests {
     use super::*;
-    use crate::recovery::wire::TAG_LEN;
+    use crate::recovery::wire::MIN_FILE_LEN;
 
     #[test]
     fn deterministic_with_fixed_inputs() {
@@ -111,9 +117,8 @@ mod fixture_helper_tests {
         let a = encrypt_with_params_for_test(&pass, &body, &salt, &nonce);
         let b = encrypt_with_params_for_test(&pass, &body, &salt, &nonce);
         assert_eq!(a, b, "deterministic inputs must produce identical output");
-        assert!(a.len() >= MIN_FILE_LEN_USE);
+        assert!(a.len() >= MIN_FILE_LEN);
     }
-    const MIN_FILE_LEN_USE: usize = HEADER_LEN + SALT_LEN + NONCE_LEN + TAG_LEN;
 }
 
 #[cfg(test)]
