@@ -44,7 +44,7 @@ Both encodings round-trip to the same `RecoveryArtifact`. They serve two distinc
 
 All under `crates/harmony-owner/src/recovery/`, gated by `#[cfg(feature = "recovery")]`:
 
-```
+```text
 src/recovery/
   mod.rs            — public API re-exports + RestoredArtifact / RecoveryMetadata types
                        + impl RecoveryArtifact { to_mnemonic, from_mnemonic,
@@ -67,7 +67,7 @@ default = ["recovery"]
 recovery = ["dep:bip39", "dep:argon2", "dep:chacha20poly1305"]
 
 [dependencies]
-bip39             = { version = "2",    optional = true, default-features = false, features = ["std"] }
+bip39             = { version = "2",    optional = true, default-features = false, features = ["std", "zeroize"] }
 argon2            = { version = "0.5",  optional = true }
 chacha20poly1305  = { version = "0.10", optional = true }
 ```
@@ -80,7 +80,7 @@ Added to `RecoveryArtifact` via `impl` block in `recovery/mod.rs`:
 
 ```rust
 impl RecoveryArtifact {
-    pub fn to_mnemonic(&self) -> String;
+    pub fn to_mnemonic(&self) -> Zeroizing<String>;
     pub fn from_mnemonic(s: &str) -> Result<Self, RecoveryError>;
 
     pub fn to_encrypted_file(
@@ -163,7 +163,7 @@ Returns a `RecoveryArtifact`, which already zeroizes its 32-byte seed on Drop (e
 
 ### Cleartext header (13 bytes, bound as AAD via XChaCha20-Poly1305)
 
-```
+```text
 offset  size  field             value
 0       4     magic             b"HRMR"
 4       1     format_version    0x01
@@ -177,7 +177,7 @@ The `HRMR` magic is deliberately distinct from ZEB-174's `HRMI` (identity.enc at
 
 ### Following the header
 
-```
+```text
 offset      size       field
 13          16         salt
 29          24         nonce (XChaCha20-Poly1305 needs 24)
@@ -271,8 +271,11 @@ pub enum RecoveryError {
     #[error("recovery file format version {0:#x} is not supported by this build")]
     UnsupportedVersion(u8),
 
-    #[error("recovery file uses unsupported KDF id {0:#x} or non-standard parameters")]
-    UnsupportedKdfParams(u8),
+    #[error("recovery file uses unsupported KDF id {0:#x}")]
+    UnsupportedKdfId(u8),
+
+    #[error("recovery file KDF id {id:#x} present but parameters are non-standard")]
+    UnsupportedKdfParams { id: u8 },
 
     #[error("wrong passphrase or corrupted recovery file (AEAD tag rejected)")]
     WrongPassphraseOrCorrupt,

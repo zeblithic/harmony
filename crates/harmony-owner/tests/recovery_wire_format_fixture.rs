@@ -14,15 +14,19 @@
 //! Requires the `test-fixtures` Cargo feature for the deterministic
 //! `encrypt_with_params_for_test` helper.
 //!
-//! ## Encoding decisions pinned by this fixture
+//! ## Encoding decisions documented for this format
 //!
 //! - **Option<None> as CBOR null**: when `mint_at` or `comment` is `None`,
-//!   the field is encoded as CBOR null (0xf6) inside a 4-entry map, NOT
-//!   omitted from the map. This matches the serde default and produces
-//!   a schema-stable wire shape. Changing to
-//!   `#[serde(skip_serializing_if = "Option::is_none")]` would shrink
-//!   files with absent metadata but would require a `format_version`
-//!   bump.
+//!   the serde default encodes the field as CBOR null (0xf6) inside a
+//!   4-entry map, NOT omitted from the map. This produces a schema-stable
+//!   wire shape. Changing to `#[serde(skip_serializing_if = "Option::is_none")]`
+//!   would shrink files with absent metadata but would require a
+//!   `format_version` bump.
+//!
+//!   NOTE: this fixture pins the FULL-METADATA case (both fields `Some(...)`).
+//!   The Option<None> encoding is documented above but not byte-pinned by
+//!   this specific fixture. A future commit could add a second fixture
+//!   (e.g., `recovery_v1_no_metadata.bin`) to pin the None case explicitly.
 
 use harmony_owner::lifecycle::mint::RecoveryArtifact;
 use harmony_owner::recovery::{

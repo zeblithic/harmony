@@ -6,7 +6,7 @@
 
 **Architecture:** New module under `crates/harmony-owner/src/recovery/` with submodules for `mnemonic`, `encrypted_file`, `wire`, and `error`. Public API exposed as inherent methods on the existing `RecoveryArtifact` (no refactor of `lifecycle/mint.rs`). Encrypted-file uses a 13-byte header bound as AAD (matches the ZEB-174 pattern but with magic `HRMR` instead of `HRMI`), variable-length CBOR payload (seed + optional `mint_at` + optional ≤256-byte `comment`), capped at 1024 bytes. A second `test-fixtures` Cargo feature exposes a deterministic-input encrypt helper used by the wire-format fixture test. **Out of plan scope:** harmony-client integration (separate ticket).
 
-**Tech Stack:** Rust 2024, `bip39` v2 (English wordlist), `argon2` v0.5 (Argon2id m=64MiB,t=3,p=1), `chacha20poly1305` v0.10 (XChaCha20-Poly1305), `ciborium` (already a workspace dep, used for canonical CBOR via existing `harmony-owner::cbor`), `secrecy` v0.10 (`SecretString` for passphrases), `subtle` (constant-time comparison), `zeroize` (already in harmony-owner).
+**Tech Stack:** Rust 2021, `bip39` v2 (English wordlist, `zeroize` feature on for mnemonic-entropy wiping), `argon2` v0.5 (Argon2id m=64MiB,t=3,p=1), `chacha20poly1305` v0.10 (XChaCha20-Poly1305), `ciborium` (already a workspace dep, used for canonical CBOR via existing `harmony-owner::cbor`), `secrecy` v0.10 (`SecretString` for passphrases), `subtle` (constant-time comparison), `zeroize` (already in harmony-owner).
 
 **Spec:** `docs/superpowers/specs/2026-04-26-identity-backup-restore-design.md`
 
@@ -44,7 +44,7 @@ In `Cargo.toml` (workspace root), append to the `[workspace.dependencies]` block
 
 ```toml
 # Identity recovery (BIP39 mnemonic + passphrase wrapping)
-bip39 = { version = "2", default-features = false, features = ["std"] }
+bip39 = { version = "2", default-features = false, features = ["std", "zeroize"] }
 secrecy = "0.10"
 ```
 
