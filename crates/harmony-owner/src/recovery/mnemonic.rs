@@ -30,7 +30,13 @@ pub(crate) fn from_mnemonic_inner(s: &str) -> Result<[u8; 32], RecoveryError> {
     }
     // Whitespace normalize + lowercase.
     let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-    let words: Vec<&str> = normalized.split(' ').collect();
+    // Empty/whitespace-only input has no words, but `"".split(' ')` yields
+    // `[""]` — guard explicitly so WrongWordCount reports the right count.
+    let words: Vec<&str> = if normalized.is_empty() {
+        Vec::new()
+    } else {
+        normalized.split(' ').collect()
+    };
     if words.len() != 24 {
         return Err(RecoveryError::WrongWordCount(words.len()));
     }
@@ -39,10 +45,15 @@ pub(crate) fn from_mnemonic_inner(s: &str) -> Result<[u8; 32], RecoveryError> {
         &normalized,
     )
     .map_err(map_bip39_err_with_words(&words))?;
-    let entropy = mnemonic.to_entropy();
+    let mut entropy = mnemonic.to_entropy();
     debug_assert_eq!(entropy.len(), 32, "BIP39-24 always decodes to 32 bytes");
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&entropy);
+    // Wipe the heap-allocated Vec<u8>: bip39's zeroize feature wipes the
+    // Mnemonic word-index storage but NOT the to_entropy() return value,
+    // which is a separate Vec allocation containing the full 32-byte seed.
+    use zeroize::Zeroize;
+    entropy.zeroize();
     Ok(seed)
 }
 
@@ -124,5 +135,19 @@ mod decode_tests {
         // Leading and trailing whitespace
         let padded = format!("   \n{m}\t\t   ");
         assert!(from_mnemonic_inner(&padded).is_ok());
+    }
+
+    /// Empty / whitespace-only input must report 0 words, not 1
+    /// (regression guard for the `"".split(' ')` -> `[""]` pitfall).
+    #[test]
+    fn empty_input_reports_zero_words() {
+        assert!(matches!(
+            from_mnemonic_inner("").unwrap_err(),
+            RecoveryError::WrongWordCount(0)
+        ));
+        assert!(matches!(
+            from_mnemonic_inner("   \t\n").unwrap_err(),
+            RecoveryError::WrongWordCount(0)
+        ));
     }
 }
