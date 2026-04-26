@@ -156,13 +156,18 @@ mod body_tests {
     }
 }
 
+/// `(seed, mint_at, comment)` returned by `decrypt_inner`. Aliased to
+/// quiet `clippy::type_complexity` now that the public `RecoveryArtifact`
+/// API consumes this signature directly.
+pub(crate) type DecryptedParts = ([u8; 32], Option<u64>, Option<String>);
+
 /// Decrypt + parse a recovery-file byte slice into the seed and metadata.
 /// Returns the raw seed (caller wraps it back into a `RecoveryArtifact`)
 /// and the metadata fields.
 pub(crate) fn decrypt_inner(
     bytes: &[u8],
     passphrase: &SecretString,
-) -> Result<([u8; 32], Option<u64>, Option<String>), RecoveryError> {
+) -> Result<DecryptedParts, RecoveryError> {
     if bytes.len() < MIN_FILE_LEN {
         return Err(RecoveryError::TooSmall(bytes.len()));
     }
