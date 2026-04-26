@@ -92,6 +92,19 @@ impl RecoveryArtifact {
         passphrase: &SecretString,
         metadata: &RecoveryMetadata,
     ) -> Result<Vec<u8>, RecoveryError> {
+        // Pre-check comment length BEFORE cloning, so a hostile-large
+        // comment is rejected with no wasted allocation. encrypt_inner
+        // re-checks defensively (defense-in-depth + non-public-API
+        // callers might bypass us), but that check is now redundant
+        // for the public path.
+        if let Some(c) = metadata.comment.as_ref() {
+            if c.len() > encrypted_file::MAX_COMMENT_LEN {
+                return Err(RecoveryError::CommentTooLong {
+                    actual: c.len(),
+                    max: encrypted_file::MAX_COMMENT_LEN,
+                });
+            }
+        }
         encrypted_file::encrypt_inner(
             passphrase,
             self.as_bytes(),
