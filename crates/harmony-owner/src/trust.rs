@@ -61,11 +61,20 @@ pub fn evaluate_trust(
         return TrustDecision::Full;
     }
 
-    // Challenges from active siblings
+    // Challenges from active siblings (still apply even if target is inactive —
+    // a challenge against a stale device is meaningful evidence).
     let challenged = state.vouching.challenges_against(target)
         .any(|c| active_set.contains(&c.signer) && c.signer != target);
     if challenged {
         return TrustDecision::Refused(RefusalReason::ChallengedBySibling);
+    }
+
+    // Target activity is a precondition for Full trust in the multi-device
+    // case: an enrolled-but-inactive device (no liveness within active window)
+    // cannot reach Full regardless of how many vouches its siblings published.
+    // Drop to Provisional so callers can still use it for low-stakes ops.
+    if !active_set.contains(&target) {
+        return TrustDecision::Provisional;
     }
 
     // Vouches from active siblings (excluding target itself)
@@ -253,5 +262,43 @@ mod tests {
         let now = 1_000_001 + DEFAULT_FRESHNESS_WINDOW_SECS + 1;
         let decision = evaluate_trust(&state, id_a, now, DEFAULT_ACTIVE_WINDOW_SECS, DEFAULT_FRESHNESS_WINDOW_SECS);
         assert_eq!(decision, TrustDecision::Refused(RefusalReason::StaleTrustState));
+    }
+
+    #[test]
+    fn inactive_target_with_vouches_is_provisional_not_full() {
+        let (master_sk, master_bundle) = keypair_and_bundle();
+        let owner_id = master_bundle.identity_hash();
+        let (sk_a, bundle_a) = keypair_and_bundle();
+        let (sk_b, bundle_b) = keypair_and_bundle();
+
+        let mut state = OwnerState::new(owner_id);
+        let id_a = enroll_via_master(&mut state, &master_sk, master_bundle.clone(), bundle_a.clone(), 1_000_000);
+        let id_b = enroll_via_master(&mut state, &master_sk, master_bundle, bundle_b.clone(), 1_000_001);
+
+        // Only A is alive; B is enrolled but has NEVER published liveness.
+        state.add_liveness(LivenessCert::sign(&sk_a, owner_id, 1_500_000).unwrap()).unwrap();
+        state.add_vouching(
+            VouchingCert::sign(&sk_a, owner_id, id_b, Stance::Vouch, 1_500_500).unwrap()
+        ).unwrap();
+
+        // B inactive → must NOT be Full despite A's vouch.
+        assert_eq!(
+            evaluate_trust(&state, id_b, 1_500_500, DEFAULT_ACTIVE_WINDOW_SECS, DEFAULT_FRESHNESS_WINDOW_SECS),
+            TrustDecision::Provisional
+        );
+
+        // After B publishes liveness, A's vouch lifts B to Full.
+        state.add_liveness(LivenessCert::sign(&sk_b, owner_id, 1_500_600).unwrap()).unwrap();
+        assert_eq!(
+            evaluate_trust(&state, id_b, 1_500_600, DEFAULT_ACTIVE_WINDOW_SECS, DEFAULT_FRESHNESS_WINDOW_SECS),
+            TrustDecision::Full
+        );
+
+        // Sanity: id_a as target with both alive → Full (A vouching for B doesn't matter; A has no vouches FOR itself, but target=signer is excluded from vouches anyway. With 2 active siblings and 0 vouches for A, A would be Provisional. Re-check.)
+        // Actually A has zero vouches for itself, so multi-device + 0 vouches = Provisional for A.
+        assert_eq!(
+            evaluate_trust(&state, id_a, 1_500_600, DEFAULT_ACTIVE_WINDOW_SECS, DEFAULT_FRESHNESS_WINDOW_SECS),
+            TrustDecision::Provisional
+        );
     }
 }

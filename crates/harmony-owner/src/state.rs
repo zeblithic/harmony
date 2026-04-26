@@ -33,6 +33,12 @@ impl OwnerState {
         if cert.owner_id != self.owner_id {
             return Err(OwnerError::WrongOwner { expected: self.owner_id, got: cert.owner_id });
         }
+        // Remove-Wins revocation is permanent: a revoked device_id cannot be
+        // re-enrolled (would silently overwrite the stored bundle, even though
+        // the device stays revoked, breaking key linkage other code depends on).
+        if self.is_revoked(cert.device_id) {
+            return Err(OwnerError::Revoked { device: cert.device_id });
+        }
         cert.verify()?;
         // For Quorum certs, also walk back to verify each signer's enrollment
         // is present and was issued before this cert's `issued_at`.
@@ -516,6 +522,56 @@ mod tests {
             result,
             Err(OwnerError::InvalidSignature { cert_type: "Enrollment-Rollback-Rejected" })
         ));
+    }
+
+    #[test]
+    fn re_enrollment_of_revoked_device_rejected() {
+        let (master_sk, master_bundle) = keypair_and_bundle();
+        let owner_id = master_bundle.identity_hash();
+        let (sk_a, bundle_a) = keypair_and_bundle();
+        let id_a = bundle_a.identity_hash();
+        let mut state = OwnerState::new(owner_id);
+        state
+            .add_enrollment(
+                EnrollmentCert::sign_master(
+                    &master_sk,
+                    master_bundle.clone(),
+                    id_a,
+                    bundle_a.clone(),
+                    1_000_000,
+                    None,
+                )
+                .unwrap(),
+                1_000_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
+
+        // Revoke A
+        let rev = crate::certs::RevocationCert::sign_self(
+            &sk_a,
+            owner_id,
+            id_a,
+            1_000_500,
+            crate::certs::RevocationReason::Compromised,
+        )
+        .unwrap();
+        state.add_revocation(rev).unwrap();
+
+        // Re-enroll attempt with a fresh enrollment cert for the same device_id
+        // — must be rejected because the device is revoked (Remove-Wins is permanent).
+        let new_cert = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            id_a,
+            bundle_a,
+            1_001_000,
+            None,
+        )
+        .unwrap();
+        let result =
+            state.add_enrollment(new_cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS);
+        assert!(matches!(result, Err(OwnerError::Revoked { device }) if device == id_a));
     }
 
     #[test]
