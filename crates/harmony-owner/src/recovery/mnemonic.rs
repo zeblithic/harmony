@@ -150,4 +150,63 @@ mod decode_tests {
             RecoveryError::WrongWordCount(0)
         ));
     }
+
+    #[test]
+    fn non_ascii_rejected() {
+        // Cyrillic 'a' inside one of the words.
+        let m = to_mnemonic_inner(&[0u8; 32]);
+        let mut chars: Vec<char> = m.chars().collect();
+        chars[0] = 'а'; // U+0430 CYRILLIC SMALL LETTER A
+        let bad: String = chars.into_iter().collect();
+        assert!(matches!(
+            from_mnemonic_inner(&bad).unwrap_err(),
+            RecoveryError::NonAsciiInput
+        ));
+    }
+
+    #[test]
+    fn wrong_word_count_rejected_too_few() {
+        let m = to_mnemonic_inner(&[0u8; 32]);
+        let words: Vec<&str> = m.split_whitespace().take(23).collect();
+        let short = words.join(" ");
+        let err = from_mnemonic_inner(&short).unwrap_err();
+        assert!(matches!(err, RecoveryError::WrongWordCount(23)), "got: {err}");
+    }
+
+    #[test]
+    fn wrong_word_count_rejected_too_many() {
+        let m = to_mnemonic_inner(&[0u8; 32]);
+        let long = format!("{m} extra");
+        let err = from_mnemonic_inner(&long).unwrap_err();
+        assert!(matches!(err, RecoveryError::WrongWordCount(25)), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_word_reports_position() {
+        let m = to_mnemonic_inner(&[0u8; 32]);
+        let words: Vec<&str> = m.split_whitespace().collect();
+        // Replace the 7th word (index 6) with a non-wordlist string.
+        let mut mutated: Vec<String> = words.into_iter().map(String::from).collect();
+        mutated[6] = "harmonny".into();
+        let bad = mutated.join(" ");
+        let err = from_mnemonic_inner(&bad).unwrap_err();
+        match err {
+            RecoveryError::UnknownWord { position, word } => {
+                assert_eq!(position, 7); // 1-indexed
+                assert_eq!(word, "harmonny");
+            }
+            other => panic!("expected UnknownWord, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn bad_checksum_rejected() {
+        // Swap two valid words to break the checksum without introducing
+        // unknown words. The all-zero seed yields "abandon × 23 + art" —
+        // swap "art" for another valid word like "ability" to break checksum.
+        let m = to_mnemonic_inner(&[0u8; 32]);
+        let bad = m.replace("art", "ability");
+        let err = from_mnemonic_inner(&bad).unwrap_err();
+        assert!(matches!(err, RecoveryError::BadChecksum), "got: {err}");
+    }
 }
