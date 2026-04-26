@@ -15,7 +15,7 @@ use chacha20poly1305::{
 };
 use rand_core::{OsRng, RngCore};
 use secrecy::{ExposeSecret, SecretString};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const FORMAT_STRING: &str = "harmony-owner-recovery-v1";
 pub const MAX_COMMENT_LEN: usize = 256;
@@ -31,13 +31,27 @@ pub const MAX_COMMENT_LEN: usize = 256;
 /// integration tests when the `test-fixtures` feature is enabled. The
 /// struct is only visible at all when the `recovery` feature is on
 /// (the entire module is gated).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct RecoveryFileBody {
+    #[zeroize(skip)]
     pub format: String,
     #[serde(with = "serde_bytes")]
     pub seed: [u8; 32],
+    #[zeroize(skip)]
     pub mint_at: Option<u64>,
+    #[zeroize(skip)]
     pub comment: Option<String>,
+}
+
+impl core::fmt::Debug for RecoveryFileBody {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RecoveryFileBody")
+            .field("format", &self.format)
+            .field("seed", &"[redacted; 32 bytes]")
+            .field("mint_at", &self.mint_at)
+            .field("comment", &self.comment)
+            .finish()
+    }
 }
 
 /// Internal encrypt core. Takes already-built plaintext + already-chosen
@@ -204,8 +218,11 @@ pub(crate) fn decrypt_inner(
     })?;
 
     if body.format != FORMAT_STRING {
+        // Body is ZeroizeOnDrop, so we cannot move `body.format` out. Clone
+        // for the error report — the `format` field is non-secret, but the
+        // surrounding seed bytes will still be wiped on drop.
         return Err(RecoveryError::UnexpectedPayloadFormat {
-            found: body.format,
+            found: body.format.clone(),
             expected: FORMAT_STRING,
         });
     }
@@ -217,7 +234,10 @@ pub(crate) fn decrypt_inner(
             });
         }
     }
-    Ok((body.seed, body.mint_at, body.comment))
+    // Body is ZeroizeOnDrop and cannot be partially moved. Copy the seed
+    // (Copy type) and clone the metadata fields; the `body` itself drops at
+    // function end and zeroizes the seed bytes inside it.
+    Ok((body.seed, body.mint_at, body.comment.clone()))
 }
 
 #[cfg(all(test, feature = "test-fixtures"))]
