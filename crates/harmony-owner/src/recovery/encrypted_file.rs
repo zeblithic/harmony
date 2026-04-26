@@ -289,21 +289,23 @@ mod decrypt_tests {
         assert!(matches!(err, RecoveryError::WrongPassphraseOrCorrupt));
     }
 
+    /// Tampering with header bytes produces a strict-check rejection
+    /// (`UnsupportedKdfParams`), NOT an AEAD-AAD failure
+    /// (`WrongPassphraseOrCorrupt`). The strict-equality check at
+    /// `wire::parse_header` is intentionally a stricter guard than the
+    /// AEAD-AAD layer for the 13-byte header — every byte is checked
+    /// against locked v1 values BEFORE Argon2id derivation, so the AAD
+    /// binding is structurally redundant for header tampering in v1.
+    /// (The AAD layer would matter for a future format version that
+    /// allowed any header byte to vary; this test pins the v1 behavior.)
     #[test]
-    fn tampered_header_fails_via_aad() {
+    fn tampered_header_caught_by_strict_check_pre_aad() {
         let mut bytes = fixture_bytes();
-        // Flip the kdf_t byte AFTER serialization but ONLY in the on-disk
-        // bytes; parse_header's strict check would catch this first, so we
-        // test a header byte the strict check ignores. Actually all 13 header
-        // bytes are strict-checked, so tampering here returns one of the
-        // strict errors instead of WrongPassphraseOrCorrupt. Test via the
-        // strict path:
-        bytes[11] ^= 0x01; // mutates kdf_t low byte: 3 → 2
-        let err = decrypt_inner(&bytes, &SecretString::from("correct".to_string())).unwrap_err();
-        assert!(matches!(
-            err,
-            RecoveryError::UnsupportedKdfParams { id: 0x01 }
-        ));
+        // Mutate kdf_t low byte: 3 → 2.
+        bytes[11] ^= 0x01;
+        let err = decrypt_inner(&bytes, &SecretString::from("correct".to_string()))
+            .unwrap_err();
+        assert!(matches!(err, RecoveryError::UnsupportedKdfParams { id: 0x01 }));
     }
 
     #[test]
