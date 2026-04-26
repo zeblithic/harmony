@@ -28,12 +28,16 @@ pub(crate) fn from_mnemonic_inner(s: &str) -> Result<[u8; 32], RecoveryError> {
     if !s.is_ascii() {
         return Err(RecoveryError::NonAsciiInput);
     }
-    // Whitespace normalize + lowercase. Wrap in Zeroizing — this `String`
-    // holds the seed in word form, so it must be wiped on drop just like
-    // the seed bytes themselves.
-    let normalized: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(
-        s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase(),
+    // Whitespace normalize + lowercase. Build the joined string directly
+    // into Zeroizing<String> and lowercase IN PLACE — to_lowercase()
+    // would allocate a second String that's dropped unzeroized. ASCII
+    // lowercasing via make_ascii_lowercase is byte-preserving for the
+    // BIP39 English wordlist and safe because we already rejected
+    // non-ASCII input above.
+    let mut normalized: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(
+        s.split_whitespace().collect::<Vec<_>>().join(" "),
     );
+    normalized.make_ascii_lowercase();
     // Empty/whitespace-only input has no words, but `"".split(' ')` yields
     // `[""]` — guard explicitly so WrongWordCount reports the right count.
     let words: Vec<&str> = if normalized.is_empty() {
