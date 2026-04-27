@@ -66,7 +66,7 @@ impl RecoveryArtifact {
     /// Returns `Zeroizing<String>` because knowing the 24 words is
     /// mathematically equivalent to knowing the seed.
     pub fn to_mnemonic(&self) -> Zeroizing<String> {
-        Zeroizing::new(mnemonic::to_mnemonic_inner(self.as_bytes()))
+        mnemonic::to_mnemonic_inner(self.as_bytes())
     }
 
     /// Decode a 24-word BIP39 English mnemonic into a `RecoveryArtifact`.

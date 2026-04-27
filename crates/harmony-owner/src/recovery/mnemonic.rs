@@ -6,12 +6,21 @@
 //! (the seed is the raw 32 bytes, not a BIP39-derived 64-byte expansion).
 
 use crate::recovery::error::RecoveryError;
+use zeroize::Zeroizing;
 
 /// Encode a 32-byte seed as a 24-word BIP39 mnemonic (English wordlist).
-pub(crate) fn to_mnemonic_inner(seed: &[u8; 32]) -> String {
-    bip39::Mnemonic::from_entropy(seed)
-        .expect("32 bytes is always valid BIP39-24 entropy")
-        .to_string()
+///
+/// Returns `Zeroizing<String>` because the 24 words are mathematically
+/// equivalent to the 32-byte seed — the public wrapper would re-wrap in
+/// `Zeroizing` anyway, but enforcing it at the inner-function type level
+/// guarantees any future `pub(crate)` caller can't accidentally drop the
+/// allocation unzeroized.
+pub(crate) fn to_mnemonic_inner(seed: &[u8; 32]) -> Zeroizing<String> {
+    Zeroizing::new(
+        bip39::Mnemonic::from_entropy(seed)
+            .expect("32 bytes is always valid BIP39-24 entropy")
+            .to_string(),
+    )
 }
 
 /// Parse a 24-word BIP39 mnemonic (English wordlist) into a 32-byte seed.
@@ -100,7 +109,7 @@ mod tests {
         let seed = [0u8; 32];
         let m = to_mnemonic_inner(&seed);
         assert_eq!(
-            m,
+            &**m,
             "abandon abandon abandon abandon abandon abandon abandon abandon \
              abandon abandon abandon abandon abandon abandon abandon abandon \
              abandon abandon abandon abandon abandon abandon abandon art"
@@ -141,7 +150,7 @@ mod decode_tests {
         let weird = m.replace(' ', "\t \n  ");
         assert!(from_mnemonic_inner(&weird).is_ok());
         // Leading and trailing whitespace
-        let padded = format!("   \n{m}\t\t   ");
+        let padded = format!("   \n{}\t\t   ", &**m);
         assert!(from_mnemonic_inner(&padded).is_ok());
     }
 
@@ -184,7 +193,7 @@ mod decode_tests {
     #[test]
     fn wrong_word_count_rejected_too_many() {
         let m = to_mnemonic_inner(&[0u8; 32]);
-        let long = format!("{m} extra");
+        let long = format!("{} extra", &**m);
         let err = from_mnemonic_inner(&long).unwrap_err();
         assert!(matches!(err, RecoveryError::WrongWordCount(25)), "got: {err}");
     }
