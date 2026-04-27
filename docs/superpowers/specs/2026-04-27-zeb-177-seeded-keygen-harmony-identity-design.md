@@ -193,7 +193,7 @@ fn private_identity_from_seed_is_deterministic() {
 }
 ```
 
-Same shape for `PqPrivateIdentity`. Same shape for `harmony-crypto::ml_kem::from_seed` and `ml_dsa::from_seed` (a is_byte_equal_to b after `to_bytes()`).
+Same shape for `PqPrivateIdentity`. The harmony-crypto leaf primitives `ml_kem::from_seed` and `ml_dsa::from_seed` get the same treatment, comparing their outputs via `pk.as_bytes()` / `sk.as_bytes()` byte-equality.
 
 ### 2. Disjointness
 

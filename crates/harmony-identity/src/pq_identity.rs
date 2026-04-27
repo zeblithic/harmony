@@ -215,6 +215,13 @@ impl PqPrivateIdentity {
             .as_bytes()
             .try_into()
             .expect("HKDF returned exactly ml_dsa::SK_LENGTH bytes");
+        // Drop the DerivedKey buffers as soon as the bytes are copied into
+        // the fixed-size arrays. DerivedKey carries `#[zeroize(drop)]`, so
+        // its heap allocation is wiped at this point rather than at end of
+        // scope — minimises the time the secret material lives on the heap.
+        drop(kem_seed_bytes);
+        drop(dsa_seed_bytes);
+
         let (encryption_key, encryption_secret) = ml_kem::from_seed(&kem_seed);
         let (verifying_key, signing_key) = ml_dsa::from_seed(&dsa_seed);
         // `[u8; SK_LENGTH]` is `Copy`. `ml_kem::from_seed(&kem_seed)` and

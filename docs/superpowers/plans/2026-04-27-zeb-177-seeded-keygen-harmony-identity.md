@@ -688,5 +688,5 @@ After Task 5 completes, all six DoD items from the spec hold:
 2. ✓ `harmony-crypto::ml_kem::generate` and `ml_dsa::generate` refactored to delegate (Tasks 1, 2). Existing tests still pass.
 3. ✓ `harmony-identity::PrivateIdentity::from_seed(&[u8; 32])` (Task 3) and `PqPrivateIdentity::from_seed(&[u8; 32])` (Task 4) added.
 4. ✓ All 5 test classes pass for both classical and PQ paths: determinism (Task 3 step 5, Task 4 step 5), disjointness (per-class steps + Task 5 cross-class), round-trip (Task 3 step 5, Task 4 step 5), functional (Task 3 step 5, Task 4 step 5), golden vector (Task 3 step 7, Task 4 step 7).
-5. ✓ Clippy clean (Task 5 step 6).
-6. ✓ Rustdoc clean (Task 5 step 7).
+5. ✓ Clippy clean (Task 5 step 5).
+6. ✓ Rustdoc clean (Task 5 step 6).

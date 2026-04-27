@@ -203,6 +203,13 @@ impl PrivateIdentity {
             .expect("HKDF returned exactly 32 bytes");
         let mut x_arr: [u8; 32] = x_bytes.as_bytes().try_into()
             .expect("HKDF returned exactly 32 bytes");
+        // Drop the DerivedKey buffers as soon as the bytes are copied into
+        // the fixed-size arrays. DerivedKey carries `#[zeroize(drop)]`, so
+        // its heap allocation is wiped at this point rather than at end of
+        // scope — minimises the time the secret material lives on the heap.
+        drop(ed_bytes);
+        drop(x_bytes);
+
         let signing_key = SigningKey::from_bytes(&ed_arr);
         let encryption_secret = StaticSecret::from(x_arr);
         // `[u8; 32]` is `Copy`. `SigningKey::from_bytes(&ed_arr)` copies the bytes
