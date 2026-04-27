@@ -192,16 +192,16 @@ impl PrivateIdentity {
     /// - 32 bytes via `info=b"harmony-identity-x25519-v1"`  for the X25519 secret
     ///
     /// Same seed in → same keypairs out. Used by harmony-client to back up and
-    /// restore identity via the [ZEB-175] recovery library.
+    /// restore identity via the ZEB-175 recovery library.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
-        let ed_bytes = harmony_crypto::hkdf::derive_key(seed, None, SEED_INFO_ED25519, 32)
+        let ed_bytes = harmony_crypto::hkdf::DerivedKey::new(seed, None, SEED_INFO_ED25519, 32)
             .expect("HKDF length 32 is within the SHA-256 limit");
-        let x_bytes = harmony_crypto::hkdf::derive_key(seed, None, SEED_INFO_X25519, 32)
+        let x_bytes = harmony_crypto::hkdf::DerivedKey::new(seed, None, SEED_INFO_X25519, 32)
             .expect("HKDF length 32 is within the SHA-256 limit");
 
-        let mut ed_arr: [u8; 32] = ed_bytes.as_slice().try_into()
+        let mut ed_arr: [u8; 32] = ed_bytes.as_bytes().try_into()
             .expect("HKDF returned exactly 32 bytes");
-        let mut x_arr: [u8; 32] = x_bytes.as_slice().try_into()
+        let mut x_arr: [u8; 32] = x_bytes.as_bytes().try_into()
             .expect("HKDF returned exactly 32 bytes");
         let signing_key = SigningKey::from_bytes(&ed_arr);
         let encryption_secret = StaticSecret::from(x_arr);
@@ -676,9 +676,7 @@ mod tests {
     fn from_seed_pins_public_keys_for_zero_seed() {
         let seed = [0u8; 32];
         let id = PrivateIdentity::from_seed(&seed);
-        // Hex strings are filled in during this task's "pin the golden vector"
-        // step (the test fails first with empty hex; the failure prints the
-        // actual values; paste them back into these literals).
+        // Pinned to catch HKDF info-string drift or upstream Ed25519/X25519 ABI changes.
         let expected_x25519_pub_hex  = "c5b1a5ead546e59c593060198ec2971390900827c0d4301a658688fe1ed25a59";
         let expected_ed25519_pub_hex = "7b34c7e2de808d3c269e184b783c566bfab5c4e47accf5c464de128979619ce3";
         assert_eq!(
