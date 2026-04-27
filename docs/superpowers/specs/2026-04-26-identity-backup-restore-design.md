@@ -335,14 +335,19 @@ Mirrors the ZEB-174 testing pattern. Three tiers: unit tests per module, a wire-
 - `too_large_rejected` — 2 KiB input.
 - `salt_rotates_per_encode` — same seed + passphrase encoded twice → different ciphertexts (confirms salt is regenerated per call).
 
-### Wire-format fixture in `crates/harmony-owner/tests/recovery_wire_format_fixture.rs`
+### Wire-format fixtures in `crates/harmony-owner/tests/recovery_wire_format_fixture.rs`
 
-Matches ZEB-174's pattern:
+Matches ZEB-174's pattern, with two committed fixtures (one per CBOR shape the body can take):
 
-- Commit `crates/harmony-owner/tests/fixtures/recovery_v1.bin` produced from a deterministic seed + deterministic salt + deterministic nonce + known passphrase + known metadata. Expose a `pub fn encrypt_with_params_for_test(...)` behind a `test-fixtures` Cargo feature (NOT default-on, NOT `#[doc(hidden)] pub`) that lets tests inject the salt/nonce explicitly. The cleaner feature-gate pattern was suggested in PR #58 review for ZEB-174 and we should adopt it for new code rather than carry forward the legacy `#[doc(hidden)] pub` workaround.
-- Test asserts decoding the fixture yields the expected seed and metadata.
-- Honor a `HARMONY_REGENERATE_RECOVERY_WIRE_FIXTURE=1` env var to rewrite the fixture for intentional format changes (so version bumps land cleanly).
-- This pins the v1 wire format byte-for-byte. Any accidental serialization change (CBOR canonicalization drift, KDF param tweak, header layout shift) breaks this test loudly.
+- `crates/harmony-owner/tests/fixtures/recovery_v1.bin` — **full-metadata** case (`mint_at: Some(...)`, `comment: Some(...)`).
+- `crates/harmony-owner/tests/fixtures/recovery_v1_no_metadata.bin` — **no-metadata** case (`mint_at: None`, `comment: None`). Pins the `Option<None>`-as-CBOR-null wire shape: a future migration to `#[serde(skip_serializing_if = "Option::is_none")]` would change the body from a 4-entry map with two `null` values to a 2-entry map with the keys absent — both valid CBOR but different bytes — and would break this fixture loudly instead of silently breaking interop with files written by older builds.
+
+Both fixtures share the same deterministic seed + salt + nonce + passphrase, and both are produced via the public `pub fn encrypt_with_params_for_test(...)` helper exposed behind the `test-fixtures` Cargo feature (NOT default-on, NOT `#[doc(hidden)] pub`). The feature-gate pattern was suggested in PR #58 review for ZEB-174; adopting it here rather than carrying forward the legacy `#[doc(hidden)] pub` workaround.
+
+- One test per fixture (`wire_format_v1_full_metadata_pinned`, `wire_format_v1_no_metadata_pinned`), so a regression in either path reports the precise shape that drifted.
+- Each test asserts byte-for-byte equality against the committed fixture AND decodes the fixture round-trip to confirm the seed + metadata land where expected.
+- The `HARMONY_REGENERATE_RECOVERY_WIRE_FIXTURE=1` env var rewrites BOTH fixtures in a single test pass, for intentional format changes (so version bumps land cleanly).
+- This pins the v1 wire format byte-for-byte across both metadata shapes. Any accidental serialization change (CBOR canonicalization drift, KDF param tweak, header layout shift, `serde` attribute migration) breaks one of the tests loudly.
 
 ### Cross-encoding equivalence test in `recovery/mod.rs`
 
