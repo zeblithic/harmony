@@ -213,9 +213,8 @@ pub(crate) fn decrypt_inner(
     // Wrap plaintext in Zeroizing so it's wiped after we finish parsing.
     let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(plaintext_vec);
 
-    let body: RecoveryFileBody = ciborium::de::from_reader(&plaintext[..]).map_err(|_| {
-        RecoveryError::PayloadDecodeFailed("CBOR payload could not be parsed".to_string())
-    })?;
+    let body: RecoveryFileBody = ciborium::de::from_reader(&plaintext[..])
+        .map_err(|_| RecoveryError::PayloadDecodeFailed)?;
 
     if body.format != FORMAT_STRING {
         // Body is ZeroizeOnDrop, so we cannot move `body.format` out. Clone

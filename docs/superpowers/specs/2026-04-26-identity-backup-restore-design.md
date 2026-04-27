@@ -230,7 +230,7 @@ The `format` string inside the encrypted payload is defense-in-depth: even thoug
 3. Slice salt (16B), nonce (24B), ciphertext (variable), tag (last 16B).
 4. **Derive key** via Argon2id with the locked params. Output kept in `Zeroizing<[u8; 32]>`.
 5. **Decrypt** with AAD = parsed 13-byte header. AEAD failure → `RecoveryError::WrongPassphraseOrCorrupt`. (Deliberately ambiguous; the AEAD does not — and should not — distinguish these.)
-6. **CBOR-decode** plaintext as `RecoveryFileBody`. Failure → `RecoveryError::PayloadDecodeFailed(String)`.
+6. **CBOR-decode** plaintext as `RecoveryFileBody`. Failure → `RecoveryError::PayloadDecodeFailed` (unit variant; the inner ciborium error is deliberately not carried forward — it would risk leaking fragments of decrypted plaintext into operator-facing strings).
 7. **Validate** `body.format == "harmony-owner-recovery-v1"`. Mismatch → `RecoveryError::UnexpectedPayloadFormat { found, expected }`.
 8. **Validate** `body.comment.as_ref().map(|s| s.len()).unwrap_or(0) <= 256`. Mismatch → `RecoveryError::CommentTooLong` (defense-in-depth on read; protects against a malicious file that somehow round-trips through CBOR with an over-cap comment).
 9. Build `RestoredArtifact { artifact: RecoveryArtifact::from_seed(body.seed), metadata: RecoveryMetadata { mint_at: body.mint_at, comment: body.comment } }`.
@@ -282,8 +282,8 @@ pub enum RecoveryError {
     #[error("wrong passphrase or corrupted recovery file (AEAD tag rejected)")]
     WrongPassphraseOrCorrupt,
 
-    #[error("recovery file payload could not be decoded: {0}")]
-    PayloadDecodeFailed(String),
+    #[error("recovery file payload could not be decoded")]
+    PayloadDecodeFailed,
 
     #[error("recovery file payload has unexpected format string {found:?}; expected {expected:?}")]
     UnexpectedPayloadFormat { found: String, expected: &'static str },

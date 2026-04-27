@@ -243,8 +243,8 @@ pub enum RecoveryError {
     #[error("wrong passphrase or corrupted recovery file (AEAD tag rejected)")]
     WrongPassphraseOrCorrupt,
 
-    #[error("recovery file payload could not be decoded: {0}")]
-    PayloadDecodeFailed(String),
+    #[error("recovery file payload could not be decoded")]
+    PayloadDecodeFailed,
 
     #[error("recovery file payload has unexpected format string {found:?}; expected {expected:?}")]
     UnexpectedPayloadFormat { found: String, expected: &'static str },
@@ -1030,7 +1030,7 @@ pub(crate) fn decrypt_inner(
     let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(plaintext_vec);
 
     let body: RecoveryFileBody = ciborium::de::from_reader(&plaintext[..])
-        .map_err(|e| RecoveryError::PayloadDecodeFailed(e.to_string()))?;
+        .map_err(|_| RecoveryError::PayloadDecodeFailed)?;
 
     if body.format != FORMAT_STRING {
         return Err(RecoveryError::UnexpectedPayloadFormat {

@@ -39,8 +39,12 @@ pub enum RecoveryError {
     #[error("wrong passphrase or corrupted recovery file (AEAD tag rejected)")]
     WrongPassphraseOrCorrupt,
 
-    #[error("recovery file payload could not be decoded: {0}")]
-    PayloadDecodeFailed(String),
+    /// CBOR decode failed AFTER AEAD verified the ciphertext. Unit variant
+    /// (no payload) — carrying the inner ciborium error message would leak
+    /// fragments of the decrypted plaintext into operator-facing error
+    /// strings, so the type guarantees no message can be attached.
+    #[error("recovery file payload could not be decoded")]
+    PayloadDecodeFailed,
 
     #[error("recovery file payload has unexpected format string {found:?}; expected {expected:?}")]
     UnexpectedPayloadFormat { found: String, expected: &'static str },
