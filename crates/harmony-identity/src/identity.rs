@@ -27,6 +27,11 @@ pub const PRIVATE_KEY_LENGTH: usize = 64;
 /// Length of the address hash in bytes.
 pub const ADDRESS_HASH_LENGTH: usize = hash::TRUNCATED_HASH_LENGTH; // 16
 
+/// HKDF info string for the Ed25519 sub-key derived from the master seed.
+const SEED_INFO_ED25519: &[u8] = b"harmony-identity-ed25519-v1";
+/// HKDF info string for the X25519 sub-key derived from the master seed.
+const SEED_INFO_X25519:  &[u8] = b"harmony-identity-x25519-v1";
+
 /// A 128-bit identity address hash: `SHA256(X25519_pub || Ed25519_pub)[:16]`.
 /// Used as the canonical key for referencing identities across Harmony.
 pub type IdentityHash = [u8; ADDRESS_HASH_LENGTH];
@@ -172,6 +177,56 @@ impl PrivateIdentity {
         let identity =
             Identity::from_public_keys(encryption_key.as_bytes(), verifying_key.as_bytes())
                 .expect("keys from generate() are always valid");
+
+        Self {
+            identity,
+            encryption_secret,
+            signing_key,
+        }
+    }
+
+    /// Derive a `PrivateIdentity` deterministically from a 32-byte master seed.
+    ///
+    /// The master seed is HKDF-expanded into two disjoint sub-keys:
+    /// - 32 bytes via `info=b"harmony-identity-ed25519-v1"` for the Ed25519 signing key
+    /// - 32 bytes via `info=b"harmony-identity-x25519-v1"`  for the X25519 secret
+    ///
+    /// Same seed in → same keypairs out. Used by harmony-client to back up and
+    /// restore identity via the ZEB-175 recovery library.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        let ed_bytes = harmony_crypto::hkdf::DerivedKey::new(seed, None, SEED_INFO_ED25519, 32)
+            .expect("HKDF length 32 is within the SHA-256 limit");
+        let x_bytes = harmony_crypto::hkdf::DerivedKey::new(seed, None, SEED_INFO_X25519, 32)
+            .expect("HKDF length 32 is within the SHA-256 limit");
+
+        let mut ed_arr: [u8; 32] = ed_bytes.as_bytes().try_into()
+            .expect("HKDF returned exactly 32 bytes");
+        let mut x_arr: [u8; 32] = x_bytes.as_bytes().try_into()
+            .expect("HKDF returned exactly 32 bytes");
+        // Drop the DerivedKey buffers as soon as the bytes are copied into
+        // the fixed-size arrays. DerivedKey carries `#[zeroize(drop)]`, so
+        // its heap allocation is wiped at this point rather than at end of
+        // scope — minimises the time the secret material lives on the heap.
+        drop(ed_bytes);
+        drop(x_bytes);
+
+        let signing_key = SigningKey::from_bytes(&ed_arr);
+        let encryption_secret = StaticSecret::from(x_arr);
+        // `[u8; 32]` is `Copy`. `SigningKey::from_bytes(&ed_arr)` copies the bytes
+        // into the SigningKey (covered by ed25519-dalek's ZeroizeOnDrop).
+        // `StaticSecret::from(x_arr)` likewise bitwise-copies `x_arr` into the
+        // StaticSecret (covered by x25519-dalek's `#[zeroize(drop)]`). Both local
+        // arrays survive their constructors; zeroize them explicitly to wipe the
+        // stack copies (the internal copies held by SigningKey / StaticSecret are
+        // zeroized at PrivateIdentity drop time via the struct's ZeroizeOnDrop derive).
+        ed_arr.zeroize();
+        x_arr.zeroize();
+
+        let encryption_key = X25519PublicKey::from(&encryption_secret);
+        let verifying_key = signing_key.verifying_key();
+        let identity =
+            Identity::from_public_keys(encryption_key.as_bytes(), verifying_key.as_bytes())
+                .expect("from_seed-derived keys are always valid");
 
         Self {
             identity,
@@ -586,5 +641,67 @@ mod tests {
         );
         let sig = id.sign(b"test");
         assert!(id.public_identity().verify(b"test", &sig).is_ok());
+    }
+
+    // ── Seeded Key Generation ───────────────────────────────────────────
+
+    #[test]
+    fn from_seed_is_deterministic() {
+        let seed = [0x42u8; 32];
+        let a = PrivateIdentity::from_seed(&seed);
+        let b = PrivateIdentity::from_seed(&seed);
+        assert_eq!(a.to_private_bytes(), b.to_private_bytes(),
+            "from_seed must produce identical private bytes for the same seed");
+        assert_eq!(a.identity.address_hash, b.identity.address_hash,
+            "from_seed must produce identical address hash for the same seed");
+    }
+
+    #[test]
+    fn from_seed_classical_subkeys_are_disjoint() {
+        let seed = [0x42u8; 32];
+        let id = PrivateIdentity::from_seed(&seed);
+        // Both `StaticSecret::as_bytes()` and `SigningKey::as_bytes()` return
+        // `&[u8; 32]`. Use the existing `to_private_bytes` access pattern from
+        // `identity.rs:250-256` as a reference if these method names ever drift.
+        let ed_bytes: &[u8; 32] = id.signing_key.as_bytes();
+        let x_bytes:  &[u8; 32] = id.encryption_secret.as_bytes();
+        assert_ne!(ed_bytes, x_bytes,
+            "info-string separation failed: ed25519 and x25519 derived to same bytes");
+    }
+
+    #[test]
+    fn from_seed_round_trips_via_private_bytes() {
+        let seed = [0x42u8; 32];
+        let original = PrivateIdentity::from_seed(&seed);
+        let bytes = original.to_private_bytes();
+        let restored = PrivateIdentity::from_private_bytes(&bytes).unwrap();
+        assert_eq!(original.identity.address_hash, restored.identity.address_hash);
+    }
+
+    #[test]
+    fn from_seed_identity_can_sign_and_verify() {
+        let id = PrivateIdentity::from_seed(&[0x42u8; 32]);
+        let sig = id.sign(b"hello");
+        id.identity.verify(b"hello", &sig)
+            .expect("from_seed-derived identity must produce verifiable signatures");
+    }
+
+    #[test]
+    fn from_seed_pins_public_keys_for_zero_seed() {
+        let seed = [0u8; 32];
+        let id = PrivateIdentity::from_seed(&seed);
+        // Pinned to catch HKDF info-string drift or upstream Ed25519/X25519 ABI changes.
+        let expected_x25519_pub_hex  = "c5b1a5ead546e59c593060198ec2971390900827c0d4301a658688fe1ed25a59";
+        let expected_ed25519_pub_hex = "7b34c7e2de808d3c269e184b783c566bfab5c4e47accf5c464de128979619ce3";
+        assert_eq!(
+            hex::encode(id.identity.encryption_key.as_bytes()),
+            expected_x25519_pub_hex,
+            "x25519 pub bytes drifted from pinned golden vector"
+        );
+        assert_eq!(
+            hex::encode(id.identity.verifying_key.as_bytes()),
+            expected_ed25519_pub_hex,
+            "ed25519 pub bytes drifted from pinned golden vector"
+        );
     }
 }

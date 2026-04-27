@@ -31,6 +31,11 @@ pub const PQ_PUBLIC_KEY_LENGTH: usize = ml_kem::PK_LENGTH + ml_dsa::PK_LENGTH; /
 /// ML-KEM-768 decapsulation key seed (64) + ML-DSA-65 signing key seed (32).
 pub const PQ_PRIVATE_KEY_LENGTH: usize = ml_kem::SK_LENGTH + ml_dsa::SK_LENGTH; // 96
 
+/// HKDF info string for the ML-KEM-768 sub-key derived from the master seed.
+const SEED_INFO_ML_KEM: &[u8] = b"harmony-identity-ml-kem-v1";
+/// HKDF info string for the ML-DSA-65 sub-key derived from the master seed.
+const SEED_INFO_ML_DSA: &[u8] = b"harmony-identity-ml-dsa-v1";
+
 /// A post-quantum public identity: ML-KEM-768 encapsulation key + ML-DSA-65 verifying key.
 ///
 /// This is the information shared with peers. The address hash derived from
@@ -171,6 +176,63 @@ impl PqPrivateIdentity {
 
         let identity = PqIdentity::from_public_keys(encryption_key, verifying_key);
 
+        Self {
+            identity,
+            encryption_secret,
+            signing_key,
+        }
+    }
+
+    /// Derive a `PqPrivateIdentity` deterministically from a 32-byte master seed.
+    ///
+    /// The master seed is HKDF-expanded into two disjoint sub-seeds:
+    /// - 64 bytes via `info=b"harmony-identity-ml-kem-v1"` for the ML-KEM-768 keypair
+    /// - 32 bytes via `info=b"harmony-identity-ml-dsa-v1"` for the ML-DSA-65 keypair
+    ///
+    /// Same seed in → same keypairs out. Used by harmony-client to back up and
+    /// restore identity via the ZEB-175 recovery library.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        let kem_seed_bytes = harmony_crypto::hkdf::DerivedKey::new(
+            seed,
+            None,
+            SEED_INFO_ML_KEM,
+            ml_kem::SK_LENGTH,
+        )
+        .expect("HKDF length 64 is within the SHA-256 limit");
+        let dsa_seed_bytes = harmony_crypto::hkdf::DerivedKey::new(
+            seed,
+            None,
+            SEED_INFO_ML_DSA,
+            ml_dsa::SK_LENGTH,
+        )
+        .expect("HKDF length 32 is within the SHA-256 limit");
+
+        let mut kem_seed: [u8; ml_kem::SK_LENGTH] = kem_seed_bytes
+            .as_bytes()
+            .try_into()
+            .expect("HKDF returned exactly ml_kem::SK_LENGTH bytes");
+        let mut dsa_seed: [u8; ml_dsa::SK_LENGTH] = dsa_seed_bytes
+            .as_bytes()
+            .try_into()
+            .expect("HKDF returned exactly ml_dsa::SK_LENGTH bytes");
+        // Drop the DerivedKey buffers as soon as the bytes are copied into
+        // the fixed-size arrays. DerivedKey carries `#[zeroize(drop)]`, so
+        // its heap allocation is wiped at this point rather than at end of
+        // scope — minimises the time the secret material lives on the heap.
+        drop(kem_seed_bytes);
+        drop(dsa_seed_bytes);
+
+        let (encryption_key, encryption_secret) = ml_kem::from_seed(&kem_seed);
+        let (verifying_key, signing_key) = ml_dsa::from_seed(&dsa_seed);
+        // `[u8; SK_LENGTH]` is `Copy`. `ml_kem::from_seed(&kem_seed)` and
+        // `ml_dsa::from_seed(&dsa_seed)` each copy the seed bytes into the
+        // returned secret key structs (both covered by their own ZeroizeOnDrop
+        // at PqPrivateIdentity drop time). The local arrays survive their
+        // constructors; zeroize them explicitly to wipe the stack copies.
+        kem_seed.zeroize();
+        dsa_seed.zeroize();
+
+        let identity = PqIdentity::from_public_keys(encryption_key, verifying_key);
         Self {
             identity,
             encryption_secret,
@@ -738,5 +800,101 @@ mod tests {
         );
         let sig = id.sign(b"test").unwrap();
         assert!(id.public_identity().verify(b"test", &sig).is_ok());
+    }
+
+    // ── from_seed tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn pq_from_seed_is_deterministic() {
+        let seed = [0x42u8; 32];
+        let a = PqPrivateIdentity::from_seed(&seed);
+        let b = PqPrivateIdentity::from_seed(&seed);
+        assert_eq!(a.to_private_bytes(), b.to_private_bytes(),
+            "from_seed must produce identical private bytes for the same seed");
+        assert_eq!(a.public_identity().address_hash, b.public_identity().address_hash,
+            "from_seed must produce identical address hash for the same seed");
+    }
+
+    #[test]
+    fn pq_from_seed_subkeys_are_disjoint() {
+        // The ML-DSA secret-key bytes contain the 32-byte seed material directly,
+        // and the ML-KEM secret-key bytes are derived from the 64-byte ML-KEM seed.
+        // Both come out of HKDF with disjoint info strings — the first 32 bytes of
+        // the ML-KEM seed must differ from the ML-DSA seed.
+        let seed = [0x42u8; 32];
+        let id = PqPrivateIdentity::from_seed(&seed);
+        let kem_bytes = id.encryption_secret.as_bytes();  // 64-byte ML-KEM seed
+        let dsa_bytes = id.signing_key.as_bytes();        // 32-byte ML-DSA seed
+        assert_ne!(&kem_bytes[..32], &dsa_bytes[..],
+            "info-string separation failed: ml-kem and ml-dsa derived to same bytes");
+    }
+
+    #[test]
+    fn pq_from_seed_round_trips_via_private_bytes() {
+        let seed = [0x42u8; 32];
+        let original = PqPrivateIdentity::from_seed(&seed);
+        let bytes = original.to_private_bytes();
+        let restored = PqPrivateIdentity::from_private_bytes(&bytes).unwrap();
+        assert_eq!(
+            original.public_identity().address_hash,
+            restored.public_identity().address_hash,
+            "round-trip via private bytes must preserve identity"
+        );
+    }
+
+    #[test]
+    fn pq_from_seed_identity_can_encrypt_and_decrypt() {
+        let id = PqPrivateIdentity::from_seed(&[0x42u8; 32]);
+        let mut rng = rand::rngs::OsRng;
+        let ct = id.public_identity().encrypt(&mut rng, b"hello").unwrap();
+        let pt = id.decrypt(&ct).unwrap();
+        assert_eq!(pt, b"hello");
+    }
+
+    #[test]
+    fn pq_from_seed_pins_address_hash_for_zero_seed() {
+        let seed = [0u8; 32];
+        let id = PqPrivateIdentity::from_seed(&seed);
+        // Pinned to catch HKDF info-string drift or upstream ML-KEM/ML-DSA ABI changes.
+        let expected_address_hash_hex = "627da3b06e6571cf10eca8fc1e386a1f";
+        assert_eq!(
+            hex::encode(id.public_identity().address_hash),
+            expected_address_hash_hex,
+            "PQ address hash drifted from pinned golden vector"
+        );
+    }
+
+    /// Same master seed → classical and PQ derive to fully disjoint key bytes.
+    /// Sanity check that the four info strings (ed25519, x25519, ml-kem, ml-dsa)
+    /// are all distinct in their effect on HKDF output. Operates on the public
+    /// to_private_bytes outputs so the test does not depend on private struct
+    /// fields.
+    #[test]
+    fn classical_and_pq_subkeys_are_cross_class_disjoint() {
+        use crate::PrivateIdentity;
+        let seed = [0x42u8; 32];
+        let classical = PrivateIdentity::from_seed(&seed);
+        let pq = PqPrivateIdentity::from_seed(&seed);
+
+        let classical_bytes = classical.to_private_bytes();
+        let pq_bytes = pq.to_private_bytes();
+
+        // Layout (confirmed in step 1):
+        //   classical_bytes: 64 bytes = [X25519 secret (32) || Ed25519 secret (32)]
+        //   pq_bytes:        ml_kem::SK_LENGTH + ml_dsa::SK_LENGTH bytes =
+        //                    [ML-KEM seed (64) || ML-DSA seed (32)]
+        let classical_x_bytes  = &classical_bytes[..32];
+        let classical_ed_bytes = &classical_bytes[32..];
+        let pq_kem_bytes = &pq_bytes[..ml_kem::SK_LENGTH];
+        let pq_dsa_bytes = &pq_bytes[ml_kem::SK_LENGTH..];
+
+        assert_ne!(classical_ed_bytes, pq_dsa_bytes,
+            "ed25519 and ml-dsa derived to same 32 bytes — info-string separation failed");
+        assert_ne!(classical_x_bytes, pq_dsa_bytes,
+            "x25519 and ml-dsa derived to same 32 bytes — info-string separation failed");
+        assert_ne!(classical_ed_bytes, &pq_kem_bytes[..32],
+            "ed25519 and ml-kem (first 32B) derived to same bytes — info-string separation failed");
+        assert_ne!(classical_x_bytes, &pq_kem_bytes[..32],
+            "x25519 and ml-kem (first 32B) derived to same bytes — info-string separation failed");
     }
 }
