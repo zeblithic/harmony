@@ -64,12 +64,13 @@ The existing `RecoveryArtifact` type stays where it is (`lifecycle/mint.rs`). Th
 ```toml
 [features]
 default = ["recovery"]
-recovery = ["dep:bip39", "dep:argon2", "dep:chacha20poly1305"]
+recovery = ["dep:bip39", "dep:argon2", "dep:chacha20poly1305", "dep:secrecy"]
 
 [dependencies]
 bip39             = { version = "2",    optional = true, default-features = false, features = ["std", "zeroize"] }
 argon2            = { version = "0.5",  optional = true }
 chacha20poly1305  = { version = "0.10", optional = true }
+secrecy           = { version = "0.10", optional = true }
 ```
 
 Default-on means harmony-client and other typical consumers get recovery for free. Downstream crates that genuinely don't need it (e.g., a future server-side verifier that only inspects Enrollment Certs) can `default-features = false` to skip the Argon2id compile cost.
@@ -224,7 +225,8 @@ The `format` string inside the encrypted payload is defense-in-depth: even thoug
 2. **Header validation.**
    - First 4 bytes ≠ `b"HRMR"` → `RecoveryError::UnrecognizedFormat`.
    - `format_version ≠ 0x01` → `RecoveryError::UnsupportedVersion`.
-   - `kdf_id ≠ 0x01` OR any KDF param ≠ the locked value → `RecoveryError::UnsupportedKdfParams`. (Strict equality, same DoS guard as ZEB-174's `identity.enc`. Prevents an attacker-controlled file from coercing the parser into running an absurd Argon2id m_kib value as a CPU/memory DoS.)
+   - `kdf_id ≠ 0x01` → `RecoveryError::UnsupportedKdfId`.
+   - Any KDF param ≠ the locked value → `RecoveryError::UnsupportedKdfParams { id }`. (Strict equality, same DoS guard as ZEB-174's `identity.enc`. Prevents an attacker-controlled file from coercing the parser into running an absurd Argon2id m_kib value as a CPU/memory DoS.)
 3. Slice salt (16B), nonce (24B), ciphertext (variable), tag (last 16B).
 4. **Derive key** via Argon2id with the locked params. Output kept in `Zeroizing<[u8; 32]>`.
 5. **Decrypt** with AAD = parsed 13-byte header. AEAD failure → `RecoveryError::WrongPassphraseOrCorrupt`. (Deliberately ambiguous; the AEAD does not — and should not — distinguish these.)
@@ -325,8 +327,8 @@ Mirrors the ZEB-174 testing pattern. Three tiers: unit tests per module, a wire-
 - `comment_over_max_fails_at_encode` — 257 bytes → `CommentTooLong`.
 - `wrong_passphrase_fails_aead` — encode with passphrase A, decode with B → `WrongPassphraseOrCorrupt`.
 - `tampered_ciphertext_fails` — flip a byte in the ciphertext region → `WrongPassphraseOrCorrupt`.
-- `tampered_header_fails` — flip a header byte → AEAD rejects (header is AAD).
-- `tampered_kdf_params_fails` — change `kdf_m_kib` from 65536 to 32768 → `UnsupportedKdfParams` BEFORE the Argon2id pass even runs.
+- `tampered_header_caught_by_strict_check_pre_aad` — flip a header byte → strict `parse_header` validation rejects with `UnsupportedKdfId` / `UnsupportedKdfParams` BEFORE AEAD/KDF runs. (The 13-byte header is also bound as AEAD AAD, but the strict-equality v1 check is structurally redundant with — and stricter than — the AAD layer.)
+- `tampered_kdf_params_rejected_before_argon2` — change `kdf_m_kib` from 65536 to 32768 → `UnsupportedKdfParams { id: 0x01 }` BEFORE the Argon2id pass even runs.
 - `wrong_magic_rejected` — `UnrecognizedFormat`.
 - `unsupported_version_rejected` — `format_version = 0x02`.
 - `too_small_rejected` — 50-byte input.
