@@ -217,6 +217,11 @@ impl PqPrivateIdentity {
             .expect("HKDF returned exactly ml_dsa::SK_LENGTH bytes");
         let (encryption_key, encryption_secret) = ml_kem::from_seed(&kem_seed);
         let (verifying_key, signing_key) = ml_dsa::from_seed(&dsa_seed);
+        // `[u8; SK_LENGTH]` is `Copy`. `ml_kem::from_seed(&kem_seed)` and
+        // `ml_dsa::from_seed(&dsa_seed)` each copy the seed bytes into the
+        // returned secret key structs (both covered by their own ZeroizeOnDrop
+        // at PqPrivateIdentity drop time). The local arrays survive their
+        // constructors; zeroize them explicitly to wipe the stack copies.
         kem_seed.zeroize();
         dsa_seed.zeroize();
 

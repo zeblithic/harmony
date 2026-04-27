@@ -194,6 +194,11 @@ pub fn from_seed(seed: &[u8; SK_LENGTH]) -> (MlDsaPublicKey, MlDsaSecretKey) {
         inner: kp.verifying_key().clone(),
     };
     let sk = MlDsaSecretKey { seed: *seed };
+    // `B32 = Array<u8, U32>` is `Copy`, so `from_seed(&seed_arr)` made a
+    // bitwise copy of the seed material into `kp` (the ML-DSA SigningKey
+    // owns its `seed: B32` field with explicit Drop-time zeroing). The
+    // local `seed_arr` survives the call; zeroize it explicitly to wipe
+    // the stack copy.
     seed_arr.zeroize();
     (pk, sk)
 }

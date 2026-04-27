@@ -205,6 +205,13 @@ impl PrivateIdentity {
             .expect("HKDF returned exactly 32 bytes");
         let signing_key = SigningKey::from_bytes(&ed_arr);
         let encryption_secret = StaticSecret::from(x_arr);
+        // `[u8; 32]` is `Copy`. `SigningKey::from_bytes(&ed_arr)` copies the bytes
+        // into the SigningKey (covered by ed25519-dalek's ZeroizeOnDrop).
+        // `StaticSecret::from(x_arr)` likewise bitwise-copies `x_arr` into the
+        // StaticSecret (covered by x25519-dalek's `#[zeroize(drop)]`). Both local
+        // arrays survive their constructors; zeroize them explicitly to wipe the
+        // stack copies (the internal copies held by SigningKey / StaticSecret are
+        // zeroized at PrivateIdentity drop time via the struct's ZeroizeOnDrop derive).
         ed_arr.zeroize();
         x_arr.zeroize();
 

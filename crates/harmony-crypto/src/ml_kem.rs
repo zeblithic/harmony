@@ -172,6 +172,10 @@ pub fn from_seed(seed: &[u8; SK_LENGTH]) -> (MlKemPublicKey, MlKemSecretKey) {
     let mut seed_arr = Array::from(*seed);
     let dk = ml_kem::DecapsulationKey::<MlKem768>::from_seed(seed_arr);
     let ek = dk.encapsulation_key().clone();
+    // `Array<u8, U64>` is `Copy`, so `from_seed(seed_arr)` made a bitwise
+    // copy into `dk` (covered by the underlying type's ZeroizeOnDrop, which
+    // propagates through MlKemSecretKey). The local `seed_arr` survives the
+    // call; zeroize it explicitly to wipe the stack copy.
     seed_arr.zeroize();
     (MlKemPublicKey { inner: ek }, MlKemSecretKey { inner: dk })
 }
