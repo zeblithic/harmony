@@ -37,7 +37,7 @@ pub use error::RecoveryError;
 
 use crate::lifecycle::mint::RecoveryArtifact;
 use secrecy::SecretString;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Encode-side input / decode-side output for the encrypted-file's
 /// metadata. All fields are optional and non-secret on their own.
@@ -72,8 +72,13 @@ impl RecoveryArtifact {
     /// Decode a 24-word BIP39 English mnemonic into a `RecoveryArtifact`.
     /// Whitespace-tolerant, case-insensitive, ASCII-only.
     pub fn from_mnemonic(s: &str) -> Result<Self, RecoveryError> {
-        let seed = mnemonic::from_mnemonic_inner(s)?;
-        Ok(Self::from_seed(seed))
+        // `[u8; 32]` is `Copy`, so the value crosses the `from_mnemonic_inner`
+        // return boundary as a stack copy. Bind it `mut` and `zeroize()` after
+        // wrapping into the artifact, mirroring `mint_owner` (lifecycle/mint.rs).
+        let mut seed = mnemonic::from_mnemonic_inner(s)?;
+        let artifact = Self::from_seed(seed);
+        seed.zeroize();
+        Ok(artifact)
     }
 
     /// Encode this artifact + metadata as a passphrase-encrypted file.
@@ -135,10 +140,17 @@ impl RecoveryArtifact {
         bytes: &[u8],
         passphrase: &SecretString,
     ) -> Result<RestoredArtifact, RecoveryError> {
-        let (seed, mint_at, comment) =
+        // `[u8; 32]` is `Copy`, so the seed crosses the `decrypt_inner` return
+        // as a stack copy (the inner `RecoveryFileBody` is ZeroizeOnDrop, but
+        // its slot is a separate allocation from this caller's binding). Bind
+        // it `mut` and `zeroize()` after wrapping into the artifact, mirroring
+        // `mint_owner` (lifecycle/mint.rs).
+        let (mut seed, mint_at, comment) =
             encrypted_file::decrypt_inner(bytes, passphrase)?;
+        let artifact = RecoveryArtifact::from_seed(seed);
+        seed.zeroize();
         Ok(RestoredArtifact {
-            artifact: RecoveryArtifact::from_seed(seed),
+            artifact,
             metadata: RecoveryMetadata { mint_at, comment },
         })
     }
