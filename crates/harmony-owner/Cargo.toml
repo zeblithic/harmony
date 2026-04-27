@@ -20,10 +20,30 @@ x25519-dalek = { workspace = true }
 rand_core = { workspace = true, features = ["getrandom"] }
 hkdf = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true }
+
+# Recovery-only — gated by the `recovery` feature.
+bip39 = { workspace = true, optional = true }
+argon2 = { workspace = true, optional = true }
+chacha20poly1305 = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
 
 [dev-dependencies]
 hex = { workspace = true }
 rand = { workspace = true }
 
 [features]
-default = []
+default = ["recovery"]
+# Identity backup/restore: BIP39-24 mnemonic + Argon2id-XChaCha20-Poly1305
+# encrypted file. Default-on for typical consumers (harmony-client). Disable
+# via `default-features = false` to skip the heavy crypto deps.
+recovery = ["dep:bip39", "dep:argon2", "dep:chacha20poly1305", "dep:secrecy"]
+# Test-only: exposes deterministic-input encrypt helper for wire-format
+# fixture generation. NOT default-on. Implies `recovery`.
+test-fixtures = ["recovery"]
+
+# The wire-format fixture integration test only builds when test-fixtures
+# is enabled, so it can call the deterministic encrypt helper.
+[[test]]
+name = "recovery_wire_format_fixture"
+required-features = ["test-fixtures"]

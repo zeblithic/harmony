@@ -7,6 +7,15 @@ use rand_core::{OsRng, RngCore};
 use zeroize::Zeroize;
 
 /// 32-byte master seed. Format BIP39-wraps to 24 mnemonic words. Drop wipes.
+#[cfg_attr(
+    feature = "recovery",
+    doc = "",
+    doc = "Encoding/decoding for portable backup is in [`crate::recovery`] (gated by",
+    doc = "the default-on `recovery` Cargo feature):",
+    doc = "",
+    doc = "- [`RecoveryArtifact::to_mnemonic`] / [`RecoveryArtifact::from_mnemonic`]",
+    doc = "- [`RecoveryArtifact::to_encrypted_file`] / [`RecoveryArtifact::from_encrypted_file`]"
+)]
 pub struct RecoveryArtifact {
     seed: [u8; 32],
 }
