@@ -28,6 +28,15 @@
 //!
 //! Network propagation (Zenoh gossip + queryable) and harmony-client
 //! integration are separate plans/crates.
+#![cfg_attr(
+    feature = "recovery",
+    doc = "",
+    doc = "## Recovery",
+    doc = "",
+    doc = "Backup and restore of the master seed (mnemonic + encrypted-file)",
+    doc = "lives in [`recovery`], gated by the default-on `recovery` Cargo",
+    doc = "feature. See `docs/superpowers/specs/2026-04-26-identity-backup-restore-design.md`."
+)]
 
 pub mod cbor;
 pub mod certs;
@@ -38,5 +47,8 @@ pub mod pubkey_bundle;
 pub mod signing;
 pub mod state;
 pub mod trust;
+
+#[cfg(feature = "recovery")]
+pub mod recovery;
 
 pub use error::OwnerError;
