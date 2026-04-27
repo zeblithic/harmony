@@ -851,4 +851,38 @@ mod tests {
             "PQ address hash drifted from pinned golden vector"
         );
     }
+
+    /// Same master seed → classical and PQ derive to fully disjoint key bytes.
+    /// Sanity check that the four info strings (ed25519, x25519, ml-kem, ml-dsa)
+    /// are all distinct in their effect on HKDF output. Operates on the public
+    /// to_private_bytes outputs so the test does not depend on private struct
+    /// fields.
+    #[test]
+    fn classical_and_pq_subkeys_are_cross_class_disjoint() {
+        use crate::PrivateIdentity;
+        let seed = [0x42u8; 32];
+        let classical = PrivateIdentity::from_seed(&seed);
+        let pq = PqPrivateIdentity::from_seed(&seed);
+
+        let classical_bytes = classical.to_private_bytes();
+        let pq_bytes = pq.to_private_bytes();
+
+        // Layout (confirmed in step 1):
+        //   classical_bytes: 64 bytes = [X25519 secret (32) || Ed25519 secret (32)]
+        //   pq_bytes:        ml_kem::SK_LENGTH + ml_dsa::SK_LENGTH bytes =
+        //                    [ML-KEM seed (64) || ML-DSA seed (32)]
+        let classical_x_bytes  = &classical_bytes[..32];
+        let classical_ed_bytes = &classical_bytes[32..];
+        let pq_kem_bytes = &pq_bytes[..ml_kem::SK_LENGTH];
+        let pq_dsa_bytes = &pq_bytes[ml_kem::SK_LENGTH..];
+
+        assert_ne!(classical_ed_bytes, pq_dsa_bytes,
+            "ed25519 and ml-dsa derived to same 32 bytes — info-string separation failed");
+        assert_ne!(classical_x_bytes, pq_dsa_bytes,
+            "x25519 and ml-dsa derived to same 32 bytes — info-string separation failed");
+        assert_ne!(classical_ed_bytes, &pq_kem_bytes[..32],
+            "ed25519 and ml-kem (first 32B) derived to same bytes — info-string separation failed");
+        assert_ne!(classical_x_bytes, &pq_kem_bytes[..32],
+            "x25519 and ml-kem (first 32B) derived to same bytes — info-string separation failed");
+    }
 }
