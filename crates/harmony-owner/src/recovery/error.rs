@@ -73,8 +73,24 @@ mod tests {
             "mnemonic checksum mismatch — likely a typo somewhere in the 24 words"
         );
         assert_eq!(
+            RecoveryError::NonAsciiInput.to_string(),
+            "mnemonic contains non-ASCII characters; BIP39 English wordlist is ASCII-only"
+        );
+        assert_eq!(
             RecoveryError::TooSmall(50).to_string(),
             "recovery file is too small (50 bytes; minimum 69)"
+        );
+        assert_eq!(
+            RecoveryError::TooLarge(2048).to_string(),
+            "recovery file is too large (2048 bytes; maximum 1024)"
+        );
+        assert_eq!(
+            RecoveryError::UnrecognizedFormat.to_string(),
+            "not a harmony recovery file (magic mismatch)"
+        );
+        assert_eq!(
+            RecoveryError::WrongPassphraseOrCorrupt.to_string(),
+            "wrong passphrase or corrupted recovery file (AEAD tag rejected)"
         );
         assert_eq!(
             RecoveryError::UnsupportedVersion(0x02).to_string(),
