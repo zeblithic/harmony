@@ -182,22 +182,32 @@ impl<'de> serde::Deserialize<'de> for MlDsaSignature {
     }
 }
 
-/// Generate an ML-DSA-65 keypair.
+/// Derive an ML-DSA-65 keypair from a 32-byte seed.
 ///
-/// Uses the provided RNG to generate a 32-byte seed, then derives
-/// the keypair deterministically from it.
-pub fn generate(rng: &mut impl CryptoRngCore) -> (MlDsaPublicKey, MlDsaSecretKey) {
-    let mut seed_bytes = [0u8; SK_LENGTH];
-    rng.fill_bytes(&mut seed_bytes);
-    let mut seed_arr = ml_dsa::B32::from(seed_bytes);
+/// Deterministic: same seed in → same keypair out. Used by
+/// `harmony-identity::PqPrivateIdentity::from_seed` to build the PQ
+/// identity from the master 32-byte seed via HKDF expansion.
+pub fn from_seed(seed: &[u8; SK_LENGTH]) -> (MlDsaPublicKey, MlDsaSecretKey) {
+    let mut seed_arr = ml_dsa::B32::from(*seed);
     let kp = MlDsa65::from_seed(&seed_arr);
     let pk = MlDsaPublicKey {
         inner: kp.verifying_key().clone(),
     };
-    let sk = MlDsaSecretKey { seed: seed_bytes };
+    let sk = MlDsaSecretKey { seed: *seed };
     seed_arr.zeroize();
-    seed_bytes.zeroize();
     (pk, sk)
+}
+
+/// Generate an ML-DSA-65 keypair.
+///
+/// Uses the provided RNG to generate a 32-byte seed, then derives the
+/// keypair deterministically via [`from_seed`].
+pub fn generate(rng: &mut impl CryptoRngCore) -> (MlDsaPublicKey, MlDsaSecretKey) {
+    let mut seed = [0u8; SK_LENGTH];
+    rng.fill_bytes(&mut seed);
+    let kp = from_seed(&seed);
+    seed.zeroize();
+    kp
 }
 
 /// Sign a message using the given secret key.
@@ -305,5 +315,28 @@ mod tests {
         let bytes = postcard::to_allocvec(&sig).unwrap();
         let decoded: MlDsaSignature = postcard::from_bytes(&bytes).unwrap();
         assert!(verify(&pk, b"test message", &decoded).is_ok());
+    }
+
+    #[test]
+    fn from_seed_is_deterministic() {
+        let seed = [0x42u8; SK_LENGTH];
+        let (pk_a, sk_a) = from_seed(&seed);
+        let (pk_b, sk_b) = from_seed(&seed);
+        assert_eq!(pk_a.as_bytes(), pk_b.as_bytes(),
+            "from_seed must be deterministic across calls (public key)");
+        assert_eq!(sk_a.as_bytes(), sk_b.as_bytes(),
+            "from_seed must be deterministic across calls (secret key)");
+    }
+
+    #[test]
+    fn from_seed_round_trips_via_bytes() {
+        let seed = [0x42u8; SK_LENGTH];
+        let (pk, sk) = from_seed(&seed);
+        let pk_bytes = pk.as_bytes();
+        let sk_bytes = sk.as_bytes();
+        let pk_restored = MlDsaPublicKey::from_bytes(&pk_bytes).unwrap();
+        let sk_restored = MlDsaSecretKey::from_bytes(&sk_bytes).unwrap();
+        assert_eq!(pk.as_bytes(), pk_restored.as_bytes());
+        assert_eq!(sk.as_bytes(), sk_restored.as_bytes());
     }
 }
