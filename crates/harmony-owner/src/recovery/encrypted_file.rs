@@ -143,6 +143,43 @@ mod fixture_helper_tests {
 mod body_tests {
     use super::*;
 
+    /// The manual `Debug` impl on `RecoveryFileBody` carries a security
+    /// contract: panic messages, log lines, and `dbg!()` calls must NEVER
+    /// surface the 32-byte seed. Pin it explicitly so a future "cleanup"
+    /// switching back to `derive(Debug)` is caught immediately. Uses a
+    /// distinctive seed byte (`0x42`) so a regression that printed
+    /// `[42, 42, 42, ...]` would clearly contain those bytes.
+    #[test]
+    fn debug_impl_redacts_seed() {
+        let body = RecoveryFileBody {
+            format: FORMAT_STRING.into(),
+            seed: [0x42u8; 32],
+            mint_at: Some(1_700_000_000),
+            comment: Some("debug-redaction-test".into()),
+        };
+        let dbg = format!("{body:?}");
+        assert!(
+            dbg.contains("[redacted; 32 bytes]"),
+            "Debug output must contain the redaction marker; got: {dbg}"
+        );
+        // Ensure no plain-byte rendering of the seed survives. Both the
+        // signed-i32 and unsigned-u8 forms of `0x42` would render as "66".
+        assert!(
+            !dbg.contains("66, 66, 66"),
+            "Debug output must not contain raw seed bytes; got: {dbg}"
+        );
+        // And no hex-string spelling either, in case Debug ever switches
+        // to a Vec<u8>-via-hex format.
+        assert!(
+            !dbg.contains("4242424242"),
+            "Debug output must not contain hex-encoded seed bytes; got: {dbg}"
+        );
+        // Non-secret fields are still visible (the Debug impl is targeted
+        // redaction, not blanket censorship).
+        assert!(dbg.contains("debug-redaction-test"));
+        assert!(dbg.contains("1700000000"));
+    }
+
     #[test]
     fn cbor_round_trip_minimal() {
         let body = RecoveryFileBody {

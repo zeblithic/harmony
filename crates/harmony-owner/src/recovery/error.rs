@@ -95,6 +95,14 @@ mod tests {
             }.to_string(),
             r#"recovery file payload has unexpected format string "harmony-foo-v9"; expected "harmony-owner-recovery-v1""#
         );
+        // Pin the sanitized message: this variant is unit-only specifically
+        // so no inner ciborium error can leak fragments of the decrypted
+        // plaintext into operator-facing strings. If this assertion ever
+        // mutates to include dynamic content, the leak guard is broken.
+        assert_eq!(
+            RecoveryError::PayloadDecodeFailed.to_string(),
+            "recovery file payload could not be decoded"
+        );
         assert_eq!(
             RecoveryError::CommentTooLong { actual: 300, max: 256 }.to_string(),
             "comment is 300 bytes; max allowed is 256"
