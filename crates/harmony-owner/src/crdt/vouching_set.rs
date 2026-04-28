@@ -1,11 +1,29 @@
 use crate::certs::{Stance, VouchingCert};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// LWW-per-cell CRDT keyed by `(signer, target)`. Newer entries from the
 /// same signer supersede older ones; signers cannot override each other.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "Vec<VouchingCert>", into = "Vec<VouchingCert>")]
 pub struct VouchingSet {
     cells: HashMap<([u8; 16], [u8; 16]), VouchingCert>,
+}
+
+impl From<Vec<VouchingCert>> for VouchingSet {
+    fn from(certs: Vec<VouchingCert>) -> Self {
+        let mut set = VouchingSet::default();
+        for cert in certs {
+            set.insert(cert);
+        }
+        set
+    }
+}
+
+impl From<VouchingSet> for Vec<VouchingCert> {
+    fn from(set: VouchingSet) -> Self {
+        set.cells.into_values().collect()
+    }
 }
 
 impl VouchingSet {
