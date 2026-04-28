@@ -1,11 +1,34 @@
 use crate::certs::{Stance, VouchingCert};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// LWW-per-cell CRDT keyed by `(signer, target)`. Newer entries from the
 /// same signer supersede older ones; signers cannot override each other.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "Vec<VouchingCert>", into = "Vec<VouchingCert>")]
 pub struct VouchingSet {
     cells: HashMap<([u8; 16], [u8; 16]), VouchingCert>,
+}
+
+impl From<Vec<VouchingCert>> for VouchingSet {
+    fn from(certs: Vec<VouchingCert>) -> Self {
+        let mut set = VouchingSet::default();
+        for cert in certs {
+            set.insert(cert);
+        }
+        set
+    }
+}
+
+impl From<VouchingSet> for Vec<VouchingCert> {
+    fn from(set: VouchingSet) -> Self {
+        // Deterministic order: canonical CBOR sorts map entries but preserves
+        // array order, so we must sort here. Sort by `(signer, target)` (the
+        // cell key) for a stable wire format.
+        let mut certs: Vec<_> = set.cells.into_values().collect();
+        certs.sort_unstable_by_key(|cert| (cert.signer, cert.target));
+        certs
+    }
 }
 
 impl VouchingSet {
@@ -127,6 +150,40 @@ mod tests {
 
         set1.merge(set2);
         assert_eq!(set1.vouches_for(target).count(), 2);
+    }
+
+    #[test]
+    fn serialization_is_deterministic_across_insertion_orders() {
+        // Bots flagged: HashMap iteration order randomizes the wire format.
+        // The From<VouchingSet> for Vec<VouchingCert> impl now sorts by
+        // (signer, target) so equivalent sets produce byte-identical bytes.
+        use crate::cbor;
+
+        // Build five distinct (signer, target) certs.
+        let target = [9u8; 16];
+        let mut certs = Vec::new();
+        for _ in 0..5 {
+            let sk = SigningKey::generate(&mut OsRng);
+            let (_, cert) = make_cert_with_key(&sk, target, Stance::Vouch, 100);
+            certs.push(cert);
+        }
+
+        let mut set_a = VouchingSet::new();
+        for c in certs.iter().cloned() {
+            set_a.insert(c);
+        }
+        let mut set_b = VouchingSet::new();
+        for c in certs.iter().rev().cloned() {
+            set_b.insert(c);
+        }
+
+        let bytes_a = cbor::to_canonical(&set_a).unwrap();
+        let bytes_b = cbor::to_canonical(&set_b).unwrap();
+        assert_eq!(
+            bytes_a, bytes_b,
+            "equivalent VouchingSets with different insertion orders must \
+             serialize to identical canonical CBOR"
+        );
     }
 
     #[test]

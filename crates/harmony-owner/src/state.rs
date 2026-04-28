@@ -1,7 +1,8 @@
-use crate::certs::{EnrollmentCert, EnrollmentIssuer, LivenessCert};
+use crate::certs::{EnrollmentCert, EnrollmentIssuer, LivenessCert, RevocationCert, VouchingCert};
 use crate::crdt::{RevocationSet, VouchingSet};
 use crate::OwnerError;
 use ed25519_dalek::VerifyingKey;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Aggregate state for one owner identity: enrollment certs per device,
@@ -10,13 +11,173 @@ use std::collections::HashMap;
 /// Reclamation continuity is evaluated functionally via
 /// `lifecycle::reclamation::evaluate_reclamation` against any candidate
 /// `ReclamationCert`; it is not held as state here (no current consumer).
-#[derive(Debug, Clone, Default)]
+///
+/// Serialization: HashMap fields use a list-of-pairs representation for
+/// CBOR compatibility (CBOR map keys must be scalars; `[u8; 16]` keys
+/// are encoded as byte strings in the pair's first element).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(try_from = "OwnerStateWire", into = "OwnerStateWire")]
 pub struct OwnerState {
     pub owner_id: [u8; 16],
     pub enrollments: HashMap<[u8; 16], EnrollmentCert>,
     pub vouching: VouchingSet,
     pub revocations: RevocationSet,
     pub liveness: HashMap<[u8; 16], LivenessCert>,
+}
+
+/// Wire format for CBOR serialization of `OwnerState`. HashMaps are
+/// represented as ordered lists of `(key, value)` pairs so that `[u8; 16]`
+/// keys serialize as CBOR byte strings rather than integer arrays.
+///
+/// `vouching` and `revocations` are `Vec<Cert>` (not the CRDT set types)
+/// so `OwnerState::try_from` can validate `cert.owner_id` on each *raw*
+/// entry before the LWW dedup in `VouchingSet::from(...)` /
+/// `RevocationSet::from(...)` collapses inconsistent duplicate cells.
+/// Otherwise a malformed older cert at the same cell would lose LWW to a
+/// valid newer cert and disappear before validation.
+#[derive(Serialize, Deserialize)]
+struct OwnerStateWire {
+    #[serde(with = "crate::cbor::arr16")]
+    owner_id: [u8; 16],
+    enrollments: Vec<EnrollmentPair>,
+    vouching: Vec<VouchingCert>,
+    revocations: Vec<RevocationCert>,
+    liveness: Vec<LivenessPair>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EnrollmentPair(
+    #[serde(with = "crate::cbor::arr16")] [u8; 16],
+    EnrollmentCert,
+);
+
+#[derive(Serialize, Deserialize)]
+struct LivenessPair(
+    #[serde(with = "crate::cbor::arr16")] [u8; 16],
+    LivenessCert,
+);
+
+impl TryFrom<OwnerStateWire> for OwnerState {
+    type Error = OwnerError;
+
+    /// Validate persisted wire data before constructing an `OwnerState`.
+    ///
+    /// The mutation APIs (`add_enrollment`, `add_liveness`, `add_vouching`,
+    /// `add_revocation`) all enforce `cert.owner_id == self.owner_id` —
+    /// deserialization preserves that invariant so corrupted or buggy
+    /// persisted state cannot silently load into an inconsistent shape.
+    ///
+    /// Validates:
+    /// - Each enrollment pair's `cert.owner_id` matches `wire.owner_id` and
+    ///   the pair's key matches `cert.device_id`.
+    /// - Each liveness pair similarly (key matches `cert.signer`).
+    /// - Each cert in the vouching/revocation CRDTs carries the right `owner_id`.
+    /// - Enrollment and liveness wire lists contain no duplicate keys.
+    fn try_from(w: OwnerStateWire) -> Result<Self, OwnerError> {
+        let owner_id = w.owner_id;
+
+        let mut enrollments = HashMap::with_capacity(w.enrollments.len());
+        for EnrollmentPair(key, cert) in w.enrollments {
+            if cert.owner_id != owner_id {
+                return Err(OwnerError::WrongOwner {
+                    expected: owner_id,
+                    got: cert.owner_id,
+                });
+            }
+            if cert.device_id != key {
+                return Err(OwnerError::Cbor(format!(
+                    "enrollment pair key {key:?} does not match cert.device_id {:?}",
+                    cert.device_id
+                )));
+            }
+            if enrollments.insert(key, cert).is_some() {
+                return Err(OwnerError::Cbor(format!(
+                    "duplicate enrollment key {key:?} in wire data"
+                )));
+            }
+        }
+
+        let mut liveness = HashMap::with_capacity(w.liveness.len());
+        for LivenessPair(key, cert) in w.liveness {
+            if cert.owner_id != owner_id {
+                return Err(OwnerError::WrongOwner {
+                    expected: owner_id,
+                    got: cert.owner_id,
+                });
+            }
+            if cert.signer != key {
+                return Err(OwnerError::Cbor(format!(
+                    "liveness pair key {key:?} does not match cert.signer {:?}",
+                    cert.signer
+                )));
+            }
+            if liveness.insert(key, cert).is_some() {
+                return Err(OwnerError::Cbor(format!(
+                    "duplicate liveness key {key:?} in wire data"
+                )));
+            }
+        }
+
+        // Validate cert.owner_id on each *raw* CRDT entry BEFORE materializing
+        // the sets. The CRDT From impls call insert() which applies LWW
+        // dedup — a malformed older cert at the same (signer, target) cell
+        // would otherwise silently lose to a newer valid cert and disappear
+        // before validation could catch it.
+        for cert in &w.vouching {
+            if cert.owner_id != owner_id {
+                return Err(OwnerError::WrongOwner {
+                    expected: owner_id,
+                    got: cert.owner_id,
+                });
+            }
+        }
+        for cert in &w.revocations {
+            if cert.owner_id != owner_id {
+                return Err(OwnerError::WrongOwner {
+                    expected: owner_id,
+                    got: cert.owner_id,
+                });
+            }
+        }
+
+        Ok(OwnerState {
+            owner_id,
+            enrollments,
+            vouching: VouchingSet::from(w.vouching),
+            revocations: RevocationSet::from(w.revocations),
+            liveness,
+        })
+    }
+}
+
+impl From<OwnerState> for OwnerStateWire {
+    fn from(s: OwnerState) -> Self {
+        // Sort HashMap entries by key for deterministic CBOR. Canonical CBOR
+        // sorts map entries but preserves array order, so we must sort here.
+        // Without this, identical states emit different bytes across runs
+        // (HashMap iteration order is randomized), defeating the canonical-
+        // CBOR contract that consumers rely on for hash/sign/compare.
+        let mut enrollments: Vec<_> = s.enrollments.into_iter().collect();
+        enrollments.sort_unstable_by_key(|(k, _)| *k);
+        let mut liveness: Vec<_> = s.liveness.into_iter().collect();
+        liveness.sort_unstable_by_key(|(k, _)| *k);
+        OwnerStateWire {
+            owner_id: s.owner_id,
+            enrollments: enrollments
+                .into_iter()
+                .map(|(k, v)| EnrollmentPair(k, v))
+                .collect(),
+            // CRDT sets convert via their existing sorted From impls
+            // (RevocationSet → Vec<RevocationCert> sorts by target;
+            // VouchingSet → Vec<VouchingCert> sorts by (signer, target)).
+            vouching: s.vouching.into(),
+            revocations: s.revocations.into(),
+            liveness: liveness
+                .into_iter()
+                .map(|(k, v)| LivenessPair(k, v))
+                .collect(),
+        }
+    }
 }
 
 impl OwnerState {
@@ -572,6 +733,241 @@ mod tests {
         let result =
             state.add_enrollment(new_cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS);
         assert!(matches!(result, Err(OwnerError::Revoked { device }) if device == id_a));
+    }
+
+    #[test]
+    fn serialization_is_deterministic_across_insertion_orders() {
+        // Bots flagged: HashMap iteration order randomizes the wire format,
+        // so equivalent states could emit different CBOR bytes across runs
+        // (and thus across processes / replicas). Canonicalization sorts
+        // CBOR map entries but preserves array order, so the sort must
+        // happen in the From<OwnerState> for OwnerStateWire impl.
+        use crate::cbor;
+
+        let (master_sk, master_bundle) = keypair_and_bundle();
+        let owner_id = master_bundle.identity_hash();
+
+        // Build five enrollment certs (different device_ids).
+        let mut certs = Vec::new();
+        for _ in 0..5 {
+            let (_, device_bundle) = keypair_and_bundle();
+            let device_id = device_bundle.identity_hash();
+            certs.push(
+                EnrollmentCert::sign_master(
+                    &master_sk,
+                    master_bundle.clone(),
+                    device_id,
+                    device_bundle,
+                    1_000_000,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+
+        // State A: enroll forwards 0,1,2,3,4
+        let mut state_a = OwnerState::new(owner_id);
+        for cert in certs.iter() {
+            state_a
+                .add_enrollment(
+                    cert.clone(),
+                    1_000_000,
+                    crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                )
+                .unwrap();
+        }
+        // State B: enroll backwards 4,3,2,1,0
+        let mut state_b = OwnerState::new(owner_id);
+        for cert in certs.iter().rev() {
+            state_b
+                .add_enrollment(
+                    cert.clone(),
+                    1_000_000,
+                    crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                )
+                .unwrap();
+        }
+
+        let bytes_a = cbor::to_canonical(&state_a).unwrap();
+        let bytes_b = cbor::to_canonical(&state_b).unwrap();
+        assert_eq!(
+            bytes_a, bytes_b,
+            "equivalent OwnerStates with different insertion orders must \
+             serialize to identical canonical CBOR"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_enrollment_cert_owner_mismatch() {
+        // Persisted wire data with an enrollment cert whose owner_id differs
+        // from the wire-level owner_id must fail deserialization, not silently
+        // load into an inconsistent state.
+        use crate::cbor;
+
+        let (master_sk, master_bundle) = keypair_and_bundle();
+        let owner_id_real = master_bundle.identity_hash();
+        let (_, device_bundle) = keypair_and_bundle();
+        let device_id = device_bundle.identity_hash();
+        let cert = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000_000,
+            None,
+        )
+        .unwrap();
+
+        // Wire owner_id is different from the cert's owner_id.
+        let wire = OwnerStateWire {
+            owner_id: [0x99u8; 16],
+            enrollments: vec![EnrollmentPair(cert.device_id, cert)],
+            vouching: vec![],
+            revocations: vec![],
+            liveness: vec![],
+        };
+        let bytes = cbor::to_canonical(&wire).unwrap();
+        let result: Result<OwnerState, _> = cbor::from_bytes(&bytes);
+        let err = result.expect_err("must reject");
+        assert!(
+            err.to_string().contains("owner_id") || err.to_string().contains("WrongOwner"),
+            "actual: {err}"
+        );
+        // Sanity: real owner_id is unchanged after the failed deserialize.
+        let _ = owner_id_real;
+    }
+
+    #[test]
+    fn deserialize_rejects_enrollment_pair_key_mismatch() {
+        // Wire pair has a key that doesn't match cert.device_id — must error.
+        use crate::cbor;
+
+        let (master_sk, master_bundle) = keypair_and_bundle();
+        let owner_id = master_bundle.identity_hash();
+        let (_, device_bundle) = keypair_and_bundle();
+        let device_id = device_bundle.identity_hash();
+        let cert = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000_000,
+            None,
+        )
+        .unwrap();
+
+        let wire = OwnerStateWire {
+            owner_id,
+            enrollments: vec![EnrollmentPair([0x42u8; 16], cert)],
+            vouching: vec![],
+            revocations: vec![],
+            liveness: vec![],
+        };
+        let bytes = cbor::to_canonical(&wire).unwrap();
+        let result: Result<OwnerState, _> = cbor::from_bytes(&bytes);
+        let err = result.expect_err("must reject");
+        assert!(
+            err.to_string().contains("device_id") || err.to_string().contains("pair key"),
+            "actual: {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_duplicate_enrollment_key() {
+        // Two pairs sharing the same key — must error rather than silently
+        // overwriting. Provides clearer diagnostics on persistence corruption.
+        use crate::cbor;
+
+        let (master_sk, master_bundle) = keypair_and_bundle();
+        let owner_id = master_bundle.identity_hash();
+        let (_, device_bundle) = keypair_and_bundle();
+        let device_id = device_bundle.identity_hash();
+        let cert = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000_000,
+            None,
+        )
+        .unwrap();
+
+        let wire = OwnerStateWire {
+            owner_id,
+            enrollments: vec![
+                EnrollmentPair(cert.device_id, cert.clone()),
+                EnrollmentPair(cert.device_id, cert),
+            ],
+            vouching: vec![],
+            revocations: vec![],
+            liveness: vec![],
+        };
+        let bytes = cbor::to_canonical(&wire).unwrap();
+        let result: Result<OwnerState, _> = cbor::from_bytes(&bytes);
+        let err = result.expect_err("must reject");
+        assert!(err.to_string().contains("duplicate"), "actual: {err}");
+    }
+
+    #[test]
+    fn deserialize_rejects_malformed_vouching_cert_even_when_lww_would_drop_it() {
+        // Regression: prior fix iterated `w.vouching.iter()` AFTER the wire
+        // had been deserialized into a `VouchingSet`, which calls insert()
+        // (LWW). A malformed older cert at the same (signer, target) cell
+        // could lose LWW to a valid newer cert and silently disappear before
+        // the validation iteration ran. Now that `OwnerStateWire.vouching`
+        // is `Vec<VouchingCert>` (raw), the validation runs on the original
+        // wire entries before LWW dedup.
+        use crate::cbor;
+        use crate::certs::{Stance, VouchingCert};
+
+        // Owner A's identity, plus a single device under owner A.
+        let (master_sk_a, master_bundle_a) = keypair_and_bundle();
+        let owner_id_a = master_bundle_a.identity_hash();
+        let (sk_dev, bundle_dev) = keypair_and_bundle();
+        let device_id = bundle_dev.identity_hash();
+
+        // Manually construct a wire payload with two vouching certs at the
+        // same cell (same signer, same target). The OLDER cert claims the
+        // wrong owner_id (e.g., from a corrupted persisted state); the
+        // NEWER cert is valid. Without the fix, LWW would drop the older
+        // cert before validation, masking the corruption.
+        let target = [9u8; 16];
+
+        let mut malformed_old =
+            VouchingCert::sign(&sk_dev, owner_id_a, target, Stance::Vouch, 100).unwrap();
+        // Tamper: swap the owner_id to something else, simulating wire
+        // corruption / cross-owner cert leakage.
+        malformed_old.owner_id = [0xEEu8; 16];
+
+        let valid_new =
+            VouchingCert::sign(&sk_dev, owner_id_a, target, Stance::Vouch, 200).unwrap();
+
+        let wire = OwnerStateWire {
+            owner_id: owner_id_a,
+            enrollments: vec![EnrollmentPair(
+                device_id,
+                EnrollmentCert::sign_master(
+                    &master_sk_a,
+                    master_bundle_a,
+                    device_id,
+                    bundle_dev,
+                    1_000_000,
+                    None,
+                )
+                .unwrap(),
+            )],
+            vouching: vec![malformed_old, valid_new],
+            revocations: vec![],
+            liveness: vec![],
+        };
+        let bytes = cbor::to_canonical(&wire).unwrap();
+        let result: Result<OwnerState, _> = cbor::from_bytes(&bytes);
+        let err = result
+            .expect_err("must reject — malformed older cert must not be silently dropped by LWW");
+        assert!(
+            err.to_string().contains("owner_id") || err.to_string().contains("WrongOwner"),
+            "actual: {err}"
+        );
     }
 
     #[test]

@@ -1,14 +1,37 @@
 use crate::certs::RevocationCert;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Strict Remove-Wins / monotonic add-only revocation set. Once a target
 /// is in the set, no subsequent cert can remove it. The earliest-timestamp
 /// revocation cert wins per target (so replays of older state don't lose
 /// information about already-known revocations).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "Vec<RevocationCert>", into = "Vec<RevocationCert>")]
 pub struct RevocationSet {
     /// target -> earliest revocation cert seen
     cells: HashMap<[u8; 16], RevocationCert>,
+}
+
+impl From<Vec<RevocationCert>> for RevocationSet {
+    fn from(certs: Vec<RevocationCert>) -> Self {
+        let mut set = RevocationSet::default();
+        for cert in certs {
+            set.insert(cert);
+        }
+        set
+    }
+}
+
+impl From<RevocationSet> for Vec<RevocationCert> {
+    fn from(set: RevocationSet) -> Self {
+        // Deterministic order: canonical CBOR sorts map entries but preserves
+        // array order, so we must sort here. Sort by `target` (the cell key —
+        // each target has at most one cert) for a stable wire format.
+        let mut certs: Vec<_> = set.cells.into_values().collect();
+        certs.sort_unstable_by_key(|cert| cert.target);
+        certs
+    }
 }
 
 impl RevocationSet {
@@ -104,6 +127,42 @@ mod tests {
         s1.merge(s2);
         assert!(s1.is_revoked(target_a));
         assert!(s1.is_revoked(target_b));
+    }
+
+    #[test]
+    fn serialization_is_deterministic_across_insertion_orders() {
+        // Bots flagged: HashMap iteration order randomizes the wire format.
+        // The From<RevocationSet> for Vec<RevocationCert> impl now sorts by
+        // target so equivalent sets produce byte-identical serialization.
+        use crate::cbor;
+
+        let mut targets = [[0u8; 16]; 5];
+        for (i, t) in targets.iter_mut().enumerate() {
+            *t = [(i as u8) * 17 + 1; 16];
+        }
+        let certs: Vec<_> = targets
+            .iter()
+            .map(|&t| make_self_revocation(t, 100))
+            .collect();
+
+        // Set A: insert forwards
+        let mut set_a = RevocationSet::new();
+        for c in certs.iter().cloned() {
+            set_a.insert(c);
+        }
+        // Set B: insert backwards
+        let mut set_b = RevocationSet::new();
+        for c in certs.iter().rev().cloned() {
+            set_b.insert(c);
+        }
+
+        let bytes_a = cbor::to_canonical(&set_a).unwrap();
+        let bytes_b = cbor::to_canonical(&set_b).unwrap();
+        assert_eq!(
+            bytes_a, bytes_b,
+            "equivalent RevocationSets with different insertion orders must \
+             serialize to identical canonical CBOR"
+        );
     }
 
     #[test]
