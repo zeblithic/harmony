@@ -2,7 +2,6 @@ use crate::certs::{EnrollmentCert, EnrollmentIssuer, LivenessCert};
 use crate::crdt::{RevocationSet, VouchingSet};
 use crate::OwnerError;
 use ed25519_dalek::VerifyingKey;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Aggregate state for one owner identity: enrollment certs per device,
@@ -11,67 +10,13 @@ use std::collections::HashMap;
 /// Reclamation continuity is evaluated functionally via
 /// `lifecycle::reclamation::evaluate_reclamation` against any candidate
 /// `ReclamationCert`; it is not held as state here (no current consumer).
-///
-/// Serialization: HashMap fields use a list-of-pairs representation for
-/// CBOR compatibility (CBOR map keys must be scalars; `[u8; 16]` keys
-/// are encoded as byte strings in the pair's first element).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(from = "OwnerStateWire", into = "OwnerStateWire")]
+#[derive(Debug, Clone, Default)]
 pub struct OwnerState {
     pub owner_id: [u8; 16],
     pub enrollments: HashMap<[u8; 16], EnrollmentCert>,
     pub vouching: VouchingSet,
     pub revocations: RevocationSet,
     pub liveness: HashMap<[u8; 16], LivenessCert>,
-}
-
-/// Wire format for CBOR serialization of `OwnerState`. HashMaps are
-/// represented as ordered lists of `(key, value)` pairs so that `[u8; 16]`
-/// keys serialize as CBOR byte strings rather than integer arrays.
-#[derive(Serialize, Deserialize)]
-struct OwnerStateWire {
-    #[serde(with = "crate::cbor::arr16")]
-    owner_id: [u8; 16],
-    enrollments: Vec<EnrollmentPair>,
-    vouching: VouchingSet,
-    revocations: RevocationSet,
-    liveness: Vec<LivenessPair>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct EnrollmentPair(
-    #[serde(with = "crate::cbor::arr16")] [u8; 16],
-    EnrollmentCert,
-);
-
-#[derive(Serialize, Deserialize)]
-struct LivenessPair(
-    #[serde(with = "crate::cbor::arr16")] [u8; 16],
-    LivenessCert,
-);
-
-impl From<OwnerStateWire> for OwnerState {
-    fn from(w: OwnerStateWire) -> Self {
-        OwnerState {
-            owner_id: w.owner_id,
-            enrollments: w.enrollments.into_iter().map(|EnrollmentPair(k, v)| (k, v)).collect(),
-            vouching: w.vouching,
-            revocations: w.revocations,
-            liveness: w.liveness.into_iter().map(|LivenessPair(k, v)| (k, v)).collect(),
-        }
-    }
-}
-
-impl From<OwnerState> for OwnerStateWire {
-    fn from(s: OwnerState) -> Self {
-        OwnerStateWire {
-            owner_id: s.owner_id,
-            enrollments: s.enrollments.into_iter().map(|(k, v)| EnrollmentPair(k, v)).collect(),
-            vouching: s.vouching,
-            revocations: s.revocations,
-            liveness: s.liveness.into_iter().map(|(k, v)| LivenessPair(k, v)).collect(),
-        }
-    }
 }
 
 impl OwnerState {

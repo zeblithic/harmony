@@ -1,32 +1,14 @@
 use crate::certs::RevocationCert;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Strict Remove-Wins / monotonic add-only revocation set. Once a target
 /// is in the set, no subsequent cert can remove it. The earliest-timestamp
 /// revocation cert wins per target (so replays of older state don't lose
 /// information about already-known revocations).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(from = "Vec<RevocationCert>", into = "Vec<RevocationCert>")]
+#[derive(Debug, Clone, Default)]
 pub struct RevocationSet {
     /// target -> earliest revocation cert seen
     cells: HashMap<[u8; 16], RevocationCert>,
-}
-
-impl From<Vec<RevocationCert>> for RevocationSet {
-    fn from(certs: Vec<RevocationCert>) -> Self {
-        let mut set = RevocationSet::default();
-        for cert in certs {
-            set.insert(cert);
-        }
-        set
-    }
-}
-
-impl From<RevocationSet> for Vec<RevocationCert> {
-    fn from(set: RevocationSet) -> Self {
-        set.cells.into_values().collect()
-    }
 }
 
 impl RevocationSet {
