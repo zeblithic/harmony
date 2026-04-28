@@ -1,4 +1,4 @@
-use crate::certs::{EnrollmentCert, EnrollmentIssuer, LivenessCert};
+use crate::certs::{EnrollmentCert, EnrollmentIssuer, LivenessCert, RevocationCert, VouchingCert};
 use crate::crdt::{RevocationSet, VouchingSet};
 use crate::OwnerError;
 use ed25519_dalek::VerifyingKey;
@@ -28,13 +28,20 @@ pub struct OwnerState {
 /// Wire format for CBOR serialization of `OwnerState`. HashMaps are
 /// represented as ordered lists of `(key, value)` pairs so that `[u8; 16]`
 /// keys serialize as CBOR byte strings rather than integer arrays.
+///
+/// `vouching` and `revocations` are `Vec<Cert>` (not the CRDT set types)
+/// so `OwnerState::try_from` can validate `cert.owner_id` on each *raw*
+/// entry before the LWW dedup in `VouchingSet::from(...)` /
+/// `RevocationSet::from(...)` collapses inconsistent duplicate cells.
+/// Otherwise a malformed older cert at the same cell would lose LWW to a
+/// valid newer cert and disappear before validation.
 #[derive(Serialize, Deserialize)]
 struct OwnerStateWire {
     #[serde(with = "crate::cbor::arr16")]
     owner_id: [u8; 16],
     enrollments: Vec<EnrollmentPair>,
-    vouching: VouchingSet,
-    revocations: RevocationSet,
+    vouching: Vec<VouchingCert>,
+    revocations: Vec<RevocationCert>,
     liveness: Vec<LivenessPair>,
 }
 
@@ -111,9 +118,12 @@ impl TryFrom<OwnerStateWire> for OwnerState {
             }
         }
 
-        // CRDT containers reconstruct via their own infallible From impls
-        // (LWW dedups internally); validate cert.owner_id post-hoc.
-        for cert in w.vouching.iter() {
+        // Validate cert.owner_id on each *raw* CRDT entry BEFORE materializing
+        // the sets. The CRDT From impls call insert() which applies LWW
+        // dedup — a malformed older cert at the same (signer, target) cell
+        // would otherwise silently lose to a newer valid cert and disappear
+        // before validation could catch it.
+        for cert in &w.vouching {
             if cert.owner_id != owner_id {
                 return Err(OwnerError::WrongOwner {
                     expected: owner_id,
@@ -121,7 +131,7 @@ impl TryFrom<OwnerStateWire> for OwnerState {
                 });
             }
         }
-        for cert in w.revocations.iter() {
+        for cert in &w.revocations {
             if cert.owner_id != owner_id {
                 return Err(OwnerError::WrongOwner {
                     expected: owner_id,
@@ -133,8 +143,8 @@ impl TryFrom<OwnerStateWire> for OwnerState {
         Ok(OwnerState {
             owner_id,
             enrollments,
-            vouching: w.vouching,
-            revocations: w.revocations,
+            vouching: VouchingSet::from(w.vouching),
+            revocations: RevocationSet::from(w.revocations),
             liveness,
         })
     }
@@ -157,8 +167,11 @@ impl From<OwnerState> for OwnerStateWire {
                 .into_iter()
                 .map(|(k, v)| EnrollmentPair(k, v))
                 .collect(),
-            vouching: s.vouching,
-            revocations: s.revocations,
+            // CRDT sets convert via their existing sorted From impls
+            // (RevocationSet → Vec<RevocationCert> sorts by target;
+            // VouchingSet → Vec<VouchingCert> sorts by (signer, target)).
+            vouching: s.vouching.into(),
+            revocations: s.revocations.into(),
             liveness: liveness
                 .into_iter()
                 .map(|(k, v)| LivenessPair(k, v))
@@ -809,8 +822,8 @@ mod tests {
         let wire = OwnerStateWire {
             owner_id: [0x99u8; 16],
             enrollments: vec![EnrollmentPair(cert.device_id, cert)],
-            vouching: VouchingSet::new(),
-            revocations: RevocationSet::new(),
+            vouching: vec![],
+            revocations: vec![],
             liveness: vec![],
         };
         let bytes = cbor::to_canonical(&wire).unwrap();
@@ -846,8 +859,8 @@ mod tests {
         let wire = OwnerStateWire {
             owner_id,
             enrollments: vec![EnrollmentPair([0x42u8; 16], cert)],
-            vouching: VouchingSet::new(),
-            revocations: RevocationSet::new(),
+            vouching: vec![],
+            revocations: vec![],
             liveness: vec![],
         };
         let bytes = cbor::to_canonical(&wire).unwrap();
@@ -885,14 +898,76 @@ mod tests {
                 EnrollmentPair(cert.device_id, cert.clone()),
                 EnrollmentPair(cert.device_id, cert),
             ],
-            vouching: VouchingSet::new(),
-            revocations: RevocationSet::new(),
+            vouching: vec![],
+            revocations: vec![],
             liveness: vec![],
         };
         let bytes = cbor::to_canonical(&wire).unwrap();
         let result: Result<OwnerState, _> = cbor::from_bytes(&bytes);
         let err = result.expect_err("must reject");
         assert!(err.to_string().contains("duplicate"), "actual: {err}");
+    }
+
+    #[test]
+    fn deserialize_rejects_malformed_vouching_cert_even_when_lww_would_drop_it() {
+        // Regression: prior fix iterated `w.vouching.iter()` AFTER the wire
+        // had been deserialized into a `VouchingSet`, which calls insert()
+        // (LWW). A malformed older cert at the same (signer, target) cell
+        // could lose LWW to a valid newer cert and silently disappear before
+        // the validation iteration ran. Now that `OwnerStateWire.vouching`
+        // is `Vec<VouchingCert>` (raw), the validation runs on the original
+        // wire entries before LWW dedup.
+        use crate::cbor;
+        use crate::certs::{Stance, VouchingCert};
+
+        // Owner A's identity, plus a single device under owner A.
+        let (master_sk_a, master_bundle_a) = keypair_and_bundle();
+        let owner_id_a = master_bundle_a.identity_hash();
+        let (sk_dev, bundle_dev) = keypair_and_bundle();
+        let device_id = bundle_dev.identity_hash();
+
+        // Manually construct a wire payload with two vouching certs at the
+        // same cell (same signer, same target). The OLDER cert claims the
+        // wrong owner_id (e.g., from a corrupted persisted state); the
+        // NEWER cert is valid. Without the fix, LWW would drop the older
+        // cert before validation, masking the corruption.
+        let target = [9u8; 16];
+
+        let mut malformed_old =
+            VouchingCert::sign(&sk_dev, owner_id_a, target, Stance::Vouch, 100).unwrap();
+        // Tamper: swap the owner_id to something else, simulating wire
+        // corruption / cross-owner cert leakage.
+        malformed_old.owner_id = [0xEEu8; 16];
+
+        let valid_new =
+            VouchingCert::sign(&sk_dev, owner_id_a, target, Stance::Vouch, 200).unwrap();
+
+        let wire = OwnerStateWire {
+            owner_id: owner_id_a,
+            enrollments: vec![EnrollmentPair(
+                device_id,
+                EnrollmentCert::sign_master(
+                    &master_sk_a,
+                    master_bundle_a,
+                    device_id,
+                    bundle_dev,
+                    1_000_000,
+                    None,
+                )
+                .unwrap(),
+            )],
+            vouching: vec![malformed_old, valid_new],
+            revocations: vec![],
+            liveness: vec![],
+        };
+        let bytes = cbor::to_canonical(&wire).unwrap();
+        let result: Result<OwnerState, _> = cbor::from_bytes(&bytes);
+        let err = result
+            .expect_err("must reject — malformed older cert must not be silently dropped by LWW");
+        assert!(
+            err.to_string().contains("owner_id") || err.to_string().contains("WrongOwner"),
+            "actual: {err}"
+        );
     }
 
     #[test]
