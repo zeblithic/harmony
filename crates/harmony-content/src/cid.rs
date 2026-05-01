@@ -400,10 +400,17 @@ impl ContentId {
 impl Serialize for ContentId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         // Emit as CBOR bstr / serde "bytes" rather than as a tuple-of-u8
-        // (the default for [u8; 32] in serde). Bytewise-identical in
-        // postcard (workspace's primary codec); narrower on the wire in
-        // CBOR codecs (ciborium, serde_cbor). harmony-client's
-        // bstr-based wire format depends on this representation.
+        // (the default for [u8; 32] in serde). Postcard wire format
+        // changes from 32 raw bytes ([u8; 32]) to varint-length-prefixed
+        // 32 bytes (33 bytes total: 0x20 + payload). Deserialize accepts
+        // both via a Visitor (visit_bytes for the new format,
+        // visit_seq for legacy [u8; 32] / array-of-u8 — see impl below).
+        // Narrower than array-of-u8 in CBOR codecs (ciborium, serde_cbor)
+        // because CBOR encodes each u8 as a 1-2 byte unsigned int.
+        // harmony-client's bstr-based wire format depends on this
+        // representation. New writes are not bytewise-compatible with
+        // pre-Phase-3b code; the legacy-tolerant visit_seq path provides
+        // backward read compatibility.
         serializer.serialize_bytes(&self.to_bytes())
     }
 }
