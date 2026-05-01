@@ -1,5 +1,5 @@
 use crate::error::ContentError;
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 /// Length of the hash/payload portion of a ContentId in bytes.
@@ -966,5 +966,46 @@ mod tests {
         assert_eq!(buf[0], 0x20, "expected varint encoding of length 32 (0x20)");
         let recovered: ContentId = postcard::from_bytes(&buf).unwrap();
         assert_eq!(cid, recovered);
+    }
+
+    #[test]
+    fn ciborium_deserialize_rejects_non_32_byte_bstr() {
+        // Lock in the v.len() != 32 guard in ContentIdVisitor::visit_bytes.
+        // bstr(31) — too short.
+        let mut short = vec![0x58, 0x1f];
+        short.extend_from_slice(&[0u8; 31]);
+        assert!(
+            ciborium::de::from_reader::<ContentId, _>(&short[..]).is_err(),
+            "expected error decoding bstr(31), got Ok"
+        );
+
+        // bstr(33) — too long.
+        let mut long = vec![0x58, 0x21];
+        long.extend_from_slice(&[0u8; 33]);
+        assert!(
+            ciborium::de::from_reader::<ContentId, _>(&long[..]).is_err(),
+            "expected error decoding bstr(33), got Ok"
+        );
+    }
+
+    #[test]
+    fn postcard_deserialize_rejects_non_32_byte_inputs() {
+        // Lock in the v.len() != 32 guard via postcard's varint-prefixed
+        // byte-slice encoding. varint(31) + 31 bytes = 32-byte buffer that
+        // should reject because length is not 32.
+        let mut short = vec![0x1f];
+        short.extend_from_slice(&[0u8; 31]);
+        assert!(
+            postcard::from_bytes::<ContentId>(&short).is_err(),
+            "expected error decoding postcard varint(31)+31 bytes, got Ok"
+        );
+
+        // varint(33) + 33 bytes — too long.
+        let mut long = vec![0x21];
+        long.extend_from_slice(&[0u8; 33]);
+        assert!(
+            postcard::from_bytes::<ContentId>(&long).is_err(),
+            "expected error decoding postcard varint(33)+33 bytes, got Ok"
+        );
     }
 }
