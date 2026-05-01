@@ -436,6 +436,21 @@ impl<'de> Deserialize<'de> for ContentId {
                 arr.copy_from_slice(v);
                 Ok(ContentId::from_bytes(arr))
             }
+
+            // Explicit forwards to visit_bytes. Serde's defaults already
+            // forward these to visit_bytes, but making the dispatch
+            // explicit matches repo style (harmony-mail-discovery::claim,
+            // harmony-owner::cbor) and avoids relying on implicit defaults.
+            fn visit_borrowed_bytes<E: serde::de::Error>(
+                self,
+                v: &'de [u8],
+            ) -> Result<ContentId, E> {
+                self.visit_bytes(v)
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<ContentId, E> {
+                self.visit_bytes(&v)
+            }
         }
         // Phase 3b wire-format change: this PR breaks postcard
         // wire compat for ContentId. Pre-Phase-3b postcard data
