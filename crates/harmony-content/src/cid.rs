@@ -399,14 +399,51 @@ impl ContentId {
 
 impl Serialize for ContentId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.to_bytes().serialize(serializer)
+        // Emit as CBOR bstr / serde "bytes" rather than as a tuple-of-u8
+        // (the default for [u8; 32] in serde). Bytewise-identical in
+        // postcard (workspace's primary codec); narrower on the wire in
+        // CBOR codecs (ciborium, serde_cbor). harmony-client's
+        // bstr-based wire format depends on this representation.
+        serializer.serialize_bytes(&self.to_bytes())
     }
 }
 
 impl<'de> Deserialize<'de> for ContentId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes: [u8; 32] = Deserialize::deserialize(deserializer)?;
-        Ok(ContentId::from_bytes(bytes))
+        struct ContentIdVisitor;
+        impl<'de> serde::de::Visitor<'de> for ContentIdVisitor {
+            type Value = ContentId;
+
+            fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                formatter.write_str("a 32-byte sequence or byte string")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<ContentId, E> {
+                if v.len() != 32 {
+                    return Err(E::invalid_length(v.len(), &"32"));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(v);
+                Ok(ContentId::from_bytes(arr))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ContentId, A::Error> {
+                let mut arr = [0u8; 32];
+                for byte in arr.iter_mut() {
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(0, &"32"))?;
+                }
+                Ok(ContentId::from_bytes(arr))
+            }
+        }
+        // Use deserialize_bytes to match serialize_bytes (bstr in CBOR,
+        // length-prefixed byte slice in postcard). The visitor also accepts
+        // seq for forward compatibility with any legacy tuple-of-u8 encoding.
+        deserializer.deserialize_bytes(ContentIdVisitor)
     }
 }
 
@@ -862,5 +899,31 @@ mod tests {
 
     fn children_to_bytes(children: &[ContentId]) -> Vec<u8> {
         children.iter().flat_map(|c| c.to_bytes()).collect()
+    }
+
+    #[test]
+    fn ciborium_serialize_emits_bstr_32() {
+        // Phase 3b precondition: harmony-client encodes ContentId as a
+        // canonical CBOR bstr(32). Wire bytes must be 0x58 0x20 + 32 payload
+        // bytes (1-byte tag, 1-byte length, 32 payload) = 34 bytes total.
+        // Without serialize_bytes, ciborium encodes [u8; 32] as a 32-element
+        // major-type-4 array, which is wider on the wire and incompatible
+        // with harmony-client's bstr-based RootPublishPayload.
+        let cid = ContentId::for_book(b"hello", ContentFlags::default()).unwrap();
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&cid, &mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            34,
+            "expected bstr(32) = 34 bytes, got {} bytes (likely array-of-u8 encoding)",
+            buf.len()
+        );
+        assert_eq!(
+            buf[0], 0x58,
+            "expected CBOR major type 2 (bstr) with 1-byte length tag"
+        );
+        assert_eq!(buf[1], 0x20, "expected length = 32");
+        let recovered: ContentId = ciborium::de::from_reader(&buf[..]).unwrap();
+        assert_eq!(cid, recovered);
     }
 }
