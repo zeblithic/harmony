@@ -1,5 +1,5 @@
 use crate::error::ContentError;
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 /// Length of the hash/payload portion of a ContentId in bytes.
@@ -399,14 +399,70 @@ impl ContentId {
 
 impl Serialize for ContentId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.to_bytes().serialize(serializer)
+        // Emit as CBOR bstr / serde "bytes" rather than as a tuple-of-u8
+        // (the default for [u8; 32] in serde). Postcard wire format
+        // changes from 32 raw bytes ([u8; 32]) to varint-length-prefixed
+        // 32 bytes (33 bytes total: 0x20 + payload). This is a one-way
+        // wire-format break: pre-Phase-3b postcard data containing
+        // ContentId cannot be read by the new Deserialize impl, since
+        // postcard's deserialize_bytes expects a varint length prefix
+        // and never falls back to tuple/seq decoding. Narrower than
+        // array-of-u8 in CBOR codecs (ciborium, serde_cbor) because
+        // CBOR encodes each u8 as a 1-2 byte unsigned int. harmony-
+        // client's bstr-based wire format depends on this representation.
+        // Accepted because harmony is pre-1.0 with no production
+        // deployments; affected consumers (harmony-roxy LicenseManifest/
+        // ArtistProfile, harmony-model ModelManifest) regenerate at-rest
+        // data after Phase 3b lands.
+        serializer.serialize_bytes(&self.to_bytes())
     }
 }
 
 impl<'de> Deserialize<'de> for ContentId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes: [u8; 32] = Deserialize::deserialize(deserializer)?;
-        Ok(ContentId::from_bytes(bytes))
+        struct ContentIdVisitor;
+        impl<'de> serde::de::Visitor<'de> for ContentIdVisitor {
+            type Value = ContentId;
+
+            fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                formatter.write_str("a 32-byte byte string")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<ContentId, E> {
+                if v.len() != 32 {
+                    return Err(E::invalid_length(v.len(), &"32"));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(v);
+                Ok(ContentId::from_bytes(arr))
+            }
+
+            // Explicit forwards to visit_bytes. Serde's defaults already
+            // forward these to visit_bytes, but making the dispatch
+            // explicit matches repo style (harmony-mail-discovery::claim,
+            // harmony-owner::cbor) and avoids relying on implicit defaults.
+            fn visit_borrowed_bytes<E: serde::de::Error>(
+                self,
+                v: &'de [u8],
+            ) -> Result<ContentId, E> {
+                self.visit_bytes(v)
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<ContentId, E> {
+                self.visit_bytes(&v)
+            }
+        }
+        // Phase 3b wire-format change: this PR breaks postcard
+        // wire compat for ContentId. Pre-Phase-3b postcard data
+        // (32 raw bytes via [u8; 32] tuple serialization) cannot
+        // be decoded by this Visitor — postcard's deserialize_bytes
+        // expects a varint length prefix and never falls back to
+        // tuple/seq decoding. Workspace consumers with at-rest
+        // postcard data containing ContentId fields (harmony-roxy
+        // LicenseManifest/ArtistProfile, harmony-model ModelManifest)
+        // must regenerate that data after Phase 3b lands. Accepted
+        // because harmony is pre-1.0 with no production deployments.
+        deserializer.deserialize_bytes(ContentIdVisitor)
     }
 }
 
@@ -862,5 +918,94 @@ mod tests {
 
     fn children_to_bytes(children: &[ContentId]) -> Vec<u8> {
         children.iter().flat_map(|c| c.to_bytes()).collect()
+    }
+
+    #[test]
+    fn ciborium_serialize_emits_bstr_32() {
+        // Phase 3b precondition: harmony-client encodes ContentId as a
+        // canonical CBOR bstr(32). Wire bytes must be 0x58 0x20 + 32 payload
+        // bytes (1-byte tag, 1-byte length, 32 payload) = 34 bytes total.
+        // Without serialize_bytes, ciborium encodes [u8; 32] as a 32-element
+        // major-type-4 array, which is wider on the wire and incompatible
+        // with harmony-client's bstr-based RootPublishPayload.
+        let cid = ContentId::for_book(b"hello", ContentFlags::default()).unwrap();
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&cid, &mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            34,
+            "expected bstr(32) = 34 bytes, got {} bytes (likely array-of-u8 encoding)",
+            buf.len()
+        );
+        assert_eq!(
+            buf[0], 0x58,
+            "expected CBOR major type 2 (bstr) with 1-byte length tag"
+        );
+        assert_eq!(buf[1], 0x20, "expected length = 32");
+        let recovered: ContentId = ciborium::de::from_reader(&buf[..]).unwrap();
+        assert_eq!(cid, recovered);
+    }
+
+    #[test]
+    fn postcard_serialize_emits_varint_prefixed_33_bytes() {
+        // Phase 3b wire-format change: ContentId now serializes via
+        // serde::serialize_bytes, which postcard encodes as
+        // varint(N) + N bytes. For N=32, that's 0x20 + 32 = 33 bytes.
+        // The previous wire format was 32 raw bytes (no length prefix)
+        // via the [u8; 32]: Serialize default. Old data is NOT
+        // backward-readable by the new impl — see Serialize impl
+        // comment for affected consumers.
+        let cid = ContentId::for_book(b"hello", ContentFlags::default()).unwrap();
+        let buf = postcard::to_allocvec(&cid).unwrap();
+        assert_eq!(
+            buf.len(),
+            33,
+            "expected varint(32) + 32 bytes = 33 bytes, got {}",
+            buf.len()
+        );
+        assert_eq!(buf[0], 0x20, "expected varint encoding of length 32 (0x20)");
+        let recovered: ContentId = postcard::from_bytes(&buf).unwrap();
+        assert_eq!(cid, recovered);
+    }
+
+    #[test]
+    fn ciborium_deserialize_rejects_non_32_byte_bstr() {
+        // Lock in the v.len() != 32 guard in ContentIdVisitor::visit_bytes.
+        // bstr(31) — too short.
+        let mut short = vec![0x58, 0x1f];
+        short.extend_from_slice(&[0u8; 31]);
+        assert!(
+            ciborium::de::from_reader::<ContentId, _>(&short[..]).is_err(),
+            "expected error decoding bstr(31), got Ok"
+        );
+
+        // bstr(33) — too long.
+        let mut long = vec![0x58, 0x21];
+        long.extend_from_slice(&[0u8; 33]);
+        assert!(
+            ciborium::de::from_reader::<ContentId, _>(&long[..]).is_err(),
+            "expected error decoding bstr(33), got Ok"
+        );
+    }
+
+    #[test]
+    fn postcard_deserialize_rejects_non_32_byte_inputs() {
+        // Lock in the v.len() != 32 guard via postcard's varint-prefixed
+        // byte-slice encoding. varint(31) + 31 bytes = 32-byte buffer that
+        // should reject because length is not 32.
+        let mut short = vec![0x1f];
+        short.extend_from_slice(&[0u8; 31]);
+        assert!(
+            postcard::from_bytes::<ContentId>(&short).is_err(),
+            "expected error decoding postcard varint(31)+31 bytes, got Ok"
+        );
+
+        // varint(33) + 33 bytes — too long.
+        let mut long = vec![0x21];
+        long.extend_from_slice(&[0u8; 33]);
+        assert!(
+            postcard::from_bytes::<ContentId>(&long).is_err(),
+            "expected error decoding postcard varint(33)+33 bytes, got Ok"
+        );
     }
 }

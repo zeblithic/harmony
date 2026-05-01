@@ -3302,6 +3302,7 @@ dependencies = [
 name = "harmony-content"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "harmony-crypto",
  "harmony-zenoh",
  "hashbrown 0.15.5",

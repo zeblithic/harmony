@@ -21,3 +21,6 @@ hashbrown = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 libm = { workspace = true }
+
+[dev-dependencies]
+ciborium = "0.2"
