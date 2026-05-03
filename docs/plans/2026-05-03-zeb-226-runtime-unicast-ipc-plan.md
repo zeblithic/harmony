@@ -14,7 +14,7 @@
 
 ## File Structure
 
-Single-crate change. All work in `crates/harmony-runtime/`:
+Primary work is in `crates/harmony-runtime/`, with a small companion change in `crates/harmony-reticulum/` for the `DeliverLocally.source` field (chosen during Task 3 investigation per Option C in the open questions below):
 
 - **Modify:** `crates/harmony-runtime/src/runtime.rs`
   - Around line 195+ — add `RuntimeEvent::SendUnicastToDevice` variant (Tier 1)
@@ -23,9 +23,11 @@ Single-crate change. All work in `crates/harmony-runtime/`:
   - In the runtime tick loop (find by reading `pub fn tick` at line 2005 + grep for where `RuntimeEvent` variants get dispatched) — add a `SendUnicastToDevice` event handler that translates to `SendOnInterface`
   - Inline tests in the same file's `#[cfg(test)]` block (matches existing convention)
 
+- **Modify (likely):** `crates/harmony-reticulum/src/node.rs` — add a `source: Option<[u8; 16]>` field to `NodeAction::DeliverLocally` and a test-only `path_table_mut_for_tests()` accessor on `Node`. (See Task 3 + Task 4 investigations.)
+
 - **Modify (if needed):** `crates/harmony-runtime/src/lib.rs` or other re-export paths if the new variants need to surface through a `pub use`
 
-No new files. No other crates touched.
+No new files.
 
 ---
 
@@ -116,6 +118,7 @@ cargo fmt --all -- --check && \
   cargo clippy --manifest-path crates/harmony-runtime/Cargo.toml --all-targets -- -D warnings && \
   cargo check --manifest-path crates/harmony-runtime/Cargo.toml
 ```
+
 Expected: all three exit 0.
 
 - [ ] **Step 6: Commit**
@@ -201,6 +204,7 @@ cargo fmt --all -- --check && \
   cargo clippy --manifest-path crates/harmony-runtime/Cargo.toml --all-targets -- -D warnings && \
   cargo check --manifest-path crates/harmony-runtime/Cargo.toml
 ```
+
 Expected: all three exit 0.
 
 - [ ] **Step 6: Commit**
@@ -311,9 +315,11 @@ cargo fmt --all -- --check && \
   cargo clippy --manifest-path crates/harmony-runtime/Cargo.toml --all-targets -- -D warnings && \
   cargo test --manifest-path crates/harmony-runtime/Cargo.toml --lib
 ```
+
 Expected: all three exit 0. Full lib test suite passes.
 
 If you needed to modify `harmony-reticulum` (option a), also run:
+
 ```bash
 cargo clippy --manifest-path crates/harmony-reticulum/Cargo.toml --all-targets -- -D warnings && \
   cargo test --manifest-path crates/harmony-reticulum/Cargo.toml --lib
@@ -439,6 +445,7 @@ cargo fmt --all -- --check && \
   cargo clippy --manifest-path crates/harmony-runtime/Cargo.toml --all-targets -- -D warnings && \
   cargo test --manifest-path crates/harmony-runtime/Cargo.toml --lib
 ```
+
 Expected: all three exit 0.
 
 - [ ] **Step 7: Commit**
@@ -535,11 +542,11 @@ fn unicast_round_trip_a_to_b_surfaces_as_unicast_received() {
 Run: `cargo test --manifest-path crates/harmony-runtime/Cargo.toml --lib unicast_round_trip_a_to_b_surfaces_as_unicast_received`
 Expected: PASS
 
-If this fails, the issue is most likely:
+When this fails, the most likely root causes are:
 - The minimal two-node setup doesn't share a real interface (need to wire the `interface_name` through correctly)
 - The Reticulum link layer requires handshake before unicast (need to either pre-establish the link in the test setup, or use a simpler non-link path if available)
 
-If the issue is "real Reticulum link handshake required for round-trip," that's acceptable scope-creep for a focused unit test only IF the existing test infrastructure makes link-establishment easy. If not, defer the full round-trip test to harmony-client's Phase 3b integration tests and leave a comment in this test explaining the deferral.
+Should the second cause apply ("real Reticulum link handshake required for round-trip"), that's acceptable scope-creep for a focused unit test only IF the existing test infrastructure makes link-establishment easy. Otherwise, defer the full round-trip test to harmony-client's Phase 3b integration tests and leave a comment in this test explaining the deferral.
 
 - [ ] **Step 4: Run gates**
 
