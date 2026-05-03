@@ -202,6 +202,21 @@ pub enum RuntimeEvent {
     /// Tier 1: Periodic timer tick for path expiry, announce scheduling.
     /// `now` is monotonic millis-since-start. `unix_now` is Unix epoch seconds.
     TimerTick { now: u64, unix_now: u64 },
+    /// Tier 1: Client requests a Reticulum unicast send to a specific
+    /// device. Translated to `RuntimeAction::SendOnInterface` during the
+    /// next tick by looking up `target`'s reachable interface in peer state.
+    /// If `target` is unknown, the request is logged and dropped — retry/
+    /// expiration semantics are the client's concern (handled at the
+    /// outbox layer in harmony-client per ZEB-216 Sub-B Phase 3b).
+    ///
+    /// (ZEB-216 Sub-B Phase 3a — DM transport surface)
+    SendUnicastToDevice {
+        /// 16-byte device identity hash (`harmony_identity::IdentityHash`).
+        target: [u8; 16],
+        /// Opaque packet bytes — the runtime does not parse or validate
+        /// the payload. The client owns encryption + framing.
+        packet: Vec<u8>,
+    },
     /// Tier 2: Zenoh query received (content fetch or stats request).
     QueryReceived {
         query_id: u64,
@@ -1990,6 +2005,12 @@ impl<B: BookStore> NodeRuntime<B> {
                     .storage
                     .handle(StorageTierEvent::S3ReadFailed { cid, query_id });
                 self.dispatch_storage_actions_inline(storage_actions);
+            }
+            RuntimeEvent::SendUnicastToDevice { .. } => {
+                // Placeholder arm — variant exists from ZEB-226 Task 1 (this
+                // commit) so harmony-client can build against it. Translation
+                // to RuntimeAction::SendOnInterface is wired in Task 4. The
+                // explicit no-op keeps the match exhaustive without a wildcard.
             }
         }
     }
@@ -4588,6 +4609,25 @@ mod tests {
         config.schedule.router_max_per_tick = Some(5);
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.schedule().router_max_per_tick, Some(5));
+    }
+
+    #[test]
+    fn runtime_event_send_unicast_to_device_constructs_and_compares() {
+        // ZEB-216 Sub-B Phase 3a — Task 1: variant constructor smoke.
+        // Match-and-extract proves the variant is constructible by name
+        // and the field types match (catches accidental tuple-variant
+        // shape or wrong field-name typos in future refactors).
+        let e = RuntimeEvent::SendUnicastToDevice {
+            target: [0xaa; 16],
+            packet: vec![0x01, 0x02, 0x03],
+        };
+        match e {
+            RuntimeEvent::SendUnicastToDevice { target, packet } => {
+                assert_eq!(target, [0xaa; 16]);
+                assert_eq!(packet, vec![0x01, 0x02, 0x03]);
+            }
+            _ => panic!("expected SendUnicastToDevice variant"),
+        }
     }
 
     #[test]
