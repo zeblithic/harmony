@@ -43,9 +43,8 @@ pub(crate) fn from_mnemonic_inner(s: &str) -> Result<[u8; 32], RecoveryError> {
     // lowercasing via make_ascii_lowercase is byte-preserving for the
     // BIP39 English wordlist and safe because we already rejected
     // non-ASCII input above.
-    let mut normalized: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(
-        s.split_whitespace().collect::<Vec<_>>().join(" "),
-    );
+    let mut normalized: zeroize::Zeroizing<String> =
+        zeroize::Zeroizing::new(s.split_whitespace().collect::<Vec<_>>().join(" "));
     normalized.make_ascii_lowercase();
     // Empty/whitespace-only input has no words, but `"".split(' ')` yields
     // `[""]` — guard explicitly so WrongWordCount reports the right count.
@@ -57,11 +56,8 @@ pub(crate) fn from_mnemonic_inner(s: &str) -> Result<[u8; 32], RecoveryError> {
     if words.len() != 24 {
         return Err(RecoveryError::WrongWordCount(words.len()));
     }
-    let mnemonic = bip39::Mnemonic::parse_in_normalized(
-        bip39::Language::English,
-        &normalized,
-    )
-    .map_err(map_bip39_err_with_words(&words))?;
+    let mnemonic = bip39::Mnemonic::parse_in_normalized(bip39::Language::English, &normalized)
+        .map_err(map_bip39_err_with_words(&words))?;
     let mut entropy = mnemonic.to_entropy();
     debug_assert_eq!(entropy.len(), 32, "BIP39-24 always decodes to 32 bytes");
     let mut seed = [0u8; 32];
@@ -74,7 +70,9 @@ pub(crate) fn from_mnemonic_inner(s: &str) -> Result<[u8; 32], RecoveryError> {
     Ok(seed)
 }
 
-fn map_bip39_err_with_words<'a>(words: &'a [&'a str]) -> impl FnOnce(bip39::Error) -> RecoveryError + 'a {
+fn map_bip39_err_with_words<'a>(
+    words: &'a [&'a str],
+) -> impl FnOnce(bip39::Error) -> RecoveryError + 'a {
     move |e| match e {
         bip39::Error::UnknownWord(idx) => RecoveryError::UnknownWord {
             position: idx + 1, // 1-indexed for human display
@@ -137,8 +135,16 @@ mod decode_tests {
         let m = to_mnemonic_inner(&[0u8; 32]);
         let upper = m.to_uppercase();
         assert!(from_mnemonic_inner(&upper).is_ok());
-        let mixed: String = m.chars().enumerate()
-            .map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c })
+        let mixed: String = m
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 0 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
             .collect();
         assert!(from_mnemonic_inner(&mixed).is_ok());
     }
@@ -187,7 +193,10 @@ mod decode_tests {
         let words: Vec<&str> = m.split_whitespace().take(23).collect();
         let short = words.join(" ");
         let err = from_mnemonic_inner(&short).unwrap_err();
-        assert!(matches!(err, RecoveryError::WrongWordCount(23)), "got: {err}");
+        assert!(
+            matches!(err, RecoveryError::WrongWordCount(23)),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -195,7 +204,10 @@ mod decode_tests {
         let m = to_mnemonic_inner(&[0u8; 32]);
         let long = format!("{} extra", &**m);
         let err = from_mnemonic_inner(&long).unwrap_err();
-        assert!(matches!(err, RecoveryError::WrongWordCount(25)), "got: {err}");
+        assert!(
+            matches!(err, RecoveryError::WrongWordCount(25)),
+            "got: {err}"
+        );
     }
 
     #[test]

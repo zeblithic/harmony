@@ -164,12 +164,18 @@ mod tests {
 
     #[test]
     fn decode_unknown_tag_returns_error() {
-        assert!(matches!(decode_task(&[0xFF, b'{', b'}']), Err(AgentError::UnsupportedFormat(0xFF))));
+        assert!(matches!(
+            decode_task(&[0xFF, b'{', b'}']),
+            Err(AgentError::UnsupportedFormat(0xFF))
+        ));
     }
 
     #[test]
     fn decode_invalid_json_returns_error() {
-        assert!(matches!(decode_task(&[JSON_TAG, b'n', b'o', b't']), Err(AgentError::Json(_))));
+        assert!(matches!(
+            decode_task(&[JSON_TAG, b'n', b'o', b't']),
+            Err(AgentError::Json(_))
+        ));
     }
 
     #[test]

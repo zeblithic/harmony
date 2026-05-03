@@ -63,7 +63,9 @@ impl EnrollmentCert {
         expires_at: Option<u64>,
     ) -> Result<Self, OwnerError> {
         let owner_id = master_pubkey.identity_hash();
-        let issuer = EnrollmentIssuer::Master { master_pubkey: master_pubkey.clone() };
+        let issuer = EnrollmentIssuer::Master {
+            master_pubkey: master_pubkey.clone(),
+        };
         let payload_bytes = cbor::to_canonical(&signing_payload(
             ENROLLMENT_VERSION,
             owner_id,
@@ -96,7 +98,9 @@ impl EnrollmentCert {
                     return Err(OwnerError::IdentityHashMismatch);
                 }
                 let vk = VerifyingKey::from_bytes(&master_pubkey.classical.ed25519_verify)
-                    .map_err(|_| OwnerError::InvalidSignature { cert_type: "Enrollment" })?;
+                    .map_err(|_| OwnerError::InvalidSignature {
+                        cert_type: "Enrollment",
+                    })?;
                 let payload_bytes = cbor::to_canonical(&signing_payload(
                     self.version,
                     self.owner_id,
@@ -106,27 +110,43 @@ impl EnrollmentCert {
                     self.expires_at,
                     &self.issuer,
                 )?)?;
-                verify_with_tag(&vk, tags::ENROLLMENT, &payload_bytes, &self.signature, "Enrollment")?;
+                verify_with_tag(
+                    &vk,
+                    tags::ENROLLMENT,
+                    &payload_bytes,
+                    &self.signature,
+                    "Enrollment",
+                )?;
                 if self.device_pubkeys.identity_hash() != self.device_id {
                     return Err(OwnerError::IdentityHashMismatch);
                 }
                 Ok(())
             }
-            EnrollmentIssuer::Quorum { signers, signatures } => {
+            EnrollmentIssuer::Quorum {
+                signers,
+                signatures,
+            } => {
                 // Quorum verification is delegated to OwnerState (which has access to
                 // the full set of signer Enrollment Certs). This standalone verify()
                 // performs the structural checks that don't require state lookup:
                 // minimum quorum size, signers/signatures parity, distinct signers,
                 // and device-id consistency.
                 if signers.len() < 2 {
-                    return Err(OwnerError::InsufficientQuorum { min: 2, got: signers.len() });
+                    return Err(OwnerError::InsufficientQuorum {
+                        min: 2,
+                        got: signers.len(),
+                    });
                 }
                 if signers.len() != signatures.len() {
-                    return Err(OwnerError::InvalidSignature { cert_type: "Enrollment" });
+                    return Err(OwnerError::InvalidSignature {
+                        cert_type: "Enrollment",
+                    });
                 }
                 let unique: std::collections::HashSet<[u8; 16]> = signers.iter().copied().collect();
                 if unique.len() != signers.len() {
-                    return Err(OwnerError::InvalidSignature { cert_type: "Enrollment" });
+                    return Err(OwnerError::InvalidSignature {
+                        cert_type: "Enrollment",
+                    });
                 }
                 if self.device_pubkeys.identity_hash() != self.device_id {
                     return Err(OwnerError::IdentityHashMismatch);
@@ -147,9 +167,7 @@ fn signing_payload<'a>(
     issuer: &'a EnrollmentIssuer,
 ) -> Result<EnrollmentSigningPayload<'a>, OwnerError> {
     let (issuer_kind, issuer_data) = match issuer {
-        EnrollmentIssuer::Master { master_pubkey } => {
-            (0u8, cbor::to_canonical(master_pubkey)?)
-        }
+        EnrollmentIssuer::Master { master_pubkey } => (0u8, cbor::to_canonical(master_pubkey)?),
         EnrollmentIssuer::Quorum { signers, .. } => {
             // Signatures NOT included in signing payload (chicken-and-egg);
             // each signer's signature covers the rest of the payload + the
@@ -202,7 +220,8 @@ mod tests {
             device_bundle,
             1_700_000_000,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         cert.verify().unwrap();
     }
@@ -220,7 +239,8 @@ mod tests {
             device_bundle,
             1_700_000_000,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Tamper with timestamp
         cert.issued_at = 1_800_000_000;
@@ -241,7 +261,8 @@ mod tests {
             device_bundle,
             1_700_000_000,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         let bytes = cbor::to_canonical(&cert).unwrap();
         let decoded: EnrollmentCert = cbor::from_bytes(&bytes).unwrap();

@@ -470,10 +470,8 @@ pub async fn run(
                     reticulum_inbound_tx: Some(ri_tx),
                     ..harmony_rawlink::BridgeConfig::default()
                 };
-                let padded_socket = harmony_rawlink::PaddedSocket::new(
-                    socket,
-                    harmony_rawlink::DEFAULT_PAD_BLOCK,
-                );
+                let padded_socket =
+                    harmony_rawlink::PaddedSocket::new(socket, harmony_rawlink::DEFAULT_PAD_BLOCK);
                 let mut bridge = harmony_rawlink::Bridge::new(
                     padded_socket,
                     session.clone(),
@@ -642,9 +640,8 @@ pub async fn run(
     // Validates thresholds before constructing SpecDecConfig to avoid panics
     // from invalid user-provided values.
     #[cfg(feature = "inference")]
-    let spec_dec_config: Option<harmony_inference::SpecDecConfig> = speculation_config
-        .as_ref()
-        .and_then(|spec| {
+    let spec_dec_config: Option<harmony_inference::SpecDecConfig> =
+        speculation_config.as_ref().and_then(|spec| {
             let d = harmony_inference::SpecDecConfig::default();
             let tg = spec.tau_generate.unwrap_or(d.tau_generate);
             let tc = spec.tau_chain.unwrap_or(d.tau_chain);
@@ -652,7 +649,10 @@ pub async fn run(
             let mdl = spec.max_draft_len.unwrap_or(d.max_draft_len);
 
             if !(tg.is_finite() && tg >= 0.0 && tg < 1.0) {
-                tracing::warn!(tau_generate = tg, "invalid tau_generate — disabling speculation");
+                tracing::warn!(
+                    tau_generate = tg,
+                    "invalid tau_generate — disabling speculation"
+                );
                 return None;
             }
             if !(tc.is_finite() && tc > 0.0 && tc < 1.0) {
@@ -660,11 +660,18 @@ pub async fn run(
                 return None;
             }
             if !(ta.is_finite() && ta > tg && ta <= 1.0) {
-                tracing::warn!(tau_accept = ta, tau_generate = tg, "invalid tau_accept — disabling speculation");
+                tracing::warn!(
+                    tau_accept = ta,
+                    tau_generate = tg,
+                    "invalid tau_accept — disabling speculation"
+                );
                 return None;
             }
             if mdl < 2 {
-                tracing::warn!(max_draft_len = mdl, "invalid max_draft_len — disabling speculation");
+                tracing::warn!(
+                    max_draft_len = mdl,
+                    "invalid max_draft_len — disabling speculation"
+                );
                 return None;
             }
 
@@ -712,14 +719,13 @@ pub async fn run(
 
     if let Some(ref dir) = data_dir {
         let dir_clone = dir.clone();
-        let memo_entries = tokio::task::spawn_blocking(move || {
-            crate::memo_io::scan_memos(&dir_clone)
-        })
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("memo scan task panicked: {}", e);
-            Vec::new()
-        });
+        let memo_entries =
+            tokio::task::spawn_blocking(move || crate::memo_io::scan_memos(&dir_clone))
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("memo scan task panicked: {}", e);
+                    Vec::new()
+                });
 
         let store = runtime.memo_store_mut();
         for (memo, size) in memo_entries {
@@ -727,7 +733,11 @@ pub async fn run(
                 memo_disk_bytes += size;
             }
         }
-        tracing::info!("Loaded {} memos from disk ({} bytes)", store.len(), memo_disk_bytes);
+        tracing::info!(
+            "Loaded {} memos from disk ({} bytes)",
+            store.len(),
+            memo_disk_bytes
+        );
 
         // Load LFU counts if available (via spawn_blocking to stay off async runtime).
         let lfu_path = dir.join("memo_lfu.bin");
@@ -1602,7 +1612,9 @@ pub async fn run(
                                         max_tokens,
                                         engram_prefill,
                                         spec_config_clone.as_ref().map(|c| {
-                                            harmony_inference::SpeculativeDecodeScheduler::new(c.clone())
+                                            harmony_inference::SpeculativeDecodeScheduler::new(
+                                                c.clone(),
+                                            )
                                         }),
                                     );
                                 });
@@ -1655,7 +1667,9 @@ pub async fn run(
                                     max_tokens,
                                     None,
                                     spec_config_clone2.as_ref().map(|c| {
-                                        harmony_inference::SpeculativeDecodeScheduler::new(c.clone())
+                                        harmony_inference::SpeculativeDecodeScheduler::new(
+                                            c.clone(),
+                                        )
                                     }),
                                 );
                             });
@@ -2262,7 +2276,10 @@ async fn dispatch_action(
                             if let Err(e) = crate::disk_io::write_book(&adir, &cid, &data) {
                                 tracing::error!(?cid, error = %e, "cascade to archive: write failed");
                                 // NVMe file still exists — tell runtime to re-index it.
-                                let _ = tx.blocking_send(ArchiveIoResult::CascadeFailed { cid, size: actual_size });
+                                let _ = tx.blocking_send(ArchiveIoResult::CascadeFailed {
+                                    cid,
+                                    size: actual_size,
+                                });
                                 return;
                             }
                             if let Err(e) = crate::disk_io::delete_book(&ddir, &cid) {
@@ -2284,21 +2301,16 @@ async fn dispatch_action(
             if let Some(ref dir) = archive_dir {
                 let dir = dir.clone();
                 let tx = archive_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    match crate::disk_io::read_book(&dir, &cid) {
-                        Ok(data) => {
-                            let _ = tx.blocking_send(ArchiveIoResult::ReadComplete {
-                                cid,
-                                query_id,
-                                data,
-                            });
-                        }
-                        Err(_) => {
-                            let _ = tx.blocking_send(ArchiveIoResult::ReadFailed {
-                                cid,
-                                query_id,
-                            });
-                        }
+                tokio::task::spawn_blocking(move || match crate::disk_io::read_book(&dir, &cid) {
+                    Ok(data) => {
+                        let _ = tx.blocking_send(ArchiveIoResult::ReadComplete {
+                            cid,
+                            query_id,
+                            data,
+                        });
+                    }
+                    Err(_) => {
+                        let _ = tx.blocking_send(ArchiveIoResult::ReadFailed { cid, query_id });
                     }
                 });
             } else {
@@ -2760,10 +2772,8 @@ fn run_inference_loop(
                 if history.len() >= 2 {
                     let window = &history[history.len().saturating_sub(3)..];
                     let req_result = if latent_failed {
-                        harmony_inference::engram_bridge::prepare_engram_request(
-                            &ep.client, window,
-                        )
-                        .map_err(|e| e.to_string())
+                        harmony_inference::engram_bridge::prepare_engram_request(&ep.client, window)
+                            .map_err(|e| e.to_string())
                     } else {
                         prepare_engram_request_auto(&engine, &ep.client, window)
                             .or_else(|latent_err| {
@@ -2775,8 +2785,7 @@ fn run_inference_loop(
                                 .map_err(|e| e.to_string())
                             })
                     };
-                    if let Ok(req) = req_result
-                    {
+                    if let Ok(req) = req_result {
                         let all_cached = req
                             .required_shards
                             .iter()
@@ -2798,9 +2807,11 @@ fn run_inference_loop(
                                         embeddings: slice,
                                         injection_layers: &ep.injection_layers,
                                     };
-                                    match engine
-                                        .forward_with_engram(&[next_token], &mut cache, &ctx)
-                                    {
+                                    match engine.forward_with_engram(
+                                        &[next_token],
+                                        &mut cache,
+                                        &ctx,
+                                    ) {
                                         Ok(l) => break 'decode_fwd (l, None),
                                         Err(e) => {
                                             // Warn (not trace) — this is an unexpected
@@ -2822,20 +2833,18 @@ fn run_inference_loop(
                 }
             }
             match engine.forward_full(&[next_token], &mut cache, None) {
-                Ok(output) => {
-                    match output.logits_vec() {
-                        Ok(l) => (l, Some(output)),
-                        Err(e) => {
-                            let _ = tx.blocking_send(InferenceResult::Failed {
-                                query_id,
-                                task_id,
-                                error: format!("logits extraction failed: {e}"),
-                                engine,
-                            });
-                            return;
-                        }
+                Ok(output) => match output.logits_vec() {
+                    Ok(l) => (l, Some(output)),
+                    Err(e) => {
+                        let _ = tx.blocking_send(InferenceResult::Failed {
+                            query_id,
+                            task_id,
+                            error: format!("logits extraction failed: {e}"),
+                            engine,
+                        });
+                        return;
                     }
-                }
+                },
                 Err(e) => {
                     let _ = tx.blocking_send(InferenceResult::Failed {
                         query_id,
@@ -2976,11 +2985,17 @@ fn prepare_engram_request_auto(
             })
             .and_then(|(keys, positions)| {
                 harmony_inference::engram_bridge::prepare_engram_request_latent(
-                    client, &keys, &positions, tokens.len(),
+                    client,
+                    &keys,
+                    &positions,
+                    tokens.len(),
                 )
                 .map_err(|e| e.to_string())
             })?;
-        tracing::debug!(num_lookups = req.lookups.len(), "engram: latent projection path used");
+        tracing::debug!(
+            num_lookups = req.lookups.len(),
+            "engram: latent projection path used"
+        );
         Ok(req)
     } else {
         harmony_inference::engram_bridge::prepare_engram_request(client, tokens)
@@ -2990,10 +3005,7 @@ fn prepare_engram_request_auto(
 
 /// Persist a memo to disk if data_dir is configured.
 #[allow(dead_code)]
-fn persist_memo_to_disk(
-    data_dir: &Option<std::path::PathBuf>,
-    memo: &harmony_memo::Memo,
-) {
+fn persist_memo_to_disk(data_dir: &Option<std::path::PathBuf>, memo: &harmony_memo::Memo) {
     if let Some(ref dir) = data_dir {
         let dir = dir.clone();
         let memo = memo.clone();

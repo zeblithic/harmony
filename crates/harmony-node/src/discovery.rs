@@ -637,7 +637,8 @@ mod tests {
             "non-pinned peer last_seen must be refreshed"
         );
         assert_eq!(
-            t.peers.get(&sa_pin).unwrap().last_seen, before_pin,
+            t.peers.get(&sa_pin).unwrap().last_seen,
+            before_pin,
             "pinned peer last_seen must not change"
         );
     }

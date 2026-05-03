@@ -120,12 +120,12 @@ mod tests {
     #[test]
     fn serialize_header_matches_frozen_golden() {
         let expected: [u8; 13] = [
-            0x48, 0x52, 0x4d, 0x52,   // "HRMR"
-            0x01,                       // format_version
-            0x01,                       // kdf_id (Argon2id)
-            0x00, 0x01, 0x00, 0x00,   // kdf_m_kib = 65536 (BE u32)
-            0x00, 0x03,                 // kdf_t = 3 (BE u16)
-            0x01,                       // kdf_p
+            0x48, 0x52, 0x4d, 0x52, // "HRMR"
+            0x01, // format_version
+            0x01, // kdf_id (Argon2id)
+            0x00, 0x01, 0x00, 0x00, // kdf_m_kib = 65536 (BE u32)
+            0x00, 0x03, // kdf_t = 3 (BE u16)
+            0x01, // kdf_p
         ];
         assert_eq!(serialize_header(), expected);
     }
@@ -170,7 +170,10 @@ mod tests {
         let mut h = serialize_header();
         h[6..10].copy_from_slice(&32768u32.to_be_bytes());
         let err = parse_header(&h).unwrap_err();
-        assert!(matches!(err, RecoveryError::UnsupportedKdfParams { id: 0x01 }));
+        assert!(matches!(
+            err,
+            RecoveryError::UnsupportedKdfParams { id: 0x01 }
+        ));
     }
 
     #[test]
@@ -178,7 +181,10 @@ mod tests {
         let mut h = serialize_header();
         h[10..12].copy_from_slice(&7u16.to_be_bytes());
         let err = parse_header(&h).unwrap_err();
-        assert!(matches!(err, RecoveryError::UnsupportedKdfParams { id: 0x01 }));
+        assert!(matches!(
+            err,
+            RecoveryError::UnsupportedKdfParams { id: 0x01 }
+        ));
     }
 
     #[test]
@@ -186,6 +192,9 @@ mod tests {
         let mut h = serialize_header();
         h[12] = 4;
         let err = parse_header(&h).unwrap_err();
-        assert!(matches!(err, RecoveryError::UnsupportedKdfParams { id: 0x01 }));
+        assert!(matches!(
+            err,
+            RecoveryError::UnsupportedKdfParams { id: 0x01 }
+        ));
     }
 }

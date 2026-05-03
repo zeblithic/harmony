@@ -39,7 +39,11 @@ pub enum RemoteDeliveryError {
 impl std::fmt::Display for RemoteDeliveryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidKeyLength { field, got, expected } => write!(
+            Self::InvalidKeyLength {
+                field,
+                got,
+                expected,
+            } => write!(
                 f,
                 "announce record field {field} has wrong length: got {got}, expected {expected}",
             ),
@@ -103,7 +107,9 @@ pub(crate) fn identity_from_announce_record(
     rec: &AnnounceRecord,
 ) -> Result<Identity, RemoteDeliveryError> {
     if rec.identity_ref.suite != CryptoSuite::Ed25519 {
-        return Err(RemoteDeliveryError::UnsupportedSuite(rec.identity_ref.suite));
+        return Err(RemoteDeliveryError::UnsupportedSuite(
+            rec.identity_ref.suite,
+        ));
     }
     let x25519_pub: &[u8; 32] = rec.encryption_key.as_slice().try_into().map_err(|_| {
         RemoteDeliveryError::InvalidKeyLength {
@@ -164,7 +170,10 @@ impl ZenohRecipientResolver {
         session: std::sync::Arc<zenoh::Session>,
         query_timeout: std::time::Duration,
     ) -> Self {
-        Self { session, query_timeout }
+        Self {
+            session,
+            query_timeout,
+        }
     }
 }
 
@@ -240,12 +249,9 @@ mod tests {
         )
         .expect("seal should succeed");
 
-        let opened = HarmonyEnvelope::open(
-            &recipient_priv,
-            gateway_priv.public_identity(),
-            &sealed,
-        )
-        .expect("open should succeed");
+        let opened =
+            HarmonyEnvelope::open(&recipient_priv, gateway_priv.public_identity(), &sealed)
+                .expect("open should succeed");
         assert_eq!(opened.plaintext, plaintext);
         assert_eq!(
             opened.sender_address,
@@ -263,8 +269,8 @@ mod tests {
         // encryption_key = X25519 (32B public).
         let pub_bytes = pub_id.to_public_bytes();
         let mut rec = make_rec(
-            pub_bytes[32..].to_vec(),    // Ed25519
-            pub_bytes[..32].to_vec(),    // X25519
+            pub_bytes[32..].to_vec(), // Ed25519
+            pub_bytes[..32].to_vec(), // X25519
             CryptoSuite::Ed25519,
         );
         rec.identity_ref = IdentityRef::new(pub_id.address_hash, CryptoSuite::Ed25519);
@@ -286,7 +292,11 @@ mod tests {
         assert!(
             matches!(
                 err,
-                RemoteDeliveryError::InvalidKeyLength { field: "public_key", got: 10, expected: 32 }
+                RemoteDeliveryError::InvalidKeyLength {
+                    field: "public_key",
+                    got: 10,
+                    expected: 32
+                }
             ),
             "unexpected error: {err:?}"
         );
@@ -297,7 +307,10 @@ mod tests {
         let rec = make_rec(vec![0u8; 32], vec![0u8; 32], CryptoSuite::MlDsa65);
         let err = identity_from_announce_record(&rec).expect_err("should reject PQ suite");
         assert!(
-            matches!(err, RemoteDeliveryError::UnsupportedSuite(CryptoSuite::MlDsa65)),
+            matches!(
+                err,
+                RemoteDeliveryError::UnsupportedSuite(CryptoSuite::MlDsa65)
+            ),
             "unexpected error: {err:?}",
         );
     }

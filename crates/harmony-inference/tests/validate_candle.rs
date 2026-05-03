@@ -67,10 +67,9 @@ fn candle_matches_pytorch_logits() {
 
     // Parse GGUF and load model
     let mut cursor = std::io::Cursor::new(&gguf_data);
-    let content =
-        gguf_file::Content::read(&mut cursor).expect("failed to parse GGUF");
-    let model = HarmonyModel::from_gguf(&content, &mut cursor, &Device::Cpu)
-        .expect("failed to load model");
+    let content = gguf_file::Content::read(&mut cursor).expect("failed to parse GGUF");
+    let model =
+        HarmonyModel::from_gguf(&content, &mut cursor, &Device::Cpu).expect("failed to load model");
 
     let config = model.config();
 
@@ -100,18 +99,13 @@ fn candle_matches_pytorch_logits() {
     );
 
     // Prepare input tensor: [1, seq_len] u32
-    let input =
-        Tensor::new(reference.input_tokens.as_slice(), &Device::Cpu)
-            .expect("failed to create input tensor")
-            .reshape((1, reference.input_tokens.len()))
-            .expect("failed to reshape input");
+    let input = Tensor::new(reference.input_tokens.as_slice(), &Device::Cpu)
+        .expect("failed to create input tensor")
+        .reshape((1, reference.input_tokens.len()))
+        .expect("failed to reshape input");
 
     // Forward pass with fresh cache, no engram
-    let mut cache = InferenceCache::new(
-        config.num_layers,
-        config.head_dim,
-        config.num_kv_heads,
-    );
+    let mut cache = InferenceCache::new(config.num_layers, config.head_dim, config.num_kv_heads);
     let output = model
         .forward(&input, &mut cache, None)
         .expect("forward pass failed");
@@ -123,8 +117,7 @@ fn candle_matches_pytorch_logits() {
         .expect("flatten failed")
         .to_vec1()
         .expect("to_vec1 failed");
-    let rust_logits: Vec<f64> =
-        rust_logits_f32.iter().map(|&v| v as f64).collect();
+    let rust_logits: Vec<f64> = rust_logits_f32.iter().map(|&v| v as f64).collect();
 
     assert_eq!(
         rust_logits.len(),
@@ -148,18 +141,14 @@ fn candle_matches_pytorch_logits() {
     }
 
     // Cosine similarity (diagnostic)
-    let cos_sim =
-        cosine_similarity(&rust_logits, &reference.last_logits);
+    let cos_sim = cosine_similarity(&rust_logits, &reference.last_logits);
     println!("Phase 0h validation results:");
-    println!(
-        "  max absolute diff: {max_diff:.2e} at index {max_diff_idx}"
-    );
+    println!("  max absolute diff: {max_diff:.2e} at index {max_diff_idx}");
     println!("  cosine similarity: {cos_sim:.10}");
     println!(
         "  rust logit[{max_diff_idx}]: {:.8}, \
          python logit[{max_diff_idx}]: {:.8}",
-        rust_logits[max_diff_idx],
-        reference.last_logits[max_diff_idx]
+        rust_logits[max_diff_idx], reference.last_logits[max_diff_idx]
     );
 
     assert!(

@@ -18,7 +18,9 @@ pub enum RevocationReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RevocationIssuer {
     SelfDevice,
-    Master { master_pubkey: PubKeyBundle },
+    Master {
+        master_pubkey: PubKeyBundle,
+    },
     Quorum {
         #[serde(with = "crate::cbor::arr16_vec")]
         signers: Vec<[u8; 16]>,
@@ -65,7 +67,13 @@ impl RevocationCert {
     ) -> Result<Self, OwnerError> {
         let issuer = RevocationIssuer::SelfDevice;
         let payload_bytes = cbor::to_canonical(&signing_payload(
-            REVOCATION_VERSION, owner_id, target, issued_at, &issuer, &reason)?)?;
+            REVOCATION_VERSION,
+            owner_id,
+            target,
+            issued_at,
+            &issuer,
+            &reason,
+        )?)?;
         let signature = sign_with_tag(device_sk, tags::REVOCATION, &payload_bytes);
         Ok(RevocationCert {
             version: REVOCATION_VERSION,
@@ -86,9 +94,17 @@ impl RevocationCert {
         reason: RevocationReason,
     ) -> Result<Self, OwnerError> {
         let owner_id = master_pubkey.identity_hash();
-        let issuer = RevocationIssuer::Master { master_pubkey: master_pubkey.clone() };
+        let issuer = RevocationIssuer::Master {
+            master_pubkey: master_pubkey.clone(),
+        };
         let payload_bytes = cbor::to_canonical(&signing_payload(
-            REVOCATION_VERSION, owner_id, target, issued_at, &issuer, &reason)?)?;
+            REVOCATION_VERSION,
+            owner_id,
+            target,
+            issued_at,
+            &issuer,
+            &reason,
+        )?)?;
         let signature = sign_with_tag(master_sk, tags::REVOCATION, &payload_bytes);
         Ok(RevocationCert {
             version: REVOCATION_VERSION,
@@ -111,25 +127,49 @@ impl RevocationCert {
         match (&self.issuer, issuer_pubkey) {
             (RevocationIssuer::SelfDevice, Some(vk)) => {
                 let payload_bytes = cbor::to_canonical(&signing_payload(
-                    self.version, self.owner_id, self.target, self.issued_at, &self.issuer, &self.reason)?)?;
-                verify_with_tag(vk, tags::REVOCATION, &payload_bytes, &self.signature, "Revocation")
+                    self.version,
+                    self.owner_id,
+                    self.target,
+                    self.issued_at,
+                    &self.issuer,
+                    &self.reason,
+                )?)?;
+                verify_with_tag(
+                    vk,
+                    tags::REVOCATION,
+                    &payload_bytes,
+                    &self.signature,
+                    "Revocation",
+                )
             }
             (RevocationIssuer::Master { master_pubkey }, _) => {
                 if master_pubkey.identity_hash() != self.owner_id {
                     return Err(OwnerError::IdentityHashMismatch);
                 }
                 let vk = VerifyingKey::from_bytes(&master_pubkey.classical.ed25519_verify)
-                    .map_err(|_| OwnerError::InvalidSignature { cert_type: "Revocation" })?;
+                    .map_err(|_| OwnerError::InvalidSignature {
+                        cert_type: "Revocation",
+                    })?;
                 let payload_bytes = cbor::to_canonical(&signing_payload(
-                    self.version, self.owner_id, self.target, self.issued_at, &self.issuer, &self.reason)?)?;
-                verify_with_tag(&vk, tags::REVOCATION, &payload_bytes, &self.signature, "Revocation")
+                    self.version,
+                    self.owner_id,
+                    self.target,
+                    self.issued_at,
+                    &self.issuer,
+                    &self.reason,
+                )?)?;
+                verify_with_tag(
+                    &vk,
+                    tags::REVOCATION,
+                    &payload_bytes,
+                    &self.signature,
+                    "Revocation",
+                )
             }
-            (RevocationIssuer::Quorum { .. }, _) => {
-                Err(OwnerError::QuorumRevocationNotImplemented)
-            }
-            (RevocationIssuer::SelfDevice, None) => {
-                Err(OwnerError::InvalidSignature { cert_type: "Revocation" })
-            }
+            (RevocationIssuer::Quorum { .. }, _) => Err(OwnerError::QuorumRevocationNotImplemented),
+            (RevocationIssuer::SelfDevice, None) => Err(OwnerError::InvalidSignature {
+                cert_type: "Revocation",
+            }),
         }
     }
 }
@@ -147,7 +187,15 @@ fn signing_payload<'a>(
         RevocationIssuer::Master { master_pubkey } => (1u8, cbor::to_canonical(master_pubkey)?),
         RevocationIssuer::Quorum { signers, .. } => (2u8, cbor::to_canonical(signers)?),
     };
-    Ok(RevocationSigningPayload { version, owner_id, target, issued_at, issuer_kind, issuer_data, reason })
+    Ok(RevocationSigningPayload {
+        version,
+        owner_id,
+        target,
+        issued_at,
+        issuer_kind,
+        issuer_data,
+        reason,
+    })
 }
 
 #[cfg(test)]
@@ -160,7 +208,9 @@ mod tests {
     fn self_revocation_verifies() {
         let sk = SigningKey::generate(&mut OsRng);
         let target = [9u8; 16];
-        let cert = RevocationCert::sign_self(&sk, [1u8; 16], target, 1, RevocationReason::Decommissioned).unwrap();
+        let cert =
+            RevocationCert::sign_self(&sk, [1u8; 16], target, 1, RevocationReason::Decommissioned)
+                .unwrap();
         cert.verify(Some(&sk.verifying_key())).unwrap();
     }
 
@@ -174,7 +224,14 @@ mod tests {
             },
             post_quantum: None,
         };
-        let cert = RevocationCert::sign_master(&sk, master_bundle, [9u8; 16], 1, RevocationReason::Compromised).unwrap();
+        let cert = RevocationCert::sign_master(
+            &sk,
+            master_bundle,
+            [9u8; 16],
+            1,
+            RevocationReason::Compromised,
+        )
+        .unwrap();
         cert.verify(None).unwrap();
     }
 }

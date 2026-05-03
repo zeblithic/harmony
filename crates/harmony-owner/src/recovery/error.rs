@@ -47,7 +47,10 @@ pub enum RecoveryError {
     PayloadDecodeFailed,
 
     #[error("recovery file payload has unexpected format string {found:?}; expected {expected:?}")]
-    UnexpectedPayloadFormat { found: String, expected: &'static str },
+    UnexpectedPayloadFormat {
+        found: String,
+        expected: &'static str,
+    },
 
     // ── Encrypted-file encode ──────────────────────────────────────
     #[error("comment is {actual} bytes; max allowed is {max}")]
@@ -65,7 +68,11 @@ mod tests {
             "expected 24 BIP39 words, got 13"
         );
         assert_eq!(
-            RecoveryError::UnknownWord { position: 7, word: "harmonny".into() }.to_string(),
+            RecoveryError::UnknownWord {
+                position: 7,
+                word: "harmonny".into()
+            }
+            .to_string(),
             r#"unknown word at position 7: "harmonny""#
         );
         assert_eq!(
@@ -108,7 +115,8 @@ mod tests {
             RecoveryError::UnexpectedPayloadFormat {
                 found: "harmony-foo-v9".into(),
                 expected: "harmony-owner-recovery-v1",
-            }.to_string(),
+            }
+            .to_string(),
             r#"recovery file payload has unexpected format string "harmony-foo-v9"; expected "harmony-owner-recovery-v1""#
         );
         // Pin the sanitized message: this variant is unit-only specifically
@@ -120,7 +128,11 @@ mod tests {
             "recovery file payload could not be decoded"
         );
         assert_eq!(
-            RecoveryError::CommentTooLong { actual: 300, max: 256 }.to_string(),
+            RecoveryError::CommentTooLong {
+                actual: 300,
+                max: 256
+            }
+            .to_string(),
             "comment is 300 bytes; max allowed is 256"
         );
     }

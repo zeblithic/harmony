@@ -58,18 +58,24 @@ pub fn enroll_via_master(
 
     // New device auto-vouches for every active sibling.
     let active = state.active_devices(now, active_window_secs);
-    let auto_vouch_certs: Vec<VouchingCert> = active.iter()
+    let auto_vouch_certs: Vec<VouchingCert> = active
+        .iter()
         .filter(|s| **s != device_id)
-        .map(|sibling_id| VouchingCert::sign(
-            new_device_sk,
-            state.owner_id,
-            *sibling_id,
-            Stance::Vouch,
-            now,
-        ))
+        .map(|sibling_id| {
+            VouchingCert::sign(
+                new_device_sk,
+                state.owner_id,
+                *sibling_id,
+                Stance::Vouch,
+                now,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(EnrollResult { enrollment_cert, auto_vouch_certs })
+    Ok(EnrollResult {
+        enrollment_cert,
+        auto_vouch_certs,
+    })
 }
 
 #[cfg(test)]
@@ -87,7 +93,11 @@ mod tests {
         // Device #1 is alive
         let device_a_id = *mint.state.enrollments.keys().next().unwrap();
         let mut state = mint.state;
-        state.add_liveness(LivenessCert::sign(&mint.device_signing_key, state.owner_id, 1_000_001).unwrap()).unwrap();
+        state
+            .add_liveness(
+                LivenessCert::sign(&mint.device_signing_key, state.owner_id, 1_000_001).unwrap(),
+            )
+            .unwrap();
 
         // Generate device #2
         let device_b_sk = SigningKey::generate(&mut OsRng);
@@ -106,10 +116,17 @@ mod tests {
             device_b_bundle,
             1_001_000,
             crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Apply to state
-        state.add_enrollment(result.enrollment_cert.clone(), 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
+        state
+            .add_enrollment(
+                result.enrollment_cert.clone(),
+                1_001_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
         for v in &result.auto_vouch_certs {
             state.add_vouching(v.clone()).unwrap();
         }
@@ -129,8 +146,8 @@ mod tests {
         let result = enroll_via_master(
             &mint.state,
             &mint.recovery_artifact,
-            &new_sk,                  // sk for one identity
-            mismatched_bundle,        // pubkey for a different identity
+            &new_sk,           // sk for one identity
+            mismatched_bundle, // pubkey for a different identity
             1_001_000,
             crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
         );

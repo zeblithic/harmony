@@ -22,7 +22,8 @@ use tokio::sync::{broadcast, OwnedSemaphorePermit, RwLock, Semaphore};
 /// Pending map uses std::sync::RwLock (not tokio) so it can be locked in
 /// Drop for panic-safe cleanup. Operations are fast (HashMap insert/remove)
 /// and never held across await points.
-type PendingMap = std::sync::RwLock<HashMap<String, broadcast::Sender<Option<ResolvedDidDocument>>>>;
+type PendingMap =
+    std::sync::RwLock<HashMap<String, broadcast::Sender<Option<ResolvedDidDocument>>>>;
 
 /// Cached DID Document with expiry.
 struct CacheEntry {

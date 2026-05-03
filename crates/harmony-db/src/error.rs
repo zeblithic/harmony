@@ -38,19 +38,25 @@ mod tests {
 
     #[test]
     fn commit_not_found_display() {
-        let err = DbError::CommitNotFound { cid: "abc123".into() };
+        let err = DbError::CommitNotFound {
+            cid: "abc123".into(),
+        };
         assert_eq!(err.to_string(), "commit not found: abc123");
     }
 
     #[test]
     fn table_not_found_display() {
-        let err = DbError::TableNotFound { name: "inbox".into() };
+        let err = DbError::TableNotFound {
+            name: "inbox".into(),
+        };
         assert_eq!(err.to_string(), "table not found: inbox");
     }
 
     #[test]
     fn entry_not_found_display() {
-        let err = DbError::EntryNotFound { table: "inbox".into() };
+        let err = DbError::EntryNotFound {
+            table: "inbox".into(),
+        };
         assert_eq!(err.to_string(), "entry not found: key in table inbox");
     }
 

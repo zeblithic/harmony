@@ -258,7 +258,10 @@ mod tests {
         let logits = vec![1.0_f32; 4];
         let features = extract_uq_features(&layer_norms, &logits, &config).unwrap();
         let f5 = features[4];
-        assert!(f5 > 0.0, "slope {f5} should be positive for norms [1,2,3,4]");
+        assert!(
+            f5 > 0.0,
+            "slope {f5} should be positive for norms [1,2,3,4]"
+        );
     }
 
     // 6. Decreasing norms → negative slope.
@@ -272,7 +275,10 @@ mod tests {
         let logits = vec![1.0_f32; 4];
         let features = extract_uq_features(&layer_norms, &logits, &config).unwrap();
         let f5 = features[4];
-        assert!(f5 < 0.0, "slope {f5} should be negative for norms [4,3,2,1]");
+        assert!(
+            f5 < 0.0,
+            "slope {f5} should be negative for norms [4,3,2,1]"
+        );
     }
 
     // 7. Constant norms → slope = 0.
@@ -286,10 +292,7 @@ mod tests {
         let logits = vec![1.0_f32; 4];
         let features = extract_uq_features(&layer_norms, &logits, &config).unwrap();
         let f5 = features[4];
-        assert!(
-            f5.abs() < 1e-6,
-            "slope {f5} should be 0 for constant norms"
-        );
+        assert!(f5.abs() < 1e-6, "slope {f5} should be 0 for constant norms");
     }
 
     // 8. f8 is always 0.

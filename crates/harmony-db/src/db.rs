@@ -133,12 +133,7 @@ impl HarmonyDb {
     }
 
     /// Update metadata for an entry.
-    pub fn update_meta(
-        &mut self,
-        table: &str,
-        key: &[u8],
-        meta: EntryMeta,
-    ) -> Result<(), DbError> {
+    pub fn update_meta(&mut self, table: &str, key: &[u8], meta: EntryMeta) -> Result<(), DbError> {
         let truncated_snippet = persist::truncate_snippet(&meta.snippet);
         let t = self
             .tables
@@ -156,10 +151,7 @@ impl HarmonyDb {
     }
 
     /// Atomic snapshot: serialize all table trees to CAS, produce root manifest.
-    pub fn commit(
-        &mut self,
-        mut store: Option<&mut dyn BookStore>,
-    ) -> Result<ContentId, DbError> {
+    pub fn commit(&mut self, mut store: Option<&mut dyn BookStore>) -> Result<ContentId, DbError> {
         let commits_dir = self.data_dir.join("commits");
         let mut table_cids: BTreeMap<String, String> = BTreeMap::new();
 
@@ -174,8 +166,8 @@ impl HarmonyDb {
             parent: self.head,
             tables: table_cids,
         };
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-            .map_err(|e| DbError::Serialize(e.to_string()))?;
+        let manifest_bytes =
+            serde_json::to_vec_pretty(&manifest).map_err(|e| DbError::Serialize(e.to_string()))?;
         let root_cid = ContentId::for_book(&manifest_bytes, ContentFlags::default())
             .map_err(|e| DbError::Serialize(format!("CID error: {e:?}")))?;
         let root_hex = hex::encode(root_cid.to_bytes());
@@ -273,11 +265,7 @@ impl HarmonyDb {
                 if let Some(s) = store {
                     prefetch_tree_nodes(&self.data_dir, new_root_cid, s)?;
                 }
-                let td = crate::prolly::diff::diff_trees(
-                    &self.data_dir,
-                    None,
-                    Some(new_root_cid),
-                )?;
+                let td = crate::prolly::diff::diff_trees(&self.data_dir, None, Some(new_root_cid))?;
                 tables.insert(name.clone(), td);
             }
         }
@@ -288,11 +276,7 @@ impl HarmonyDb {
                 if let Some(s) = store {
                     prefetch_tree_nodes(&self.data_dir, old_root_cid, s)?;
                 }
-                let td = crate::prolly::diff::diff_trees(
-                    &self.data_dir,
-                    Some(old_root_cid),
-                    None,
-                )?;
+                let td = crate::prolly::diff::diff_trees(&self.data_dir, Some(old_root_cid), None)?;
                 tables.insert(name.clone(), td);
             }
         }
@@ -395,12 +379,12 @@ fn load_manifest(
     let (bytes, from_store) = if local_path.exists() {
         (std::fs::read(&local_path)?, false)
     } else if let Some(s) = store {
-        let fetched = s
-            .get(&root_cid)
-            .map(|b| b.to_vec())
-            .ok_or_else(|| DbError::CommitNotFound {
-                cid: root_hex.clone(),
-            })?;
+        let fetched =
+            s.get(&root_cid)
+                .map(|b| b.to_vec())
+                .ok_or_else(|| DbError::CommitNotFound {
+                    cid: root_hex.clone(),
+                })?;
         (fetched, true)
     } else {
         return Err(DbError::CommitNotFound { cid: root_hex });
@@ -415,8 +399,8 @@ fn load_manifest(
         )));
     }
 
-    let manifest: CommitManifest = serde_json::from_slice(&bytes)
-        .map_err(|e| DbError::CorruptIndex(e.to_string()))?;
+    let manifest: CommitManifest =
+        serde_json::from_slice(&bytes).map_err(|e| DbError::CorruptIndex(e.to_string()))?;
     if manifest.version != COMMIT_VERSION {
         return Err(DbError::CorruptIndex(format!(
             "unsupported commit version: {} (expected {})",
@@ -494,11 +478,7 @@ fn prefetch_tree_nodes(
         let bytes = std::fs::read(&local_path)?;
         if let Ok(Node::Branch(children)) = postcard::from_bytes::<Node>(&bytes) {
             for child in children {
-                prefetch_tree_nodes(
-                    data_dir,
-                    ContentId::from_bytes(child.child_cid),
-                    store,
-                )?;
+                prefetch_tree_nodes(data_dir, ContentId::from_bytes(child.child_cid), store)?;
             }
         }
         return Ok(());
@@ -622,8 +602,7 @@ mod tests {
     fn multi_table() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = HarmonyDb::open(dir.path()).unwrap();
-        db.insert("inbox", b"k", b"inbox_val", meta(0, ""))
-            .unwrap();
+        db.insert("inbox", b"k", b"inbox_val", meta(0, "")).unwrap();
         db.insert("sent", b"k", b"sent_val", meta(0, "")).unwrap();
         assert_eq!(db.get("inbox", b"k").unwrap().unwrap(), b"inbox_val");
         assert_eq!(db.get("sent", b"k").unwrap().unwrap(), b"sent_val");
@@ -718,13 +697,7 @@ mod tests {
         let dir2 = tempfile::tempdir().unwrap();
         let db2 = HarmonyDb::open_from_cas(dir2.path(), root, &store).unwrap();
         assert_eq!(db2.table_len("inbox"), 2);
-        assert_eq!(
-            db2.get("inbox", b"m1").unwrap().unwrap(),
-            b"hello"
-        );
-        assert_eq!(
-            db2.get_entry("inbox", b"m2").unwrap().metadata.flags,
-            1
-        );
+        assert_eq!(db2.get("inbox", b"m1").unwrap().unwrap(), b"hello");
+        assert_eq!(db2.get_entry("inbox", b"m2").unwrap().metadata.flags, 1);
     }
 }

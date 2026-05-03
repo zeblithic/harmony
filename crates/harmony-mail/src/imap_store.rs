@@ -685,9 +685,8 @@ impl ImapStore {
     /// List all registered users.
     pub fn list_users(&self) -> Result<Vec<UserRow>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, username, harmony_address, created_at FROM users ORDER BY id",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT id, username, harmony_address, created_at FROM users ORDER BY id")?;
         let rows = stmt.query_map([], |row| {
             let harmony_blob: Vec<u8> = row.get(2)?;
             let mut harmony_address = [0u8; ADDRESS_HASH_LEN];
@@ -701,7 +700,8 @@ impl ImapStore {
                 created_at: row.get(3)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 }
 
@@ -1076,7 +1076,9 @@ mod tests {
         let user = store.get_user_by_address(&addr_b).unwrap().unwrap();
         assert_eq!(user.username, "bob");
 
-        let missing = store.get_user_by_address(&[0xCC; ADDRESS_HASH_LEN]).unwrap();
+        let missing = store
+            .get_user_by_address(&[0xCC; ADDRESS_HASH_LEN])
+            .unwrap();
         assert!(missing.is_none());
     }
 

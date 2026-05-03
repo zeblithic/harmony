@@ -112,8 +112,8 @@ pub fn persist_snapshot(
         version: SNAPSHOT_VERSION,
         head: hex::encode(manifest_cid.to_bytes()),
     };
-    let head_json = serde_json::to_vec(&head)
-        .map_err(|e| OluoPersistError::ManifestSerde(e.to_string()))?;
+    let head_json =
+        serde_json::to_vec(&head).map_err(|e| OluoPersistError::ManifestSerde(e.to_string()))?;
     atomic_write(&data_dir.join(HEAD_FILE), &head_json)?;
 
     Ok((base_path, generation))
@@ -212,14 +212,14 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), OluoPersistError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harmony_content::book::MemoryBookStore;
     use crate::engine::{OluoAction, OluoEngine, OluoEvent};
+    use crate::ingest::IngestDecision;
+    use crate::scope::SearchQuery;
     use crate::scope::SearchScope;
+    use harmony_content::book::MemoryBookStore;
     use harmony_semantic::metadata::SidecarMetadata;
     use harmony_semantic::sidecar::SidecarHeader;
     use harmony_semantic::tier::EmbeddingTier;
-    use crate::ingest::IngestDecision;
-    use crate::scope::SearchQuery;
 
     /// Helper: create a SidecarHeader with a specific tier3 embedding.
     fn test_header(tier3: [u8; 32], cid: [u8; 32]) -> SidecarHeader {
@@ -319,10 +319,7 @@ mod tests {
 
         // Search the restored engine and compare.
         let mut restored_engine = restored_engine;
-        let restored_actions = restored_engine.handle(OluoEvent::Search {
-            query_id: 2,
-            query,
-        });
+        let restored_actions = restored_engine.handle(OluoEvent::Search { query_id: 2, query });
         let restored_results = match &restored_actions[0] {
             OluoAction::SearchResults { results, .. } => results.clone(),
             _ => panic!("expected SearchResults"),
@@ -330,10 +327,8 @@ mod tests {
 
         // Same number of results, same CIDs (order may vary by distance).
         assert_eq!(original_results.len(), restored_results.len());
-        let mut orig_cids: Vec<[u8; 32]> =
-            original_results.iter().map(|r| r.target_cid).collect();
-        let mut rest_cids: Vec<[u8; 32]> =
-            restored_results.iter().map(|r| r.target_cid).collect();
+        let mut orig_cids: Vec<[u8; 32]> = original_results.iter().map(|r| r.target_cid).collect();
+        let mut rest_cids: Vec<[u8; 32]> = restored_results.iter().map(|r| r.target_cid).collect();
         orig_cids.sort();
         rest_cids.sort();
         assert_eq!(orig_cids, rest_cids);
@@ -343,10 +338,9 @@ mod tests {
         // Fake index bytes (just needs to be non-empty for DAG ingest)
         let index_bytes = vec![0xAA; 1024];
         // Fake metadata bytes (valid postcard for an empty BTreeMap)
-        let metadata_bytes = postcard::to_allocvec(
-            &std::collections::BTreeMap::<u64, EntryMetadata>::new(),
-        )
-        .unwrap();
+        let metadata_bytes =
+            postcard::to_allocvec(&std::collections::BTreeMap::<u64, EntryMetadata>::new())
+                .unwrap();
         let key_counter = 42;
         let generation = 3;
         (index_bytes, metadata_bytes, key_counter, generation)

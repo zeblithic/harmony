@@ -142,7 +142,11 @@ pub fn parse_iso8601(s: &str) -> Result<u64, ImportError> {
         4 | 6 | 9 | 11 => 30,
         2 => {
             let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-            if is_leap { 29 } else { 28 }
+            if is_leap {
+                29
+            } else {
+                28
+            }
         }
         _ => return Err(err()),
     };
@@ -716,9 +720,7 @@ pub fn import_jsonld_vc(
 
     // Reject unknown cryptosuites early (before key-type validation).
     let expected_suite = match env.cryptosuite.as_str() {
-        "harmony-eddsa-2022" | "eddsa-jcs-2022" => {
-            harmony_identity::CryptoSuite::Ed25519
-        }
+        "harmony-eddsa-2022" | "eddsa-jcs-2022" => harmony_identity::CryptoSuite::Ed25519,
         "harmony-mldsa65-2025" | "mldsa65-jcs-2024" | "di-mldsa-jcs-2025" => {
             // Accept both MlDsa65 and MlDsa65Rotatable for ML-DSA suites.
             // We check the actual resolved suite below.
@@ -743,7 +745,9 @@ pub fn import_jsonld_vc(
     if !suite_matches {
         return Err(ImportError::UnsupportedCryptosuite(alloc::format!(
             "cryptosuite '{}' requires {:?}, but key resolved as {:?}",
-            env.cryptosuite, expected_suite, issuer_resolved.suite
+            env.cryptosuite,
+            expected_suite,
+            issuer_resolved.suite
         )));
     }
 

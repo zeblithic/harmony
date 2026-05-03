@@ -27,14 +27,20 @@ mod tests {
     fn deterministic_same_inputs() {
         let addr = [0xAA; 16];
         let params = serde_json::json!({"prompt": "Hello"});
-        assert_eq!(generate_task_id(&addr, &params, 42), generate_task_id(&addr, &params, 42));
+        assert_eq!(
+            generate_task_id(&addr, &params, 42),
+            generate_task_id(&addr, &params, 42)
+        );
     }
 
     #[test]
     fn different_nonce_different_id() {
         let addr = [0xAA; 16];
         let params = serde_json::json!({"prompt": "Hello"});
-        assert_ne!(generate_task_id(&addr, &params, 1), generate_task_id(&addr, &params, 2));
+        assert_ne!(
+            generate_task_id(&addr, &params, 1),
+            generate_task_id(&addr, &params, 2)
+        );
     }
 
     #[test]
@@ -42,13 +48,19 @@ mod tests {
         let addr = [0xAA; 16];
         let p1 = serde_json::json!({"prompt": "Hello"});
         let p2 = serde_json::json!({"prompt": "World"});
-        assert_ne!(generate_task_id(&addr, &p1, 0), generate_task_id(&addr, &p2, 0));
+        assert_ne!(
+            generate_task_id(&addr, &p1, 0),
+            generate_task_id(&addr, &p2, 0)
+        );
     }
 
     #[test]
     fn different_submitter_different_id() {
         let params = serde_json::json!({"prompt": "Hello"});
-        assert_ne!(generate_task_id(&[0xAA; 16], &params, 0), generate_task_id(&[0xBB; 16], &params, 0));
+        assert_ne!(
+            generate_task_id(&[0xAA; 16], &params, 0),
+            generate_task_id(&[0xBB; 16], &params, 0)
+        );
     }
 
     #[test]

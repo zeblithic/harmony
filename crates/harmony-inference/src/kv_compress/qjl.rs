@@ -5,9 +5,9 @@
 //! decoded into a correction vector that reduces reconstruction error.
 //! The correction provides an unbiased inner product estimator.
 
+use super::packing::{pack_1bit, unpack_1bit};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use super::packing::{pack_1bit, unpack_1bit};
 
 /// Random ±1 (Rademacher) matrix for JL projection, stored as packed bits.
 ///

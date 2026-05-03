@@ -58,9 +58,9 @@ pub fn create_memo(
 
     // Sans-I/O signing: get payload, sign externally, finalize
     let payload = builder.signable_payload();
-    let signature = identity
-        .sign(&payload)
-        .map_err(|_| MemoError::Credential(harmony_credential::CredentialError::SignatureInvalid))?;
+    let signature = identity.sign(&payload).map_err(|_| {
+        MemoError::Credential(harmony_credential::CredentialError::SignatureInvalid)
+    })?;
 
     let (credential, _salted_claims) = builder.build(signature);
 

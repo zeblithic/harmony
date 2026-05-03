@@ -688,9 +688,10 @@ impl Node {
                     .filter(|(_, &ts)| ts == u64::MAX)
                     .filter(|((_, dh), _)| {
                         // Remove if no guaranteed entries remain for this dest
-                        !self.pending_echoes.iter().any(|((_, dh2), &ts2)| {
-                            dh2 == dh && ts2 != u64::MAX
-                        })
+                        !self
+                            .pending_echoes
+                            .iter()
+                            .any(|((_, dh2), &ts2)| dh2 == dh && ts2 != u64::MAX)
                     })
                     .map(|(key, _)| key.clone())
                     .collect();
@@ -774,7 +775,10 @@ impl Node {
             .into_iter()
             .filter(|(n, _)| n.as_ref() != exclude)
             .collect();
-        let max_w = filtered.iter().map(|(_, w)| *w).fold(f32::NEG_INFINITY, f32::max);
+        let max_w = filtered
+            .iter()
+            .map(|(_, w)| *w)
+            .fold(f32::NEG_INFINITY, f32::max);
         let weights: Vec<(Arc<str>, f32)> = filtered
             .into_iter()
             .map(|(n, w)| if w >= max_w { (n, 1.0) } else { (n, w) })
@@ -1743,7 +1747,8 @@ impl Node {
                     entry.proof_received = true;
                 }
                 if !already_received {
-                    self.cooperation.observe_proof_delivered(&outbound_iface, now);
+                    self.cooperation
+                        .observe_proof_delivered(&outbound_iface, now);
                 }
                 let mut actions = self.send_on_interface(&received_iface, &raw);
                 if !actions
@@ -5214,13 +5219,7 @@ mod tests {
 
         let identity = PrivateIdentity::generate(&mut OsRng);
         let name = DestinationName::from_name("testapp", &["svc"]).unwrap();
-        let dh = node.register_announcing_destination(
-            identity,
-            name,
-            vec![],
-            Some(300),
-            1000,
-        );
+        let dh = node.register_announcing_destination(identity, name, vec![], Some(300), 1000);
 
         // Emit announce — both interfaces get pending echo entries.
         let actions = node.announce(&dh, &mut OsRng, 1_700_000_000);
@@ -5289,13 +5288,7 @@ mod tests {
 
         let identity = PrivateIdentity::generate(&mut OsRng);
         let name = DestinationName::from_name("testapp", &["svc"]).unwrap();
-        let dh = node.register_announcing_destination(
-            identity,
-            name,
-            vec![],
-            Some(300),
-            1000,
-        );
+        let dh = node.register_announcing_destination(identity, name, vec![], Some(300), 1000);
 
         let now = 1_700_000_000_u64;
 

@@ -39,7 +39,9 @@ mod tests {
 
     #[test]
     fn error_display_includes_context() {
-        let e = OwnerError::InvalidSignature { cert_type: "Enrollment" };
+        let e = OwnerError::InvalidSignature {
+            cert_type: "Enrollment",
+        };
         assert!(format!("{e}").contains("Enrollment"));
 
         let e = OwnerError::InsufficientQuorum { min: 2, got: 1 };

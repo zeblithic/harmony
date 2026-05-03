@@ -52,7 +52,7 @@ impl LeafEntry {
             + 8  // timestamp
             + 8  // flags
             + self.snippet.len()
-            + 8  // length prefixes overhead estimate
+            + 8 // length prefixes overhead estimate
     }
 }
 
@@ -68,7 +68,7 @@ impl BranchEntry {
     pub fn approx_size(&self) -> usize {
         self.boundary_key.len()
             + 32 // child_cid
-            + 4  // length prefix overhead estimate
+            + 4 // length prefix overhead estimate
     }
 }
 
@@ -84,8 +84,7 @@ impl Node {
     /// Serialize this node with postcard, compute its ContentId, and write
     /// atomically to `commits/{hex}.bin`.
     pub fn write_to_cas(&self, data_dir: &Path) -> Result<ContentId, DbError> {
-        let bytes =
-            postcard::to_allocvec(self).map_err(|e| DbError::Serialize(e.to_string()))?;
+        let bytes = postcard::to_allocvec(self).map_err(|e| DbError::Serialize(e.to_string()))?;
         let cid = ContentId::for_book(&bytes, ContentFlags::default())
             .map_err(|e| DbError::Serialize(format!("CID error: {e:?}")))?;
         let hex = hex::encode(cid.to_bytes());

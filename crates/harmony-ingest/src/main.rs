@@ -115,9 +115,14 @@ async fn run_engram(
     // Set up S3 if configured.
     let s3 = if let Some(ref bucket_name) = bucket {
         Some(
-            harmony_s3::S3Library::new(bucket_name.clone(), prefix.clone(), region.clone(), endpoint.clone())
-                .await
-                .map_err(|e| format!("S3 init: {e}"))?,
+            harmony_s3::S3Library::new(
+                bucket_name.clone(),
+                prefix.clone(),
+                region.clone(),
+                endpoint.clone(),
+            )
+            .await
+            .map_err(|e| format!("S3 init: {e}"))?,
         )
     } else {
         None

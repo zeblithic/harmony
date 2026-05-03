@@ -42,12 +42,20 @@ pub(crate) fn mod_inverse(a: u16, m: u16) -> u16 {
 
 /// Simple trial-division primality test.
 fn is_prime(n: u16) -> bool {
-    if n < 2 { return false; }
-    if n < 4 { return true; }
-    if n % 2 == 0 || n % 3 == 0 { return false; }
+    if n < 2 {
+        return false;
+    }
+    if n < 4 {
+        return true;
+    }
+    if n % 2 == 0 || n % 3 == 0 {
+        return false;
+    }
     let mut i = 5u32;
     while i * i <= n as u32 {
-        if n as u32 % i == 0 || n as u32 % (i + 2) == 0 { return false; }
+        if n as u32 % i == 0 || n as u32 % (i + 2) == 0 {
+            return false;
+        }
         i += 6;
     }
     true
@@ -89,11 +97,7 @@ pub(crate) fn find_injective_modulus(indices: &[u16; TOP_K]) -> u16 {
 /// Two phases:
 /// 1. NDD: build divided difference table to get Newton basis coefficients
 /// 2. Convert Newton basis to monomial (power) basis via synthetic expansion
-pub(crate) fn ndd_interpolate(
-    xs: &[u16; TOP_K],
-    ys: &[u16; TOP_K],
-    m: u16,
-) -> [u16; TOP_K] {
+pub(crate) fn ndd_interpolate(xs: &[u16; TOP_K], ys: &[u16; TOP_K], m: u16) -> [u16; TOP_K] {
     let m32 = m as u32;
     let k = TOP_K;
 
@@ -165,7 +169,8 @@ pub(crate) fn f32_exponent(value: f32) -> u8 {
 pub(crate) fn extract_top_k(data: &[f32], k: usize) -> (Vec<u16>, Vec<u16>) {
     assert!(data.len() >= k, "data length {} < k {}", data.len(), k);
 
-    let mut indexed: Vec<(f32, usize)> = data.iter()
+    let mut indexed: Vec<(f32, usize)> = data
+        .iter()
         .enumerate()
         .map(|(i, &v)| (v.abs(), i))
         .collect();
@@ -174,14 +179,14 @@ pub(crate) fn extract_top_k(data: &[f32], k: usize) -> (Vec<u16>, Vec<u16>) {
     // for cross-platform reproducibility. Uses total_cmp for correct NaN
     // handling (NaN sorts after all finite values, so NaN elements end up
     // at the end of the descending sort and stay out of top-k).
-    indexed.sort_by(|a, b| {
-        b.0.total_cmp(&a.0)
-            .then_with(|| a.1.cmp(&b.1))
-    });
+    indexed.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
     let top_k = &indexed[..k];
     let indices: Vec<u16> = top_k.iter().map(|(_, i)| *i as u16).collect();
-    let mantissas: Vec<u16> = top_k.iter().map(|(_, i)| f32_mantissa_u16(data[*i])).collect();
+    let mantissas: Vec<u16> = top_k
+        .iter()
+        .map(|(_, i)| f32_mantissa_u16(data[*i]))
+        .collect();
 
     (indices, mantissas)
 }
@@ -203,7 +208,11 @@ mod tests {
         let m = 65521u16;
         for a in [1u16, 2, 127, 1000, 65520] {
             let inv = mod_inverse(a, m);
-            assert_eq!((a as u32 * inv as u32) % m as u32, 1, "inverse of {a} mod {m}");
+            assert_eq!(
+                (a as u32 * inv as u32) % m as u32,
+                1,
+                "inverse of {a} mod {m}"
+            );
         }
     }
 
@@ -217,7 +226,10 @@ mod tests {
         assert!(is_prime(m), "modulus {m} should be prime");
         let mut seen = std::collections::HashSet::new();
         for &idx in &indices {
-            assert!(seen.insert(idx as u32 % m as u32), "collision at {idx} mod {m}");
+            assert!(
+                seen.insert(idx as u32 % m as u32),
+                "collision at {idx} mod {m}"
+            );
         }
     }
 

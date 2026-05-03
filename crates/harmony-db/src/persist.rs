@@ -18,9 +18,7 @@ pub(crate) struct RootsFile {
     pub table_roots: BTreeMap<String, String>, // name → root CID hex
 }
 
-pub(crate) fn load_roots(
-    data_dir: &Path,
-) -> (Option<ContentId>, BTreeMap<String, ContentId>) {
+pub(crate) fn load_roots(data_dir: &Path) -> (Option<ContentId>, BTreeMap<String, ContentId>) {
     let path = data_dir.join("index.json");
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -57,8 +55,7 @@ pub(crate) fn save_roots(
         head,
         table_roots: filtered,
     };
-    let bytes =
-        serde_json::to_vec_pretty(&rf).map_err(|e| DbError::Serialize(e.to_string()))?;
+    let bytes = serde_json::to_vec_pretty(&rf).map_err(|e| DbError::Serialize(e.to_string()))?;
     atomic_write(&data_dir.join("index.json"), &bytes)
 }
 

@@ -27,11 +27,7 @@ fn alg_to_suite(alg: &str) -> Result<CryptoSuite, SdJwtError> {
 /// signing input. It does **not** validate time-based claims (`exp`, `nbf`,
 /// `iat`). Callers MUST separately check that the token is not expired and
 /// is past its not-before time before accepting the disclosed claims.
-pub fn verify(
-    sd_jwt: &SdJwt,
-    suite: CryptoSuite,
-    public_key: &[u8],
-) -> Result<(), SdJwtError> {
+pub fn verify(sd_jwt: &SdJwt, suite: CryptoSuite, public_key: &[u8]) -> Result<(), SdJwtError> {
     harmony_identity::verify_signature(
         suite,
         public_key,
@@ -59,15 +55,14 @@ pub fn verify(
 /// verify it. Callers MUST separately verify the KB-JWT to confirm
 /// holder binding (required by many EUDI issuance flows).
 /// See harmony-lth for KB-JWT verification.
-pub fn verify_from_header(
-    sd_jwt: &SdJwt,
-    public_key: &[u8],
-) -> Result<(), SdJwtError> {
+pub fn verify_from_header(sd_jwt: &SdJwt, public_key: &[u8]) -> Result<(), SdJwtError> {
     // RFC 9901 §3.3: typ MUST be "sd+jwt" for issuer-signed SD-JWTs.
     // RFC 7515 §4.1.9: typ comparisons SHOULD be case-insensitive.
     // Accept both short form ("sd+jwt") and full media type ("application/sd+jwt").
     match sd_jwt.header.typ.as_deref() {
-        Some(t) if t.eq_ignore_ascii_case("sd+jwt") || t.eq_ignore_ascii_case("application/sd+jwt") => {}
+        Some(t)
+            if t.eq_ignore_ascii_case("sd+jwt") || t.eq_ignore_ascii_case("application/sd+jwt") => {
+        }
         _ => return Err(SdJwtError::WrongTokenType),
     }
     let suite = alg_to_suite(&sd_jwt.header.alg)?;
@@ -80,8 +75,7 @@ mod tests {
     use base64::Engine;
     use rand::rngs::OsRng;
 
-    const B64: base64::engine::GeneralPurpose =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     fn b64(json: &str) -> alloc::string::String {
         B64.encode(json.as_bytes())
@@ -106,7 +100,12 @@ mod tests {
         let compact = make_signed_sdjwt(&private, r#"{"iss":"alice"}"#);
 
         let sd_jwt = crate::parse::parse(&compact).unwrap();
-        assert!(verify(&sd_jwt, CryptoSuite::Ed25519, &identity.verifying_key.to_bytes()).is_ok());
+        assert!(verify(
+            &sd_jwt,
+            CryptoSuite::Ed25519,
+            &identity.verifying_key.to_bytes()
+        )
+        .is_ok());
     }
 
     #[test]
@@ -116,7 +115,12 @@ mod tests {
         let compact = make_signed_sdjwt(&private, r#"{"iss":"alice"}"#);
 
         let sd_jwt = crate::parse::parse(&compact).unwrap();
-        assert!(verify(&sd_jwt, CryptoSuite::Ed25519, &other.public_identity().verifying_key.to_bytes()).is_err());
+        assert!(verify(
+            &sd_jwt,
+            CryptoSuite::Ed25519,
+            &other.public_identity().verifying_key.to_bytes()
+        )
+        .is_err());
     }
 
     #[test]
@@ -131,7 +135,10 @@ mod tests {
 
     #[test]
     fn unsupported_algorithm() {
-        assert!(matches!(alg_to_suite("RS256"), Err(SdJwtError::UnsupportedAlgorithm(_))));
+        assert!(matches!(
+            alg_to_suite("RS256"),
+            Err(SdJwtError::UnsupportedAlgorithm(_))
+        ));
     }
 
     #[test]

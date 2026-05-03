@@ -656,10 +656,9 @@ impl WorkflowEngine {
                                         IOResponse::ContentReady { data },
                                         self.budget,
                                     ),
-                                    None => self.runtime.resume_with_io(
-                                        IOResponse::ContentNotFound,
-                                        self.budget,
-                                    ),
+                                    None => self
+                                        .runtime
+                                        .resume_with_io(IOResponse::ContentNotFound, self.budget),
                                 };
                                 continue;
                             }

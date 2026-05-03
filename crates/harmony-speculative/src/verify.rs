@@ -20,11 +20,7 @@ pub fn softmax(logits: &[f32]) -> Vec<f32> {
 /// Check whether a draft token should be accepted (greedy criterion).
 ///
 /// Accept if P_target(token) >= P_draft(token), where P_draft = exp(draft_logprob).
-pub fn should_accept_draft(
-    target_logits: &[f32],
-    draft_token_id: u32,
-    draft_logprob: f32,
-) -> bool {
+pub fn should_accept_draft(target_logits: &[f32], draft_token_id: u32, draft_logprob: f32) -> bool {
     let probs = softmax(target_logits);
     let p_target = probs.get(draft_token_id as usize).copied().unwrap_or(0.0);
     let p_draft = draft_logprob.exp();
@@ -40,14 +36,21 @@ pub fn sample_greedy_with_logprob(logits: &[f32]) -> (u32, f32) {
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .expect("logits must not be empty");
-    (token_id as u32, if p > 0.0 { p.ln() } else { f32::NEG_INFINITY })
+    (
+        token_id as u32,
+        if p > 0.0 { p.ln() } else { f32::NEG_INFINITY },
+    )
 }
 
 /// Compute the log-probability of a specific token given logits.
 pub fn logprob_of(logits: &[f32], token_id: u32) -> f32 {
     let probs = softmax(logits);
     let p = probs.get(token_id as usize).copied().unwrap_or(0.0);
-    if p > 0.0 { p.ln() } else { f32::NEG_INFINITY }
+    if p > 0.0 {
+        p.ln()
+    } else {
+        f32::NEG_INFINITY
+    }
 }
 
 #[cfg(test)]
@@ -98,7 +101,7 @@ mod tests {
         // Draft token has high logprob but target gives it low probability
         let logits = vec![0.0; 10]; // uniform ≈ 0.1 each
         let draft_logprob = (0.9f32).ln(); // draft was very confident
-        // P_target(token 3) ≈ 0.1 < 0.9 → reject
+                                           // P_target(token 3) ≈ 0.1 < 0.9 → reject
         assert!(!should_accept_draft(&logits, 3, draft_logprob));
     }
 
@@ -155,23 +158,53 @@ mod tests {
         let draft_logprob = (0.5f32).ln(); // ≈ -0.693
 
         let _drafts = vec![
-            DraftEntry { token_id: 1, logprob: draft_logprob }, // p_target≈0.93 >= 0.5 → ACCEPT
-            DraftEntry { token_id: 2, logprob: draft_logprob }, // p_target≈0.93 >= 0.5 → ACCEPT
-            DraftEntry { token_id: 3, logprob: draft_logprob }, // p_target≈0.93 >= 0.5 → ACCEPT
-            DraftEntry { token_id: 4, logprob: draft_logprob }, // p_target≈0.01 < 0.5  → REJECT
+            DraftEntry {
+                token_id: 1,
+                logprob: draft_logprob,
+            }, // p_target≈0.93 >= 0.5 → ACCEPT
+            DraftEntry {
+                token_id: 2,
+                logprob: draft_logprob,
+            }, // p_target≈0.93 >= 0.5 → ACCEPT
+            DraftEntry {
+                token_id: 3,
+                logprob: draft_logprob,
+            }, // p_target≈0.93 >= 0.5 → ACCEPT
+            DraftEntry {
+                token_id: 4,
+                logprob: draft_logprob,
+            }, // p_target≈0.01 < 0.5  → REJECT
         ];
 
         // Step-by-step verification matches run_verification logic:
-        assert!(should_accept_draft(&logits_pos0, 1, draft_logprob), "pos0: token 1 should be accepted");
-        assert!(should_accept_draft(&logits_pos1, 2, draft_logprob), "pos1: token 2 should be accepted");
-        assert!(should_accept_draft(&logits_pos2, 3, draft_logprob), "pos2: token 3 should be accepted");
-        assert!(!should_accept_draft(&logits_pos3, 4, draft_logprob), "pos3: token 4 should be rejected");
+        assert!(
+            should_accept_draft(&logits_pos0, 1, draft_logprob),
+            "pos0: token 1 should be accepted"
+        );
+        assert!(
+            should_accept_draft(&logits_pos1, 2, draft_logprob),
+            "pos1: token 2 should be accepted"
+        );
+        assert!(
+            should_accept_draft(&logits_pos2, 3, draft_logprob),
+            "pos2: token 3 should be accepted"
+        );
+        assert!(
+            !should_accept_draft(&logits_pos3, 4, draft_logprob),
+            "pos3: token 4 should be rejected"
+        );
 
         // At rejection, bonus token is the argmax of logits_pos3
         let (bonus_token, bonus_logprob) = sample_greedy_with_logprob(&logits_pos3);
-        assert_eq!(bonus_token, 0, "bonus token should be argmax of logits_pos3");
+        assert_eq!(
+            bonus_token, 0,
+            "bonus token should be argmax of logits_pos3"
+        );
         assert!(bonus_logprob < 0.0, "bonus logprob should be negative");
-        assert!(bonus_logprob > f32::NEG_INFINITY, "bonus logprob should be finite");
+        assert!(
+            bonus_logprob > f32::NEG_INFINITY,
+            "bonus logprob should be finite"
+        );
 
         // Verify expected VerifyResponse fields
         let response = VerifyResponse {
@@ -191,8 +224,11 @@ mod tests {
 
         let logits = vec![0.0, 5.0, 0.0, 0.0]; // token 1 dominates (≈ 0.93)
 
-        let draft = DraftEntry { token_id: 1, logprob: (0.3f32).ln() }; // p_draft=0.3
-        // p_target ≈ 0.93 >= 0.3 → ACCEPT
+        let draft = DraftEntry {
+            token_id: 1,
+            logprob: (0.3f32).ln(),
+        }; // p_draft=0.3
+           // p_target ≈ 0.93 >= 0.3 → ACCEPT
         assert!(should_accept_draft(&logits, draft.token_id, draft.logprob));
 
         // When all drafts accepted, bonus comes from the next forward pass

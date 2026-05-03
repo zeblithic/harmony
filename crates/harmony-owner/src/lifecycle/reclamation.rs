@@ -28,7 +28,10 @@ pub fn mint_reclaimed(
         note,
     )?;
     drop(master_sk);
-    Ok(ReclamationMintResult { mint, reclamation_cert })
+    Ok(ReclamationMintResult {
+        mint,
+        reclamation_cert,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +61,8 @@ pub fn evaluate_reclamation(
     predecessor_liveness_certs: &[LivenessCert],
     now: u64,
 ) -> ReclamationStatus {
-    let refuted = predecessor_liveness_certs.iter()
+    let refuted = predecessor_liveness_certs
+        .iter()
         .any(|l| cert.is_refuted_by_timestamp(l.timestamp));
     if refuted {
         return ReclamationStatus::Refuted;
@@ -79,7 +83,13 @@ mod tests {
 
     #[test]
     fn pending_during_window() {
-        let result = mint_reclaimed([9u8; 16], DEFAULT_CHALLENGE_WINDOW_SECS, "lost".into(), 1_000_000).unwrap();
+        let result = mint_reclaimed(
+            [9u8; 16],
+            DEFAULT_CHALLENGE_WINDOW_SECS,
+            "lost".into(),
+            1_000_000,
+        )
+        .unwrap();
         let status = evaluate_reclamation(&result.reclamation_cert, &[], 1_000_500);
         assert_eq!(status, ReclamationStatus::Pending);
     }
@@ -93,7 +103,13 @@ mod tests {
 
     #[test]
     fn refuted_by_predecessor_liveness() {
-        let result = mint_reclaimed([9u8; 16], DEFAULT_CHALLENGE_WINDOW_SECS, "lost".into(), 1_000_000).unwrap();
+        let result = mint_reclaimed(
+            [9u8; 16],
+            DEFAULT_CHALLENGE_WINDOW_SECS,
+            "lost".into(),
+            1_000_000,
+        )
+        .unwrap();
         let predecessor_sk = SigningKey::generate(&mut OsRng);
         let liveness = LivenessCert::sign(&predecessor_sk, [9u8; 16], 1_000_500).unwrap();
         let status = evaluate_reclamation(&result.reclamation_cert, &[liveness], 1_000_500);
@@ -102,7 +118,13 @@ mod tests {
 
     #[test]
     fn liveness_before_reclamation_does_not_refute() {
-        let result = mint_reclaimed([9u8; 16], DEFAULT_CHALLENGE_WINDOW_SECS, "lost".into(), 1_000_000).unwrap();
+        let result = mint_reclaimed(
+            [9u8; 16],
+            DEFAULT_CHALLENGE_WINDOW_SECS,
+            "lost".into(),
+            1_000_000,
+        )
+        .unwrap();
         let predecessor_sk = SigningKey::generate(&mut OsRng);
         let liveness = LivenessCert::sign(&predecessor_sk, [9u8; 16], 999_999).unwrap();
         let status = evaluate_reclamation(&result.reclamation_cert, &[liveness], 1_000_500);

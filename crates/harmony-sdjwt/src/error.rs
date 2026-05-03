@@ -37,10 +37,7 @@ impl core::fmt::Display for SdJwtError {
             Self::MissingAlgorithm => write!(f, "JWS header missing 'alg' field"),
             Self::UnsupportedAlgorithm(alg) => write!(f, "unsupported JWS algorithm: {alg}"),
             Self::InvalidDisclosure => {
-                write!(
-                    f,
-                    "disclosure is not a valid [salt, name?, value] array"
-                )
+                write!(f, "disclosure is not a valid [salt, name?, value] array")
             }
             Self::WrongTokenType => write!(f, "typ header must be \"sd+jwt\" (RFC 9901 §3.3)"),
             #[cfg(feature = "credential")]

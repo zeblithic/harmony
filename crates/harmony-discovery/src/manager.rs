@@ -312,8 +312,14 @@ mod tests {
 
     fn build_invalid_record() -> AnnounceRecord {
         let identity_ref = IdentityRef::new([0xAA; 16], CryptoSuite::Ed25519);
-        let builder =
-            AnnounceBuilder::new(identity_ref, alloc::vec![0x01; 32], alloc::vec![], 1000, 2000, [0x01; 16]);
+        let builder = AnnounceBuilder::new(
+            identity_ref,
+            alloc::vec![0x01; 32],
+            alloc::vec![],
+            1000,
+            2000,
+            [0x01; 16],
+        );
         let _payload = builder.signable_payload();
         builder.build(alloc::vec![0xFF; 64])
     }
@@ -383,7 +389,8 @@ mod tests {
         let pk = identity.verifying_key.to_bytes().to_vec();
         let ek = identity.encryption_key.as_bytes().to_vec();
 
-        let builder1 = AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 1000, 3000, [0x01; 16]);
+        let builder1 =
+            AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 1000, 3000, [0x01; 16]);
         let payload1 = builder1.signable_payload();
         let record1 = builder1.build(private.sign(&payload1).to_vec());
         let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived {
@@ -391,7 +398,8 @@ mod tests {
             now: 1500,
         });
 
-        let builder2 = AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 2000, 4000, [0x02; 16]);
+        let builder2 =
+            AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 2000, 4000, [0x02; 16]);
         let payload2 = builder2.signable_payload();
         let record2 = builder2.build(private.sign(&payload2).to_vec());
         let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived {
@@ -412,7 +420,8 @@ mod tests {
         let pk = identity.verifying_key.to_bytes().to_vec();
         let ek = identity.encryption_key.as_bytes().to_vec();
 
-        let builder1 = AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 2000, 4000, [0x01; 16]);
+        let builder1 =
+            AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 2000, 4000, [0x01; 16]);
         let payload1 = builder1.signable_payload();
         let record1 = builder1.build(private.sign(&payload1).to_vec());
         let _ = mgr.on_event(DiscoveryEvent::AnnounceReceived {
@@ -420,7 +429,8 @@ mod tests {
             now: 2500,
         });
 
-        let builder2 = AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 1000, 3000, [0x02; 16]);
+        let builder2 =
+            AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 1000, 3000, [0x02; 16]);
         let payload2 = builder2.signable_payload();
         let record2 = builder2.build(private.sign(&payload2).to_vec());
         let actions = mgr.on_event(DiscoveryEvent::AnnounceReceived {
@@ -714,12 +724,14 @@ mod tests {
         let ek = identity.encryption_key.as_bytes().to_vec();
 
         // Cache an older record
-        let builder1 = AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 1000, 5000, [0x01; 16]);
+        let builder1 =
+            AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 1000, 5000, [0x01; 16]);
         let payload1 = builder1.signable_payload();
         let record1 = builder1.build(private.sign(&payload1).to_vec());
 
         // Set local_record with a fresher version
-        let mut builder2 = AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 2000, 6000, [0x02; 16]);
+        let mut builder2 =
+            AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 2000, 6000, [0x02; 16]);
         builder2.add_routing_hint(RoutingHint::Reticulum {
             destination_hash: [0xDD; 16],
         });

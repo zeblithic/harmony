@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
-use harmony_credential::{verify_credential, CredentialKeyResolver, StatusListResolver};
 use harmony_credential::claim::{Claim, SaltedClaim};
+use harmony_credential::{verify_credential, CredentialKeyResolver, StatusListResolver};
 use harmony_identity::IdentityRef;
 
 use crate::{Memo, MemoError, MEMO_CLAIM_TYPE};
@@ -226,7 +226,8 @@ mod tests {
 
         // Verify the deserialized memo
         let keys = SingleKeyResolver::from_identity(&identity);
-        verify_memo(&restored, 1500, &keys).expect("verify_memo should succeed on deserialized memo");
+        verify_memo(&restored, 1500, &keys)
+            .expect("verify_memo should succeed on deserialized memo");
 
         // Verify fields match
         assert_eq!(restored.input, memo.input);

@@ -74,8 +74,7 @@ impl TurboQuantState {
 
         // Precompute correction scale: sqrt(π/2) * sqrt(NMSE)
         let expected_relative_error = NMSE_3BIT_GAUSSIAN.sqrt();
-        let correction_scale =
-            core::f32::consts::FRAC_PI_2.sqrt() * expected_relative_error;
+        let correction_scale = core::f32::consts::FRAC_PI_2.sqrt() * expected_relative_error;
 
         Ok(Self {
             config: config.clone(),
@@ -307,14 +306,16 @@ mod tests {
         let data = vec![1.0f32; 80];
         let qv = state.compress_vec(&data);
         assert_eq!(qv.angles.len(), 30); // ceil(80 * 3 / 8)
-        assert_eq!(qv.signs.len(), 10);  // ceil(80 / 8)
+        assert_eq!(qv.signs.len(), 10); // ceil(80 / 8)
         assert!(qv.radius > 0.0);
     }
 
     #[test]
     fn compress_decompress_vec_bounded_error() {
         let state = test_state();
-        let data: Vec<f32> = (0..80).map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.6).collect();
+        let data: Vec<f32> = (0..80)
+            .map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.6)
+            .collect();
         let data_norm: f32 = data.iter().map(|x| x * x).sum::<f32>().sqrt();
 
         let qv = state.compress_vec(&data);

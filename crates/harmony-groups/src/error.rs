@@ -32,12 +32,15 @@ impl core::fmt::Display for ResolveError {
                 &parent[..4]
             ),
             Self::CycleDetected => write!(f, "cycle detected in DAG"),
-            Self::InvalidGenesis => write!(f, "genesis op is invalid (must be Create with no parents)"),
-            Self::InvalidOpId { op } => write!(f, "op {:02x?} has invalid content-addressed ID", &op[..4]),
+            Self::InvalidGenesis => {
+                write!(f, "genesis op is invalid (must be Create with no parents)")
+            }
+            Self::InvalidOpId { op } => {
+                write!(f, "op {:02x?} has invalid content-addressed ID", &op[..4])
+            }
         }
     }
 }
 
 #[cfg(feature = "std")]
 impl std::error::Error for ResolveError {}
-

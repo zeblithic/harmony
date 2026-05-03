@@ -40,9 +40,7 @@ impl Q8KvLayer {
         let (k_batch, num_kv_heads, seq_len, head_dim) = k.dims4()?;
         let (v_batch, v_heads, v_seq, v_dim) = v.dims4()?;
         if k_batch != 1 || v_batch != 1 {
-            candle_core::bail!(
-                "Q8KvLayer expects batch size 1, got k={k_batch}, v={v_batch}"
-            );
+            candle_core::bail!("Q8KvLayer expects batch size 1, got k={k_batch}, v={v_batch}");
         }
         if (num_kv_heads, seq_len, head_dim) != (v_heads, v_seq, v_dim) {
             candle_core::bail!(
@@ -53,14 +51,8 @@ impl Q8KvLayer {
         let dtype = k.dtype();
         let num_vecs = num_kv_heads * seq_len;
 
-        let k_f32 = k
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let v_f32 = v
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
+        let k_f32 = k.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let v_f32 = v.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
 
         let mut k_scales = Vec::with_capacity(num_vecs);
         let mut k_data = Vec::with_capacity(num_vecs * head_dim);
@@ -203,14 +195,8 @@ mod tests {
             .unwrap()
             .to_scalar()
             .unwrap();
-        assert!(
-            k_max < 0.02,
-            "key roundtrip max error too high: {k_max}"
-        );
-        assert!(
-            v_max < 0.02,
-            "value roundtrip max error too high: {v_max}"
-        );
+        assert!(k_max < 0.02, "key roundtrip max error too high: {k_max}");
+        assert!(v_max < 0.02, "value roundtrip max error too high: {v_max}");
     }
 
     #[test]
@@ -280,10 +266,7 @@ mod tests {
             "q8 ({q8_bytes}) should be less than f16 ({f16_bytes})"
         );
         let ratio = q8_bytes as f64 / f16_bytes as f64;
-        assert!(
-            ratio < 0.6,
-            "compression ratio {ratio:.2} should be < 0.6"
-        );
+        assert!(ratio < 0.6, "compression ratio {ratio:.2} should be < 0.6");
     }
 
     #[test]

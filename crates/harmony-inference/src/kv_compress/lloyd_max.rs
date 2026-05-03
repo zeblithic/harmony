@@ -18,9 +18,7 @@ pub struct LloydMaxCodebook {
 }
 
 /// Standard N(0,1) Lloyd-Max 8-level boundaries.
-const GAUSSIAN_BOUNDARIES: [f64; 7] = [
-    -1.7479, -1.0500, -0.5006, 0.0, 0.5006, 1.0500, 1.7479,
-];
+const GAUSSIAN_BOUNDARIES: [f64; 7] = [-1.7479, -1.0500, -0.5006, 0.0, 0.5006, 1.0500, 1.7479];
 
 /// Standard N(0,1) Lloyd-Max 8-level centroids (conditional means).
 const GAUSSIAN_CENTROIDS: [f64; 8] = [
@@ -82,7 +80,10 @@ mod tests {
             assert!(
                 cb.centroids[i] > cb.centroids[i - 1],
                 "centroids not ascending: [{}]={} >= [{}]={}",
-                i - 1, cb.centroids[i - 1], i, cb.centroids[i]
+                i - 1,
+                cb.centroids[i - 1],
+                i,
+                cb.centroids[i]
             );
         }
     }
@@ -94,7 +95,10 @@ mod tests {
             assert!(
                 cb.boundaries[i] > cb.boundaries[i - 1],
                 "boundaries not ascending: [{}]={} >= [{}]={}",
-                i - 1, cb.boundaries[i - 1], i, cb.boundaries[i]
+                i - 1,
+                cb.boundaries[i - 1],
+                i,
+                cb.boundaries[i]
             );
         }
     }
@@ -106,7 +110,10 @@ mod tests {
             assert!(
                 (cb.centroids[i] + cb.centroids[7 - i]).abs() < 1e-4,
                 "centroids not symmetric: [{}]={} + [{}]={}",
-                i, cb.centroids[i], 7 - i, cb.centroids[7 - i]
+                i,
+                cb.centroids[i],
+                7 - i,
+                cb.centroids[7 - i]
             );
         }
         for i in 0..3 {

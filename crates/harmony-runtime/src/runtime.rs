@@ -871,14 +871,17 @@ impl<B: BookStore> NodeRuntime<B> {
                     router.register_announcing_destination(
                         identity,
                         dest_name,
-                        Vec::new(),    // no app_data
-                        Some(30_000),  // 30-second announce interval (millis)
-                        0,             // now=0: first announce on next TimerTick
+                        Vec::new(),   // no app_data
+                        Some(30_000), // 30-second announce interval (millis)
+                        0,            // now=0: first announce on next TimerTick
                     );
                     tracing::info!("Reticulum announcing destination registered (30s interval)");
                 }
                 Err(e) => {
-                    tracing::warn!(?e, "failed to deserialize Reticulum identity — announces disabled");
+                    tracing::warn!(
+                        ?e,
+                        "failed to deserialize Reticulum identity — announces disabled"
+                    );
                 }
             }
         }
@@ -1428,7 +1431,7 @@ impl<B: BookStore> NodeRuntime<B> {
         // otherwise set_connecting() is a no-op and the dedup guard fails.
         match self.peer_manager.peer_status(&identity_hash) {
             Some(PeerStatus::Searching) => {} // proceed
-            _ => return, // Connecting, Connected, Disabled, or untracked
+            _ => return,                      // Connecting, Connected, Disabled, or untracked
         }
 
         // Find the first tunnel address on the contact.
@@ -1452,22 +1455,22 @@ impl<B: BookStore> NodeRuntime<B> {
         };
 
         // Look up PQ public keys from the discovery record.
-        let (peer_dsa_pubkey, peer_kem_pubkey) =
-            match self.discovery.get_record(&identity_hash, self.last_unix_now) {
-                Some(record)
-                    if !record.public_key.is_empty() && !record.encryption_key.is_empty() =>
-                {
-                    (record.public_key.clone(), record.encryption_key.clone())
-                }
-                _ => {
-                    tracing::info!(
-                        identity = %hex::encode(&identity_hash[..4]),
-                        "contact has tunnel address but PQ keys not in discovery cache — \
-                         tunnel dial deferred until announce arrives"
-                    );
-                    return;
-                }
-            };
+        let (peer_dsa_pubkey, peer_kem_pubkey) = match self
+            .discovery
+            .get_record(&identity_hash, self.last_unix_now)
+        {
+            Some(record) if !record.public_key.is_empty() && !record.encryption_key.is_empty() => {
+                (record.public_key.clone(), record.encryption_key.clone())
+            }
+            _ => {
+                tracing::info!(
+                    identity = %hex::encode(&identity_hash[..4]),
+                    "contact has tunnel address but PQ keys not in discovery cache — \
+                     tunnel dial deferred until announce arrives"
+                );
+                return;
+            }
+        };
 
         tracing::info!(
             identity = %hex::encode(&identity_hash[..4]),
@@ -1950,9 +1953,11 @@ impl<B: BookStore> NodeRuntime<B> {
                 query_id,
                 data,
             } => {
-                let storage_actions =
-                    self.storage
-                        .handle(StorageTierEvent::ArchiveReadComplete { cid, query_id, data });
+                let storage_actions = self.storage.handle(StorageTierEvent::ArchiveReadComplete {
+                    cid,
+                    query_id,
+                    data,
+                });
                 self.dispatch_storage_actions_inline(storage_actions);
             }
             RuntimeEvent::ArchiveReadFailed { cid, query_id } => {
@@ -2322,11 +2327,9 @@ impl<B: BookStore> NodeRuntime<B> {
                     self.translate_peer_actions_out(peer_actions, out);
                 }
                 NodeAction::AnnounceNeeded { dest_hash } => {
-                    let announce_actions = self.router.announce(
-                        &dest_hash,
-                        &mut rand_core::OsRng,
-                        self.last_now,
-                    );
+                    let announce_actions =
+                        self.router
+                            .announce(&dest_hash, &mut rand_core::OsRng, self.last_now);
                     for aa in announce_actions {
                         match aa {
                             NodeAction::SendOnInterface {
@@ -2525,20 +2528,20 @@ impl<B: BookStore> NodeRuntime<B> {
         use harmony_discovery::DiscoveryAction;
         for action in actions {
             match action {
-                DiscoveryAction::PublishAnnounce { record } => {
-                    match record.serialize() {
-                        Ok(bytes) => {
-                            let identity_hex = hex::encode(self.local_pq_identity_hash);
-                            let key_expr =
-                                harmony_zenoh::namespace::identity::announce_key(&identity_hex);
-                            self.pending_direct_actions
-                                .push(RuntimeAction::Publish { key_expr, payload: bytes });
-                        }
-                        Err(e) => {
-                            tracing::warn!(?e, "failed to serialize local announce record");
-                        }
+                DiscoveryAction::PublishAnnounce { record } => match record.serialize() {
+                    Ok(bytes) => {
+                        let identity_hex = hex::encode(self.local_pq_identity_hash);
+                        let key_expr =
+                            harmony_zenoh::namespace::identity::announce_key(&identity_hex);
+                        self.pending_direct_actions.push(RuntimeAction::Publish {
+                            key_expr,
+                            payload: bytes,
+                        });
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!(?e, "failed to serialize local announce record");
+                    }
+                },
                 // SetLiveliness requires Zenoh liveliness token wiring (future work).
                 // Tunnel hint processing is done at the call site (after staleness
                 // check) rather than here via IdentityDiscovered, because
@@ -3126,7 +3129,10 @@ impl<B: BookStore> NodeRuntime<B> {
                     self.inference_tokenizer_data.as_ref(),
                 ) {
                     use harmony_inference::InferenceEngine;
-                    let mut engine = harmony_inference::HarmonyEngine::new(harmony_inference::HarmonyModelConfig::tiny(), candle_core::Device::Cpu);
+                    let mut engine = harmony_inference::HarmonyEngine::new(
+                        harmony_inference::HarmonyModelConfig::tiny(),
+                        candle_core::Device::Cpu,
+                    );
                     match engine.load_gguf(gguf_data) {
                         Ok(()) => match engine.load_tokenizer(tok_data) {
                             Ok(()) => {

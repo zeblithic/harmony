@@ -69,10 +69,7 @@ impl Dag {
         for op in op_map.values() {
             for &parent in &op.parents {
                 if !op_map.contains_key(&parent) {
-                    return Err(ResolveError::MissingParent {
-                        op: op.id,
-                        parent,
-                    });
+                    return Err(ResolveError::MissingParent { op: op.id, parent });
                 }
             }
         }
@@ -119,7 +116,11 @@ impl Dag {
             return Err(ResolveError::CycleDetected);
         }
 
-        Ok(Dag { ops: op_map, children, genesis })
+        Ok(Dag {
+            ops: op_map,
+            children,
+            genesis,
+        })
     }
 
     /// Returns the set of all transitive ancestors of `op_id` (not including
@@ -155,7 +156,10 @@ impl Dag {
 
     /// Returns the in-degree (number of parents) of each op.
     pub fn in_degrees(&self) -> HashMap<OpId, usize> {
-        self.ops.iter().map(|(&id, op)| (id, op.parents.len())).collect()
+        self.ops
+            .iter()
+            .map(|(&id, op)| (id, op.parents.len()))
+            .collect()
     }
 }
 

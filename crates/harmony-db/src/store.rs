@@ -18,7 +18,6 @@ use harmony_content::book::BookStore;
 use harmony_content::cid::{ContentFlags, ContentId};
 use harmony_content::error::ContentError;
 
-
 /// A [`BookStore`] backed by the harmony-db CAS filesystem.
 ///
 /// Reads from both `commits/` (tree nodes, manifests) and `blobs/`
@@ -70,8 +69,15 @@ impl DiskBookStore {
     /// Check if a CID exists on local disk (commits/ or blobs/) without reading contents.
     fn exists_local(&self, cid: &ContentId) -> bool {
         let hex = hex::encode(cid.to_bytes());
-        self.data_dir.join("commits").join(format!("{hex}.bin")).exists()
-            || self.data_dir.join("blobs").join(format!("{hex}.bin")).exists()
+        self.data_dir
+            .join("commits")
+            .join(format!("{hex}.bin"))
+            .exists()
+            || self
+                .data_dir
+                .join("blobs")
+                .join(format!("{hex}.bin"))
+                .exists()
     }
 
     /// Try to read a CID from local CAS (commits/ then blobs/).
@@ -200,7 +206,10 @@ impl BookStore for DiskBookStore {
     }
 
     fn remove(&mut self, cid: &ContentId) -> Option<Vec<u8>> {
-        let data = self.cache.borrow_mut().remove(cid)
+        let data = self
+            .cache
+            .borrow_mut()
+            .remove(cid)
             .or_else(|| self.read_local(cid).unwrap_or(None));
 
         // Remove from disk (both possible locations).
@@ -227,11 +236,7 @@ mod tests {
         let data = b"test node data";
         let cid = ContentId::for_book(data, ContentFlags::default()).unwrap();
         let hex = hex::encode(cid.to_bytes());
-        std::fs::write(
-            data_dir.join("commits").join(format!("{hex}.bin")),
-            data,
-        )
-        .unwrap();
+        std::fs::write(data_dir.join("commits").join(format!("{hex}.bin")), data).unwrap();
 
         let store = DiskBookStore::new(data_dir);
         assert_eq!(store.get(&cid).unwrap(), data);
@@ -246,11 +251,7 @@ mod tests {
         let data = b"test blob data";
         let cid = ContentId::for_book(data, ContentFlags::default()).unwrap();
         let hex = hex::encode(cid.to_bytes());
-        std::fs::write(
-            data_dir.join("blobs").join(format!("{hex}.bin")),
-            data,
-        )
-        .unwrap();
+        std::fs::write(data_dir.join("blobs").join(format!("{hex}.bin")), data).unwrap();
 
         let store = DiskBookStore::new(data_dir);
         assert_eq!(store.get(&cid).unwrap(), data);
@@ -276,11 +277,7 @@ mod tests {
         let data = b"exists";
         let cid = ContentId::for_book(data, ContentFlags::default()).unwrap();
         let hex = hex::encode(cid.to_bytes());
-        std::fs::write(
-            data_dir.join("commits").join(format!("{hex}.bin")),
-            data,
-        )
-        .unwrap();
+        std::fs::write(data_dir.join("commits").join(format!("{hex}.bin")), data).unwrap();
 
         let store = DiskBookStore::new(data_dir);
         assert!(store.contains(&cid));
@@ -312,7 +309,9 @@ mod tests {
 
         let data = b"inserted data";
         let mut store = DiskBookStore::new(data_dir);
-        let cid = store.insert_with_flags(data, ContentFlags::default()).unwrap();
+        let cid = store
+            .insert_with_flags(data, ContentFlags::default())
+            .unwrap();
 
         assert!(store.contains(&cid));
         assert_eq!(store.get(&cid).unwrap(), data);
@@ -351,9 +350,8 @@ mod tests {
         let real_data = b"real data";
         let cid = ContentId::for_book(real_data, ContentFlags::default()).unwrap();
 
-        let store = DiskBookStore::with_fetcher(data_dir, move |_| {
-            Some(b"corrupted data".to_vec())
-        });
+        let store =
+            DiskBookStore::with_fetcher(data_dir, move |_| Some(b"corrupted data".to_vec()));
 
         assert!(store.get(&cid).is_none());
     }
@@ -370,11 +368,7 @@ mod tests {
         let data = b"local data";
         let cid = ContentId::for_book(data, ContentFlags::default()).unwrap();
         let hex = hex::encode(cid.to_bytes());
-        std::fs::write(
-            data_dir.join("commits").join(format!("{hex}.bin")),
-            data,
-        )
-        .unwrap();
+        std::fs::write(data_dir.join("commits").join(format!("{hex}.bin")), data).unwrap();
 
         let fetcher_called = Arc::new(AtomicBool::new(false));
         let fetcher_called_clone = fetcher_called.clone();
@@ -385,7 +379,10 @@ mod tests {
         });
 
         assert_eq!(store.get(&cid).unwrap(), data);
-        assert!(!fetcher_called.load(Ordering::SeqCst), "fetcher should not be called for local hit");
+        assert!(
+            !fetcher_called.load(Ordering::SeqCst),
+            "fetcher should not be called for local hit"
+        );
     }
 
     #[test]
@@ -452,7 +449,9 @@ mod tests {
                 .ok()
         });
 
-        reader_db.rebuild_from(root_cid, Some(&fetcher_store)).unwrap();
+        reader_db
+            .rebuild_from(root_cid, Some(&fetcher_store))
+            .unwrap();
 
         // Verify reader has same state
         assert_eq!(reader_db.head(), Some(root_cid));

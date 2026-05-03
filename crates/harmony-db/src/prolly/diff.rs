@@ -4,10 +4,10 @@
 // the child CID matches. Only the "spine" of changed nodes is traversed,
 // giving O(d) I/O where d is the number of differing leaves.
 
+use super::node::{BranchEntry, LeafEntry, Node};
 use crate::error::DbError;
 use crate::types::{Entry, TableDiff};
 use harmony_content::ContentId;
-use super::node::{Node, LeafEntry, BranchEntry};
 use std::cmp::Ordering;
 use std::path::Path;
 
@@ -33,12 +33,23 @@ pub(crate) fn diff_trees(
             if cid_a == cid_b {
                 // Identical roots — O(1) skip.
             } else {
-                diff_nodes(data_dir, cid_a, cid_b, &mut added, &mut removed, &mut changed)?;
+                diff_nodes(
+                    data_dir,
+                    cid_a,
+                    cid_b,
+                    &mut added,
+                    &mut removed,
+                    &mut changed,
+                )?;
             }
         }
     }
 
-    Ok(TableDiff { added, removed, changed })
+    Ok(TableDiff {
+        added,
+        removed,
+        changed,
+    })
 }
 
 /// Recursive dispatch: load both nodes and diff based on their types.
@@ -96,7 +107,9 @@ fn diff_branches(
                         data_dir,
                         ContentId::from_bytes(a.child_cid),
                         ContentId::from_bytes(b.child_cid),
-                        added, removed, changed,
+                        added,
+                        removed,
+                        changed,
                     )?;
                 }
                 i += 1;
@@ -119,23 +132,39 @@ fn diff_branches(
 
                 while i < children_a.len() {
                     if let Some(ref sk) = sync_key {
-                        if children_a[i].boundary_key > *sk { break; }
+                        if children_a[i].boundary_key > *sk {
+                            break;
+                        }
                     }
-                    collect_raw_leaves_by_cid(data_dir, ContentId::from_bytes(children_a[i].child_cid), &mut entries_a)?;
+                    collect_raw_leaves_by_cid(
+                        data_dir,
+                        ContentId::from_bytes(children_a[i].child_cid),
+                        &mut entries_a,
+                    )?;
                     i += 1;
                     if let Some(ref sk) = sync_key {
-                        if i < children_a.len() && children_a[i - 1].boundary_key == *sk { break; }
+                        if i < children_a.len() && children_a[i - 1].boundary_key == *sk {
+                            break;
+                        }
                     }
                 }
 
                 while j < children_b.len() {
                     if let Some(ref sk) = sync_key {
-                        if children_b[j].boundary_key > *sk { break; }
+                        if children_b[j].boundary_key > *sk {
+                            break;
+                        }
                     }
-                    collect_raw_leaves_by_cid(data_dir, ContentId::from_bytes(children_b[j].child_cid), &mut entries_b)?;
+                    collect_raw_leaves_by_cid(
+                        data_dir,
+                        ContentId::from_bytes(children_b[j].child_cid),
+                        &mut entries_b,
+                    )?;
                     j += 1;
                     if let Some(ref sk) = sync_key {
-                        if j < children_b.len() && children_b[j - 1].boundary_key == *sk { break; }
+                        if j < children_b.len() && children_b[j - 1].boundary_key == *sk {
+                            break;
+                        }
                     }
                 }
 
@@ -146,12 +175,20 @@ fn diff_branches(
 
     // Remaining in A are all removed.
     while i < children_a.len() {
-        collect_all(data_dir, ContentId::from_bytes(children_a[i].child_cid), removed)?;
+        collect_all(
+            data_dir,
+            ContentId::from_bytes(children_a[i].child_cid),
+            removed,
+        )?;
         i += 1;
     }
     // Remaining in B are all added.
     while j < children_b.len() {
-        collect_all(data_dir, ContentId::from_bytes(children_b[j].child_cid), added)?;
+        collect_all(
+            data_dir,
+            ContentId::from_bytes(children_b[j].child_cid),
+            added,
+        )?;
         j += 1;
     }
 
@@ -243,11 +280,7 @@ fn diff_leaf_entries(
 
 /// Traverse an entire subtree rooted at `cid`, collecting all leaf entries
 /// as public `Entry` values.
-fn collect_all(
-    data_dir: &Path,
-    cid: ContentId,
-    out: &mut Vec<Entry>,
-) -> Result<(), DbError> {
+fn collect_all(data_dir: &Path, cid: ContentId, out: &mut Vec<Entry>) -> Result<(), DbError> {
     let node = Node::read_from_cas(data_dir, cid)?;
     collect_leaf_entries(data_dir, &node, out)
 }
@@ -284,7 +317,8 @@ fn collect_raw_leaves(
         }
         Node::Branch(children) => {
             for child in children {
-                let child_node = Node::read_from_cas(data_dir, ContentId::from_bytes(child.child_cid))?;
+                let child_node =
+                    Node::read_from_cas(data_dir, ContentId::from_bytes(child.child_cid))?;
                 collect_raw_leaves(data_dir, &child_node, out)?;
             }
         }
@@ -293,11 +327,7 @@ fn collect_raw_leaves(
 }
 
 /// Helper: recursively collect all leaf entries from a node.
-fn collect_leaf_entries(
-    data_dir: &Path,
-    node: &Node,
-    out: &mut Vec<Entry>,
-) -> Result<(), DbError> {
+fn collect_leaf_entries(data_dir: &Path, node: &Node, out: &mut Vec<Entry>) -> Result<(), DbError> {
     match node {
         Node::Leaf(entries) => {
             for e in entries {
@@ -449,7 +479,13 @@ mod tests {
         let config = ChunkerConfig::default_4k();
 
         let entries_a: Vec<Entry> = (0..200u32)
-            .map(|i| make_entry(format!("k-{i:06}").as_bytes(), format!("v-{i}").as_bytes(), dir.path()))
+            .map(|i| {
+                make_entry(
+                    format!("k-{i:06}").as_bytes(),
+                    format!("v-{i}").as_bytes(),
+                    dir.path(),
+                )
+            })
             .collect();
         let root_a = build_tree(&entries_a, &config, dir.path()).unwrap();
 
@@ -460,7 +496,11 @@ mod tests {
         let root_b = build_tree(&entries_b, &config, dir.path()).unwrap();
 
         let td = diff_trees(dir.path(), root_a, root_b).unwrap();
-        assert_eq!(td.added.len(), 1, "should detect exactly 1 addition, not spurious changes from boundary shifts");
+        assert_eq!(
+            td.added.len(),
+            1,
+            "should detect exactly 1 addition, not spurious changes from boundary shifts"
+        );
         assert_eq!(td.added[0].key, b"k-000100-new");
         assert!(td.removed.is_empty(), "no entries were removed");
         assert!(td.changed.is_empty(), "no entries were changed");

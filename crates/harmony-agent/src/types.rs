@@ -221,10 +221,22 @@ mod tests {
         };
         let json = serde_json::to_string(&task).unwrap();
         // Must use snake_case keys, not camelCase
-        assert!(json.contains("\"task_id\""), "expected snake_case key task_id, got: {json}");
-        assert!(json.contains("\"task_type\""), "expected snake_case key task_type, got: {json}");
-        assert!(!json.contains("\"taskId\""), "unexpected camelCase key taskId in: {json}");
-        assert!(!json.contains("\"taskType\""), "unexpected camelCase key taskType in: {json}");
+        assert!(
+            json.contains("\"task_id\""),
+            "expected snake_case key task_id, got: {json}"
+        );
+        assert!(
+            json.contains("\"task_type\""),
+            "expected snake_case key task_type, got: {json}"
+        );
+        assert!(
+            !json.contains("\"taskId\""),
+            "unexpected camelCase key taskId in: {json}"
+        );
+        assert!(
+            !json.contains("\"taskType\""),
+            "unexpected camelCase key taskType in: {json}"
+        );
     }
 
     #[test]
@@ -268,9 +280,21 @@ mod tests {
             final_chunk: true,
         };
         let json = serde_json::to_string(&chunk).unwrap();
-        assert!(json.contains("\"task_id\""), "expected snake_case key task_id, got: {json}");
-        assert!(json.contains("\"final_chunk\""), "expected snake_case key final_chunk, got: {json}");
-        assert!(!json.contains("\"taskId\""), "unexpected camelCase in: {json}");
-        assert!(!json.contains("\"finalChunk\""), "unexpected camelCase in: {json}");
+        assert!(
+            json.contains("\"task_id\""),
+            "expected snake_case key task_id, got: {json}"
+        );
+        assert!(
+            json.contains("\"final_chunk\""),
+            "expected snake_case key final_chunk, got: {json}"
+        );
+        assert!(
+            !json.contains("\"taskId\""),
+            "unexpected camelCase in: {json}"
+        );
+        assert!(
+            !json.contains("\"finalChunk\""),
+            "unexpected camelCase in: {json}"
+        );
     }
 }

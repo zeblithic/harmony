@@ -69,7 +69,10 @@ impl PagedKvConfig {
     pub fn new(page_size: usize, max_pages: usize) -> Self {
         assert!(page_size >= 1, "page_size must be >= 1");
         assert!(max_pages >= 1, "max_pages must be >= 1");
-        Self { page_size, max_pages }
+        Self {
+            page_size,
+            max_pages,
+        }
     }
 }
 
@@ -125,7 +128,11 @@ impl BlockAllocator {
     /// Panics if `id >= total` or the block is not currently allocated
     /// (double-free).
     pub(crate) fn free(&mut self, id: usize) {
-        assert!(id < self.total, "block id {id} out of range [0, {})", self.total);
+        assert!(
+            id < self.total,
+            "block id {id} out of range [0, {})",
+            self.total
+        );
         assert!(self.in_use[id], "double free of block id {id}");
         self.in_use[id] = false;
         self.free_list.push(id);
@@ -319,10 +326,13 @@ impl PagedKvCache {
         }
 
         let block_id = *table.last().unwrap();
-        self.pool[block_id]
-            .as_mut()
-            .unwrap()
-            .append_token(k_data, v_data, self.num_kv_heads, page_size, self.head_dim);
+        self.pool[block_id].as_mut().unwrap().append_token(
+            k_data,
+            v_data,
+            self.num_kv_heads,
+            page_size,
+            self.head_dim,
+        );
 
         self.per_layer_tokens[layer] += 1;
 
@@ -452,7 +462,11 @@ impl PagedKvCache {
             0
         } else {
             let rem = new_position % page_size;
-            if rem == 0 { page_size } else { rem }
+            if rem == 0 {
+                page_size
+            } else {
+                rem
+            }
         };
 
         for table in &mut self.layer_tables {

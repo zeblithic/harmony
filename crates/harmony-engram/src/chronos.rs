@@ -259,7 +259,7 @@ mod tests {
     fn at_two_times_ttl_decay_approx_0_61() {
         let meta = EngramMetadata::new(0, ChronosTier::Regular);
         let ttl = 2_592_000_u32; // 30 days
-        let now = 2 * ttl;      // staleness = 1.0
+        let now = 2 * ttl; // staleness = 1.0
         let decay = compute_decay(&meta, now);
         // exp(-0.5) ≈ 0.6065
         assert!((decay - 0.6065).abs() < 0.001, "got {decay}");

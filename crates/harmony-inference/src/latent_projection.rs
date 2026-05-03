@@ -25,7 +25,11 @@ impl LatentProjection {
         let latent_dim = layer2_weight.dim(0)?;
         let layer1 = Linear::new(layer1_weight, Some(layer1_bias));
         let layer2 = Linear::new(layer2_weight, Some(layer2_bias));
-        Ok(Self { layer1, layer2, latent_dim })
+        Ok(Self {
+            layer1,
+            layer2,
+            latent_dim,
+        })
     }
 
     pub fn new_random(
@@ -161,9 +165,7 @@ pub fn contrastive_loss(
     let (b, s, _) = original.dims3()?;
     let (pb, ps, _) = projected.dims3()?;
     if (pb, ps) != (b, s) {
-        candle_core::bail!(
-            "projected batch/seq ({pb}, {ps}) must match original ({b}, {s})"
-        );
+        candle_core::bail!("projected batch/seq ({pb}, {ps}) must match original ({b}, {s})");
     }
     let n = b * s;
 
@@ -216,8 +218,11 @@ pub fn contrastive_loss(
         }
     }
 
-    let target_tensor =
-        Tensor::from_vec(target_data.into_iter().flatten().collect::<Vec<f32>>(), (n, n), original.device())?;
+    let target_tensor = Tensor::from_vec(
+        target_data.into_iter().flatten().collect::<Vec<f32>>(),
+        (n, n),
+        original.device(),
+    )?;
     let targets = candle_nn::ops::softmax(&target_tensor, 1)?;
 
     // Cross-entropy: -sum(targets * log_softmax(logits))
@@ -252,8 +257,17 @@ mod tests {
         let proj = test_projection();
         let input = Tensor::randn(0f32, 10.0, (1, 8, HIDDEN_DIM), &Device::Cpu).unwrap();
         let output = proj.project(&input).unwrap();
-        let max: f32 = output.abs().unwrap().max_all().unwrap().to_scalar().unwrap();
-        assert!(max <= 1.0 + 1e-6, "tanh output must be in [-1, 1], got max={max}");
+        let max: f32 = output
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(
+            max <= 1.0 + 1e-6,
+            "tanh output must be in [-1, 1], got max={max}"
+        );
     }
 
     #[test]
@@ -272,12 +286,17 @@ mod tests {
     fn similar_embeddings_produce_same_binary_key() {
         let proj = test_projection();
         let base = Tensor::randn(0f32, 1.0, (1, 1, HIDDEN_DIM), &Device::Cpu).unwrap();
-        let noise = (Tensor::randn(0f32, 1.0, (1, 1, HIDDEN_DIM), &Device::Cpu).unwrap()
-            * 1e-4).unwrap();
+        let noise =
+            (Tensor::randn(0f32, 1.0, (1, 1, HIDDEN_DIM), &Device::Cpu).unwrap() * 1e-4).unwrap();
         let similar = (&base + &noise).unwrap();
         let keys_a = proj.to_binary_keys(&proj.project(&base).unwrap()).unwrap();
-        let keys_b = proj.to_binary_keys(&proj.project(&similar).unwrap()).unwrap();
-        assert_eq!(keys_a[0], keys_b[0], "tiny perturbation should produce same binary key");
+        let keys_b = proj
+            .to_binary_keys(&proj.project(&similar).unwrap())
+            .unwrap();
+        assert_eq!(
+            keys_a[0], keys_b[0],
+            "tiny perturbation should produce same binary key"
+        );
     }
 
     #[test]
@@ -285,10 +304,14 @@ mod tests {
         let proj = test_projection();
         let a = Tensor::ones((1, 1, HIDDEN_DIM), candle_core::DType::F32, &Device::Cpu).unwrap();
         let b = (Tensor::ones((1, 1, HIDDEN_DIM), candle_core::DType::F32, &Device::Cpu).unwrap()
-            * (-1.0)).unwrap();
+            * (-1.0))
+            .unwrap();
         let keys_a = proj.to_binary_keys(&proj.project(&a).unwrap()).unwrap();
         let keys_b = proj.to_binary_keys(&proj.project(&b).unwrap()).unwrap();
-        assert_ne!(keys_a[0], keys_b[0], "very different inputs should produce different binary keys");
+        assert_ne!(
+            keys_a[0], keys_b[0],
+            "very different inputs should produce different binary keys"
+        );
     }
 
     #[test]

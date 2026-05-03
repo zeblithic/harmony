@@ -148,7 +148,10 @@ mod tests {
         // Encrypted (bit 7) but NOT ephemeral (bit 6 clear) → durable.
         let mut cid = [0u8; 32];
         cid[0] = 0x80;
-        assert!(is_durable(&cid), "header[0]=0x80 (encrypted only) must be durable");
+        assert!(
+            is_durable(&cid),
+            "header[0]=0x80 (encrypted only) must be durable"
+        );
     }
 
     #[test]
@@ -156,7 +159,10 @@ mod tests {
         // Ephemeral flag (bit 6) set, not encrypted.
         let mut cid = [0u8; 32];
         cid[0] = 0x40;
-        assert!(!is_durable(&cid), "header[0]=0x40 (ephemeral) must NOT be durable");
+        assert!(
+            !is_durable(&cid),
+            "header[0]=0x40 (ephemeral) must NOT be durable"
+        );
     }
 
     #[test]

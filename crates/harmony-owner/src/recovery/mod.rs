@@ -28,10 +28,10 @@
 //!   knowing the 24 words is mathematically equivalent to knowing the
 //!   seed.
 
-pub mod error;
-pub(crate) mod wire;
-pub(crate) mod mnemonic;
 pub(crate) mod encrypted_file;
+pub mod error;
+pub(crate) mod mnemonic;
+pub(crate) mod wire;
 
 pub use error::RecoveryError;
 
@@ -145,8 +145,7 @@ impl RecoveryArtifact {
         // its slot is a separate allocation from this caller's binding). Bind
         // it `mut` and `zeroize()` after wrapping into the artifact, mirroring
         // `mint_owner` (lifecycle/mint.rs).
-        let (mut seed, mint_at, comment) =
-            encrypted_file::decrypt_inner(bytes, passphrase)?;
+        let (mut seed, mint_at, comment) = encrypted_file::decrypt_inner(bytes, passphrase)?;
         let artifact = RecoveryArtifact::from_seed(seed);
         seed.zeroize();
         Ok(RestoredArtifact {
@@ -160,7 +159,7 @@ impl RecoveryArtifact {
 // root so integration tests in `tests/` can reach them without
 // navigating into private submodules.
 #[cfg(feature = "test-fixtures")]
-pub use encrypted_file::{encrypt_with_params_for_test, FORMAT_STRING, RecoveryFileBody};
+pub use encrypted_file::{encrypt_with_params_for_test, RecoveryFileBody, FORMAT_STRING};
 #[cfg(feature = "test-fixtures")]
 pub use wire::{NONCE_LEN, SALT_LEN};
 

@@ -301,10 +301,16 @@ mod tests {
         let seed = [0x42u8; SK_LENGTH];
         let (pk_a, sk_a) = from_seed(&seed);
         let (pk_b, sk_b) = from_seed(&seed);
-        assert_eq!(pk_a.as_bytes(), pk_b.as_bytes(),
-            "from_seed must be deterministic across calls (public key)");
-        assert_eq!(sk_a.as_bytes(), sk_b.as_bytes(),
-            "from_seed must be deterministic across calls (secret key)");
+        assert_eq!(
+            pk_a.as_bytes(),
+            pk_b.as_bytes(),
+            "from_seed must be deterministic across calls (public key)"
+        );
+        assert_eq!(
+            sk_a.as_bytes(),
+            sk_b.as_bytes(),
+            "from_seed must be deterministic across calls (secret key)"
+        );
     }
 
     #[test]

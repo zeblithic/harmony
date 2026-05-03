@@ -80,11 +80,7 @@ impl ProllyTree {
 
     // --- Writes (update cache + rebuild tree) ---
 
-    pub fn insert(
-        &mut self,
-        entry: Entry,
-        data_dir: &Path,
-    ) -> Result<Option<ContentId>, DbError> {
+    pub fn insert(&mut self, entry: Entry, data_dir: &Path) -> Result<Option<ContentId>, DbError> {
         let old_cache = self.cache.clone();
         let old_root = self.root;
         match self.cache.binary_search_by(|e| e.key.cmp(&entry.key)) {
@@ -153,9 +149,8 @@ impl ProllyTree {
         self.cache[idx].metadata.snippet = snippet.clone();
 
         if let Some(root) = self.root {
-            match mutate::incremental_update_meta(
-                data_dir, root, key, flags, snippet, &self.config,
-            ) {
+            match mutate::incremental_update_meta(data_dir, root, key, flags, snippet, &self.config)
+            {
                 Ok(Some(new_root)) => {
                     self.root = Some(new_root);
                     Ok(true)
@@ -257,11 +252,7 @@ pub(crate) fn build_tree(
 }
 
 /// Walk tree recursively, collect all leaf entries as public Entry type.
-fn collect_entries(
-    data_dir: &Path,
-    cid: ContentId,
-    out: &mut Vec<Entry>,
-) -> Result<(), DbError> {
+fn collect_entries(data_dir: &Path, cid: ContentId, out: &mut Vec<Entry>) -> Result<(), DbError> {
     let node = Node::read_from_cas(data_dir, cid)?;
     match node {
         Node::Leaf(entries) => {

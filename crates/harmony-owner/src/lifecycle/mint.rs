@@ -142,7 +142,8 @@ mod tests {
                 x25519_pub: [0u8; 32],
             },
             post_quantum: None,
-        }.identity_hash();
+        }
+        .identity_hash();
         assert_eq!(owner_id_via_restored, result.state.owner_id);
     }
 }

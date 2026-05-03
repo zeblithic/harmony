@@ -69,21 +69,22 @@ impl PeerManager {
                         peer.connecting_since = None; // stamped on first Tick
 
                         // Check whether the contact has a Tunnel address — if so, prefer it.
-                        let tunnel_action =
-                            contacts.get(&identity_hash).and_then(|contact| {
-                                contact.addresses.iter().find_map(|addr| {
-                                    if let ContactAddress::Tunnel { node_id, relay_url, .. } = addr
-                                    {
-                                        Some(PeerAction::InitiateTunnel {
-                                            identity_hash,
-                                            node_id: *node_id,
-                                            relay_url: relay_url.clone(),
-                                        })
-                                    } else {
-                                        None
-                                    }
-                                })
-                            });
+                        let tunnel_action = contacts.get(&identity_hash).and_then(|contact| {
+                            contact.addresses.iter().find_map(|addr| {
+                                if let ContactAddress::Tunnel {
+                                    node_id, relay_url, ..
+                                } = addr
+                                {
+                                    Some(PeerAction::InitiateTunnel {
+                                        identity_hash,
+                                        node_id: *node_id,
+                                        relay_url: relay_url.clone(),
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                        });
 
                         if let Some(action) = tunnel_action {
                             actions.push(action);
@@ -93,7 +94,11 @@ impl PeerManager {
                     }
                 }
             }
-            PeerEvent::TunnelEstablished { identity_hash, node_id, now } => {
+            PeerEvent::TunnelEstablished {
+                identity_hash,
+                node_id,
+                now,
+            } => {
                 match self.peers.get_mut(&identity_hash) {
                     Some(peer) => match peer.status {
                         PeerStatus::Connecting | PeerStatus::Searching => {
@@ -231,8 +236,7 @@ impl PeerManager {
     ) {
         if let Some(peer) = peers.get_mut(&identity_hash) {
             if valid_states.contains(&peer.status) {
-                peer.last_probe =
-                    peer.connecting_since.or(peer.last_seen).or(peer.last_probe);
+                peer.last_probe = peer.connecting_since.or(peer.last_seen).or(peer.last_probe);
                 peer.status = PeerStatus::Searching;
                 peer.retry_count = peer.retry_count.saturating_add(1);
                 peer.connecting_since = None;
@@ -1060,7 +1064,9 @@ mod tests {
             "expected InitiateTunnel, got: {actions:?}"
         );
         assert!(
-            !actions.iter().any(|a| matches!(a, PeerAction::InitiateLink { .. })),
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::InitiateLink { .. })),
             "should NOT emit InitiateLink for tunnel contact"
         );
     }
@@ -1074,7 +1080,11 @@ mod tests {
         mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
 
         let actions = mgr.on_event(
-            PeerEvent::TunnelEstablished { identity_hash: id, node_id: [0xAA; 32], now: 7000 },
+            PeerEvent::TunnelEstablished {
+                identity_hash: id,
+                node_id: [0xAA; 32],
+                now: 7000,
+            },
             &store,
         );
         let peer = mgr.peers.get(&id).unwrap();
@@ -1114,13 +1124,16 @@ mod tests {
         mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
         mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
         mgr.on_event(
-            PeerEvent::TunnelEstablished { identity_hash: id, node_id: [0xAA; 32], now: 8000 },
+            PeerEvent::TunnelEstablished {
+                identity_hash: id,
+                node_id: [0xAA; 32],
+                now: 8000,
+            },
             &store,
         );
         assert_eq!(mgr.peers.get(&id).unwrap().status, PeerStatus::Connected);
 
-        let actions =
-            mgr.on_event(PeerEvent::TunnelDropped { identity_hash: id }, &store);
+        let actions = mgr.on_event(PeerEvent::TunnelDropped { identity_hash: id }, &store);
         let peer = mgr.peers.get(&id).unwrap();
         // Falls back to Reticulum immediately — status is Connecting, not Searching.
         assert_eq!(peer.status, PeerStatus::Connecting);
@@ -1141,19 +1154,24 @@ mod tests {
         mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
         mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
         mgr.on_event(
-            PeerEvent::TunnelEstablished { identity_hash: id, node_id: [0xAA; 32], now: 8000 },
+            PeerEvent::TunnelEstablished {
+                identity_hash: id,
+                node_id: [0xAA; 32],
+                now: 8000,
+            },
             &store,
         );
         assert_eq!(mgr.peers.get(&id).unwrap().status, PeerStatus::Connected);
 
-        let actions =
-            mgr.on_event(PeerEvent::TunnelDropped { identity_hash: id }, &store);
+        let actions = mgr.on_event(PeerEvent::TunnelDropped { identity_hash: id }, &store);
         let peer = mgr.peers.get(&id).unwrap();
         assert_eq!(peer.status, PeerStatus::Searching);
         assert_eq!(peer.retry_count, 1);
         // No Reticulum address → no InitiateLink
         assert!(
-            !actions.iter().any(|a| matches!(a, PeerAction::InitiateLink { .. })),
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::InitiateLink { .. })),
             "should NOT emit InitiateLink when there is no Reticulum address"
         );
     }

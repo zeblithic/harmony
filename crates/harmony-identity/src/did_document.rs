@@ -37,7 +37,9 @@ pub fn did_web_to_url(did: &str) -> Result<String, DidError> {
     // The first segment is the domain (possibly percent-encoded), and
     // any remaining segments become path components.
     let mut parts = method_specific_id.split(':');
-    let raw_domain = parts.next().expect("split always yields at least one element");
+    let raw_domain = parts
+        .next()
+        .expect("split always yields at least one element");
 
     // Decode percent-encoded characters in the domain (e.g. %3A → :)
     let domain = percent_decode(raw_domain)?;
@@ -258,8 +260,8 @@ mod tests {
     #[cfg(feature = "std")]
     mod parse_tests {
         use super::super::*;
-        use base64::Engine as _;
         use crate::crypto_suite::CryptoSuite;
+        use base64::Engine as _;
 
         fn ed25519_jwk_document(did: &str, key_b64: &str) -> String {
             format!(
@@ -283,8 +285,7 @@ mod tests {
         #[test]
         fn parse_ed25519_jwk_document() {
             let key_bytes = [42u8; 32];
-            let key_b64 =
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key_bytes);
+            let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key_bytes);
             let did = "did:web:example.com";
             let json = ed25519_jwk_document(did, &key_b64);
             let doc = parse_did_document(did, json.as_bytes()).unwrap();
@@ -361,8 +362,7 @@ mod tests {
                 "id": "did:web:evil.com",
                 "verificationMethod": []
             }"#;
-            let err =
-                parse_did_document("did:web:example.com", json.as_bytes()).unwrap_err();
+            let err = parse_did_document("did:web:example.com", json.as_bytes()).unwrap_err();
             assert!(
                 matches!(err, crate::did::DidError::MalformedDid(ref msg) if msg.contains("mismatch"))
             );
@@ -403,9 +403,9 @@ mod tests {
     #[cfg(feature = "std")]
     mod resolver_tests {
         use super::super::*;
-        use base64::Engine as _;
-        use crate::did::{DidError, DidResolver};
         use crate::crypto_suite::CryptoSuite;
+        use crate::did::{DidError, DidResolver};
+        use base64::Engine as _;
 
         struct MockFetcher {
             response: Result<alloc::vec::Vec<u8>, DidError>,
@@ -425,7 +425,8 @@ mod tests {
             let key_bytes = [42u8; 32];
             let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key_bytes);
             let did = "did:web:example.com";
-            let json = alloc::format!(r#"{{
+            let json = alloc::format!(
+                r#"{{
                 "@context": "https://www.w3.org/ns/did/v1",
                 "id": "{did}",
                 "verificationMethod": [{{
@@ -434,8 +435,11 @@ mod tests {
                     "controller": "{did}",
                     "publicKeyJwk": {{ "kty": "OKP", "crv": "Ed25519", "x": "{key_b64}" }}
                 }}]
-            }}"#);
-            let fetcher = MockFetcher { response: Ok(json.into_bytes()) };
+            }}"#
+            );
+            let fetcher = MockFetcher {
+                response: Ok(json.into_bytes()),
+            };
             let resolver = WebDidResolver::new(fetcher);
             let resolved = resolver.resolve(did).unwrap();
             assert_eq!(resolved.suite, CryptoSuite::Ed25519);
@@ -449,7 +453,8 @@ mod tests {
             let b64_1 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key1);
             let b64_2 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key2);
             let did = "did:web:example.com";
-            let json = alloc::format!(r#"{{
+            let json = alloc::format!(
+                r#"{{
                 "@context": "https://www.w3.org/ns/did/v1",
                 "id": "{did}",
                 "verificationMethod": [
@@ -458,8 +463,11 @@ mod tests {
                     {{ "id": "{did}#k2", "type": "JsonWebKey2020", "controller": "{did}",
                        "publicKeyJwk": {{ "kty": "OKP", "crv": "Ed25519", "x": "{b64_2}" }} }}
                 ]
-            }}"#);
-            let resolver = WebDidResolver::new(MockFetcher { response: Ok(json.into_bytes()) });
+            }}"#
+            );
+            let resolver = WebDidResolver::new(MockFetcher {
+                response: Ok(json.into_bytes()),
+            });
             let doc = resolver.resolve_document(did).unwrap();
             assert_eq!(doc.verification_methods.len(), 2);
         }

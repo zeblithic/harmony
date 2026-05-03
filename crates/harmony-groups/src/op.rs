@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use crate::types::{GroupAction, GroupOp, GroupOpPayload, MemberAddr, OpId};
+use alloc::vec::Vec;
 
 impl GroupOp {
     /// Serialize `payload` with postcard and return the first 32 bytes of its
@@ -120,12 +120,8 @@ mod tests {
 
     #[test]
     fn tamper_detection() {
-        let (mut op, _) = GroupOp::new_unsigned(
-            alloc::vec![],
-            [0xCC; 16],
-            100,
-            GroupAction::Dissolve,
-        );
+        let (mut op, _) =
+            GroupOp::new_unsigned(alloc::vec![], [0xCC; 16], 100, GroupAction::Dissolve);
         assert!(op.verify_id());
         // Tamper with the timestamp
         op.timestamp = 999;
@@ -139,7 +135,9 @@ mod tests {
             parents: alloc::vec![[0xFF; 32]],
             author: [0x11; 16],
             timestamp: 12345,
-            action: GroupAction::Invite { invitee: [0x22; 16] },
+            action: GroupAction::Invite {
+                invitee: [0x22; 16],
+            },
         };
         let b1 = postcard::to_allocvec(&payload).unwrap();
         let b2 = postcard::to_allocvec(&payload).unwrap();
@@ -152,12 +150,8 @@ mod tests {
 
     #[test]
     fn verify_id_correct_after_round_trip() {
-        let (op, _) = GroupOp::new_unsigned(
-            alloc::vec![[0xDE; 32]],
-            [0x55; 16],
-            500,
-            GroupAction::Leave,
-        );
+        let (op, _) =
+            GroupOp::new_unsigned(alloc::vec![[0xDE; 32]], [0x55; 16], 500, GroupAction::Leave);
         let bytes = postcard::to_allocvec(&op).unwrap();
         let decoded: GroupOp = postcard::from_bytes(&bytes).unwrap();
         assert!(decoded.verify_id());

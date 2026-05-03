@@ -88,10 +88,7 @@ impl BlockAttnRes {
     ///
     /// `query_tensors`: Vec of tensors, each shape `[1, 1, hidden_dim]`.
     /// Length must be `num_blocks - 1`.
-    pub fn from_tensors(
-        config: &BlockAttnResConfig,
-        query_tensors: Vec<Tensor>,
-    ) -> Result<Self> {
+    pub fn from_tensors(config: &BlockAttnResConfig, query_tensors: Vec<Tensor>) -> Result<Self> {
         if query_tensors.len() != config.num_blocks.saturating_sub(1) {
             candle_core::bail!(
                 "expected {} query tensors, got {}",
@@ -201,11 +198,15 @@ impl BlockAttnRes {
         let mut scores = Vec::with_capacity(num_candidates);
         for summary in &state.summaries {
             // [batch, seq_len, hidden_dim] * [1, 1, hidden_dim] → sum → [batch, seq_len, 1]
-            let score = summary.broadcast_mul(query)?.sum_keepdim(candle_core::D::Minus1)?;
+            let score = summary
+                .broadcast_mul(query)?
+                .sum_keepdim(candle_core::D::Minus1)?;
             scores.push(score);
         }
         // Current hidden state as final candidate
-        let current_score = hidden_state.broadcast_mul(query)?.sum_keepdim(candle_core::D::Minus1)?;
+        let current_score = hidden_state
+            .broadcast_mul(query)?
+            .sum_keepdim(candle_core::D::Minus1)?;
         scores.push(current_score);
 
         // Stack scores: [batch, seq_len, num_candidates]
@@ -346,11 +347,7 @@ mod tests {
         assert_eq!(state.summaries.len(), 1);
 
         // Verify the summary is h1 (all 5s), not the accumulated sum (all 6s)
-        let summary_vals: Vec<f32> = state.summaries[0]
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
+        let summary_vals: Vec<f32> = state.summaries[0].flatten_all().unwrap().to_vec1().unwrap();
         for &v in &summary_vals {
             assert!(
                 (v - 5.0).abs() < 1e-6,
@@ -422,7 +419,11 @@ mod tests {
 
         for block_idx in 0..4 {
             let input = module.block_input(block_idx, &h, &state).unwrap();
-            assert_eq!(input.dims(), &[1, 5, 8], "block {block_idx} input shape mismatch");
+            assert_eq!(
+                input.dims(),
+                &[1, 5, 8],
+                "block {block_idx} input shape mismatch"
+            );
 
             // Simulate layers within this block
             let start = block_idx * 2;
@@ -479,9 +480,7 @@ mod tests {
             hidden_dim: 4,
         };
         let zero_queries: Vec<Tensor> = (0..2)
-            .map(|_| {
-                Tensor::zeros((1, 1, 4), candle_core::DType::F32, &Device::Cpu).unwrap()
-            })
+            .map(|_| Tensor::zeros((1, 1, 4), candle_core::DType::F32, &Device::Cpu).unwrap())
             .collect();
         let module = BlockAttnRes::from_tensors(&cfg, zero_queries).unwrap();
         let mut state = module.new_state();
@@ -591,7 +590,9 @@ mod tests {
             h = (&h + &layer_out).unwrap();
 
             // Notify AttnRes of this layer's output
-            module.notify_layer_output(layer_idx, &h, &mut state).unwrap();
+            module
+                .notify_layer_output(layer_idx, &h, &mut state)
+                .unwrap();
         }
 
         // All 8 blocks should be finalized
@@ -610,9 +611,10 @@ mod tests {
         };
         // Craft a query that strongly prefers the first candidate (block 0 summary)
         // by making it point in the same direction as block 0's data.
-        let block0_direction =
-            Tensor::new(&[1.0f32, 0.0, 0.0, 0.0], &Device::Cpu).unwrap()
-                .reshape((1, 1, 4)).unwrap();
+        let block0_direction = Tensor::new(&[1.0f32, 0.0, 0.0, 0.0], &Device::Cpu)
+            .unwrap()
+            .reshape((1, 1, 4))
+            .unwrap();
         let neutral_query =
             Tensor::zeros((1, 1, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
 

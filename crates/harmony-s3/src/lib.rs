@@ -20,11 +20,7 @@ pub mod archivist;
 pub use error::S3Error;
 
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::{
-    primitives::ByteStream,
-    types::StorageClass,
-    Client,
-};
+use aws_sdk_s3::{primitives::ByteStream, types::StorageClass, Client};
 use tracing::{debug, instrument};
 
 /// Content-addressed S3 client.
@@ -120,7 +116,8 @@ impl S3Library {
         let key = self.object_key(cid_bytes);
         debug!(key, bytes = data.len(), "putting book");
 
-        let mut req = self.client
+        let mut req = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
@@ -255,16 +252,16 @@ mod tests {
             key.starts_with("prod/v2/book/"),
             "key must include the configured prefix"
         );
-        assert_eq!(
-            key,
-            format!("prod/v2/book/{}", "00".repeat(32)),
-        );
+        assert_eq!(key, format!("prod/v2/book/{}", "00".repeat(32)),);
     }
 
     #[test]
     fn custom_endpoint_flag_tracks_endpoint_presence() {
         let aws = make_library_with_endpoint("v1/", false);
-        assert!(!aws.custom_endpoint, "AWS S3 path must not set custom_endpoint");
+        assert!(
+            !aws.custom_endpoint,
+            "AWS S3 path must not set custom_endpoint"
+        );
 
         let r2 = make_library_with_endpoint("v1/", true);
         assert!(r2.custom_endpoint, "R2 path must set custom_endpoint");

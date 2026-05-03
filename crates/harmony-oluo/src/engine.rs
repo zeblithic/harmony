@@ -293,16 +293,17 @@ impl OluoEngine {
         // CID deduplication: if this CID was previously ingested, reuse the key
         // and replace the old entry (mirrors HashMap::insert semantics).
         // Scope widens to the broadest seen (never narrows).
-        let (key, old_metadata, effective_scope) = if let Some(&existing_key) = self.cid_to_key.get(&header.target_cid) {
-            let old = self.metadata.remove(&existing_key);
-            let old_scope = old.as_ref().map(|m| m.scope).unwrap_or(scope);
-            let widened = scope.max(old_scope);
-            (existing_key, old, widened)
-        } else {
-            let k = self.key_counter;
-            self.key_counter += 1;
-            (k, None, scope)
-        };
+        let (key, old_metadata, effective_scope) =
+            if let Some(&existing_key) = self.cid_to_key.get(&header.target_cid) {
+                let old = self.metadata.remove(&existing_key);
+                let old_scope = old.as_ref().map(|m| m.scope).unwrap_or(scope);
+                let widened = scope.max(old_scope);
+                (existing_key, old, widened)
+            } else {
+                let k = self.key_counter;
+                self.key_counter += 1;
+                (k, None, scope)
+            };
 
         let f32_vector = unpack_tier3(&header.tier3);
 
@@ -411,9 +412,7 @@ impl OluoEngine {
 
         // Over-fetch to compensate for evicted entries and scope filtering.
         let headroom = self.evicted_headroom();
-        let capped_headroom = headroom
-            .min(query.max_results as usize * 5)
-            .min(1000);
+        let capped_headroom = headroom.min(query.max_results as usize * 5).min(1000);
 
         // Scope-aware over-fetch: estimate what fraction of entries match the query scope.
         let total = self.metadata.len();
@@ -570,7 +569,9 @@ mod tests {
 
         assert_eq!(engine.entry_count(), 1);
         assert!(
-            actions.iter().any(|a| matches!(a, OluoAction::IndexUpdated)),
+            actions
+                .iter()
+                .any(|a| matches!(a, OluoAction::IndexUpdated)),
             "expected IndexUpdated action"
         );
     }
@@ -788,7 +789,10 @@ mod tests {
         let actions = engine.handle(OluoEvent::Search { query_id: 8, query });
         match &actions[0] {
             OluoAction::SearchResults { results, .. } => {
-                assert!(results.is_empty(), "evicted entry should not appear in search");
+                assert!(
+                    results.is_empty(),
+                    "evicted entry should not appear in search"
+                );
             }
             _ => panic!("expected SearchResults"),
         }
@@ -866,7 +870,9 @@ mod tests {
         );
         // IndexUpdated should also be present.
         assert!(
-            actions.iter().any(|a| matches!(a, OluoAction::IndexUpdated)),
+            actions
+                .iter()
+                .any(|a| matches!(a, OluoAction::IndexUpdated)),
             "expected IndexUpdated alongside PersistSnapshot"
         );
     }
@@ -989,7 +995,10 @@ mod tests {
         match &actions[0] {
             OluoAction::SearchResults { query_id, results } => {
                 assert_eq!(*query_id, 50);
-                assert!(results.is_empty(), "max_results=0 should return empty results");
+                assert!(
+                    results.is_empty(),
+                    "max_results=0 should return empty results"
+                );
             }
             _ => panic!("expected SearchResults action"),
         }
@@ -1437,7 +1446,12 @@ mod tests {
                 metadata_bytes,
                 key_counter,
                 generation,
-            } => (index_bytes.clone(), metadata_bytes.clone(), *key_counter, *generation),
+            } => (
+                index_bytes.clone(),
+                metadata_bytes.clone(),
+                *key_counter,
+                *generation,
+            ),
             _ => unreachable!(),
         };
 
@@ -1448,14 +1462,9 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let mut restored = OluoEngine::from_snapshot(
-            &index_bytes,
-            metadata,
-            key_counter,
-            generation,
-            1000,
-        )
-        .expect("from_snapshot must succeed");
+        let mut restored =
+            OluoEngine::from_snapshot(&index_bytes, metadata, key_counter, generation, 1000)
+                .expect("from_snapshot must succeed");
 
         // Verify entry count matches.
         assert_eq!(restored.entry_count(), 3);
@@ -1475,7 +1484,10 @@ mod tests {
             OluoAction::SearchResults { results, .. } => results,
             other => panic!("expected SearchResults, got {other:?}"),
         };
-        assert!(!results.is_empty(), "search must return results after restore");
+        assert!(
+            !results.is_empty(),
+            "search must return results after restore"
+        );
         // The closest result should be the entry with the same tier3.
         assert_eq!(results[0].target_cid, [0x03; 32]);
     }
@@ -1509,7 +1521,9 @@ mod tests {
             overlay_cids: Vec::new(),
         });
 
-        let snapshot = actions.iter().find(|a| matches!(a, OluoAction::PersistSnapshot { .. }));
+        let snapshot = actions
+            .iter()
+            .find(|a| matches!(a, OluoAction::PersistSnapshot { .. }));
         assert!(snapshot.is_some(), "expected PersistSnapshot action");
 
         if let Some(OluoAction::PersistSnapshot {
@@ -1520,16 +1534,20 @@ mod tests {
         }) = snapshot
         {
             assert!(!index_bytes.is_empty(), "index_bytes must not be empty");
-            assert!(!metadata_bytes.is_empty(), "metadata_bytes must not be empty");
+            assert!(
+                !metadata_bytes.is_empty(),
+                "metadata_bytes must not be empty"
+            );
             assert_eq!(*key_counter, 3, "3 entries ingested → key_counter=3");
             assert_eq!(*generation, 1, "first compaction → generation=1");
 
             // Verify metadata_bytes round-trips correctly.
-            let restored: hashbrown::HashMap<u64, EntryMetadata> =
-                postcard::from_bytes::<std::collections::BTreeMap<u64, EntryMetadata>>(metadata_bytes)
-                    .expect("metadata must deserialize")
-                    .into_iter()
-                    .collect();
+            let restored: hashbrown::HashMap<u64, EntryMetadata> = postcard::from_bytes::<
+                std::collections::BTreeMap<u64, EntryMetadata>,
+            >(metadata_bytes)
+            .expect("metadata must deserialize")
+            .into_iter()
+            .collect();
             assert_eq!(restored.len(), 3);
         }
     }
@@ -1607,8 +1625,8 @@ mod tests {
                 .expect("deserialize metadata")
                 .into_iter()
                 .collect();
-        let mut restored =
-            OluoEngine::from_snapshot(&ib, metadata, kc, gen, 1000).expect("from_snapshot must succeed");
+        let mut restored = OluoEngine::from_snapshot(&ib, metadata, kc, gen, 1000)
+            .expect("from_snapshot must succeed");
 
         // Search with Personal scope — only Personal entries should be returned.
         let search_actions = restored.handle(OluoEvent::Search {
@@ -1627,10 +1645,20 @@ mod tests {
         };
 
         // Only Personal entries ([0x01;32] and [0x04;32]) should appear.
-        assert_eq!(results.len(), 2, "Personal search must return exactly 2 Personal entries");
+        assert_eq!(
+            results.len(),
+            2,
+            "Personal search must return exactly 2 Personal entries"
+        );
         let cids: Vec<[u8; 32]> = results.iter().map(|r| r.target_cid).collect();
-        assert!(cids.contains(&[0x01; 32]), "must contain first Personal entry");
-        assert!(cids.contains(&[0x04; 32]), "must contain second Personal entry");
+        assert!(
+            cids.contains(&[0x01; 32]),
+            "must contain first Personal entry"
+        );
+        assert!(
+            cids.contains(&[0x04; 32]),
+            "must contain second Personal entry"
+        );
     }
 
     #[test]
@@ -1692,10 +1720,14 @@ mod tests {
                 .expect("deserialize metadata")
                 .into_iter()
                 .collect();
-        let mut restored =
-            OluoEngine::from_snapshot(&ib, metadata, kc, gen, 1000).expect("from_snapshot must succeed");
+        let mut restored = OluoEngine::from_snapshot(&ib, metadata, kc, gen, 1000)
+            .expect("from_snapshot must succeed");
 
-        assert_eq!(restored.entry_count(), 3, "restored engine must have 3 entries");
+        assert_eq!(
+            restored.entry_count(),
+            3,
+            "restored engine must have 3 entries"
+        );
 
         // Ingest a 4th entry into the restored engine.
         restored.handle(OluoEvent::Ingest {
@@ -1707,7 +1739,11 @@ mod tests {
             overlay_cids: Vec::new(),
         });
 
-        assert_eq!(restored.entry_count(), 4, "entry_count must be 4 after 1 new ingest into restored engine");
+        assert_eq!(
+            restored.entry_count(),
+            4,
+            "entry_count must be 4 after 1 new ingest into restored engine"
+        );
     }
 
     #[test]
@@ -1764,8 +1800,8 @@ mod tests {
                 .expect("deserialize metadata")
                 .into_iter()
                 .collect();
-        let mut restored =
-            OluoEngine::from_snapshot(&ib, metadata, kc, gen, 1000).expect("from_snapshot must succeed");
+        let mut restored = OluoEngine::from_snapshot(&ib, metadata, kc, gen, 1000)
+            .expect("from_snapshot must succeed");
 
         assert_eq!(restored.entry_count(), 3);
 
@@ -1835,8 +1871,8 @@ mod tests {
         let metadata: std::collections::BTreeMap<u64, EntryMetadata> =
             postcard::from_bytes(&mb).expect("deserialize metadata");
         // Restore with threshold=2 so we can trigger a second compaction.
-        let mut restored =
-            OluoEngine::from_snapshot(&ib, metadata, kc, gen, 2).expect("from_snapshot must succeed");
+        let mut restored = OluoEngine::from_snapshot(&ib, metadata, kc, gen, 2)
+            .expect("from_snapshot must succeed");
 
         // Ingest entries to trigger compaction on the restored engine.
         // With threshold=2, compaction fires on the 2nd ingest.
@@ -1873,7 +1909,10 @@ mod tests {
         });
         match &search_actions[0] {
             OluoAction::SearchResults { results, .. } => {
-                assert!(!results.is_empty(), "search must return results on healthy restored engine");
+                assert!(
+                    !results.is_empty(),
+                    "search must return results on healthy restored engine"
+                );
             }
             other => panic!("expected SearchResults, got {other:?}"),
         }

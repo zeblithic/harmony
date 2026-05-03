@@ -44,9 +44,7 @@ pub fn verify_announce(record: &AnnounceRecord, now: u64) -> Result<(), Discover
     // Verify that the included public keys derive to the claimed identity hash.
     // This prevents forged announces where an attacker substitutes their own keys
     // for a victim's identity address.
-    let mut combined = Vec::with_capacity(
-        record.encryption_key.len() + record.public_key.len(),
-    );
+    let mut combined = Vec::with_capacity(record.encryption_key.len() + record.public_key.len());
     combined.extend_from_slice(&record.encryption_key);
     combined.extend_from_slice(&record.public_key);
     let derived_hash = harmony_crypto::hash::truncated_hash(&combined);

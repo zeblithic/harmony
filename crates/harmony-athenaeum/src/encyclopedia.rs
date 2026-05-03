@@ -498,11 +498,11 @@ mod tests {
     fn route_hash_multiple_bits() {
         let mut hash = [0u8; 28];
         hash[0] = 0b1010_0000; // bits 0=1, 1=0, 2=1
-        hash[1] = 0xFF;        // bits 8-15 all 1
+        hash[1] = 0xFF; // bits 8-15 all 1
         let path = Encyclopedia::route_hash(&hash, 16);
         // bit 0 = 1, bit 1 = 0, bit 2 = 1, bits 3-7 = 0
         assert_eq!(path & 0b111, 0b101); // first 3 bits: 1,0,1
-        // bits 8-15 all set
+                                         // bits 8-15 all set
         assert_eq!((path >> 8) & 0xFF, 0xFF);
     }
 

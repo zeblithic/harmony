@@ -5,8 +5,8 @@
 //! the prompt. Feature-gated behind `prefill`.
 
 use harmony_content::book::BookStore;
-use harmony_content::cid::ContentId;
 use harmony_content::chunker::ChunkerConfig;
+use harmony_content::cid::ContentId;
 use harmony_content::dag;
 use harmony_content::error::ContentError;
 use harmony_crypto::hash::full_hash;
@@ -67,7 +67,10 @@ pub enum PrefillError {
     UnsupportedQuantBits(u8),
 
     #[error("model mismatch: expected {expected:?}, got {actual:?}")]
-    ModelMismatch { expected: [u8; 32], actual: [u8; 32] },
+    ModelMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
 
     #[error("cache is not compressed")]
     CacheNotCompressed,
@@ -126,7 +129,10 @@ fn store_prefill_cache_inner(
         PrefillError::SerializationFailed(format!("num_layers {} exceeds u16", cache.num_layers))
     })?;
     let num_kv_heads = u16::try_from(cache.num_kv_heads).map_err(|_| {
-        PrefillError::SerializationFailed(format!("num_kv_heads {} exceeds u16", cache.num_kv_heads))
+        PrefillError::SerializationFailed(format!(
+            "num_kv_heads {} exceeds u16",
+            cache.num_kv_heads
+        ))
     })?;
     let head_dim = u16::try_from(cache.head_dim).map_err(|_| {
         PrefillError::SerializationFailed(format!("head_dim {} exceeds u16", cache.head_dim))
@@ -221,9 +227,9 @@ pub fn load_prefill_cache(
     }
 
     let header_len = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
-    let header_end = 4usize.checked_add(header_len).ok_or_else(|| {
-        PrefillError::SerializationFailed("header_len overflow".into())
-    })?;
+    let header_end = 4usize
+        .checked_add(header_len)
+        .ok_or_else(|| PrefillError::SerializationFailed("header_len overflow".into()))?;
     if blob.len() < header_end {
         return Err(PrefillError::SerializationFailed("truncated header".into()));
     }
@@ -285,14 +291,23 @@ mod tests {
     use harmony_content::book::MemoryBookStore;
 
     /// Create a compressed InferenceCache with synthetic data.
-    fn compressed_cache(num_layers: usize, num_kv_heads: usize, head_dim: usize, n_tokens: usize) -> InferenceCache {
+    fn compressed_cache(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        n_tokens: usize,
+    ) -> InferenceCache {
         let mut cache = InferenceCache::new(num_layers, head_dim, num_kv_heads);
         if n_tokens > 0 {
             let shape = (1, num_kv_heads, n_tokens, head_dim);
             let k = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
-                .unwrap().to_dtype(DType::F16).unwrap();
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap();
             let v = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
-                .unwrap().to_dtype(DType::F16).unwrap();
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap();
             cache.layers[0] = Some((k, v));
             cache.position = n_tokens;
         }
@@ -374,9 +389,9 @@ mod tests {
         let mut store = MemoryBookStore::new();
 
         // Use v2 so we can round-trip through PrefillCacheHeader (which includes proofs).
-        let root = store_prefill_cache_with_proofs(
-            &cache, &model_cid, &token_ids, vec![], &mut store
-        ).unwrap();
+        let root =
+            store_prefill_cache_with_proofs(&cache, &model_cid, &token_ids, vec![], &mut store)
+                .unwrap();
 
         // Reassemble, patch quant_bits in header, re-store
         let blob = dag::reassemble(&root, &store).unwrap();
@@ -454,9 +469,9 @@ mod tests {
         let token_ids: Vec<u32> = (0..16).collect();
         let mut store = MemoryBookStore::new();
 
-        let root = store_prefill_cache_with_proofs(
-            &cache, &model_cid, &token_ids, vec![], &mut store
-        ).unwrap();
+        let root =
+            store_prefill_cache_with_proofs(&cache, &model_cid, &token_ids, vec![], &mut store)
+                .unwrap();
         let (_, header) = load_prefill_cache(&root, &model_cid, &store).unwrap();
         assert_eq!(header.magic, PREFILL_MAGIC_V2);
     }

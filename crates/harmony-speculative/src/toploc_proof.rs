@@ -15,10 +15,7 @@ use harmony_inference::InferenceCache;
 // serde_core (the workspace fork) only derives arrays up to size 32.
 // We serialize as a flat byte sequence: 128 * 2 = 256 bytes (little-endian).
 
-fn serialize_coefficients<S: Serializer>(
-    arr: &[u16; TOP_K],
-    s: S,
-) -> Result<S::Ok, S::Error> {
+fn serialize_coefficients<S: Serializer>(arr: &[u16; TOP_K], s: S) -> Result<S::Ok, S::Error> {
     let mut bytes = [0u8; TOP_K * 2];
     for (i, &v) in arr.iter().enumerate() {
         let le = v.to_le_bytes();
@@ -28,9 +25,7 @@ fn serialize_coefficients<S: Serializer>(
     s.serialize_bytes(&bytes)
 }
 
-fn deserialize_coefficients<'de, D: Deserializer<'de>>(
-    d: D,
-) -> Result<[u16; TOP_K], D::Error> {
+fn deserialize_coefficients<'de, D: Deserializer<'de>>(d: D) -> Result<[u16; TOP_K], D::Error> {
     use serde::de::Error;
     let bytes: &[u8] = serde::de::Deserialize::deserialize(d)?;
     if bytes.len() != TOP_K * 2 {
@@ -374,8 +369,7 @@ pub fn verify_proofs(
         // Note: mean_diff <= MEAN_DIFF_THRESHOLD is tautologically true since
         // agreeing_diffs is pre-filtered to values <= MEAN_DIFF_THRESHOLD.
         // The effective criteria are agreement rate + median diff.
-        let passed = agreement_rate >= AGREEMENT_THRESHOLD
-            && median_diff <= MEDIAN_DIFF_THRESHOLD;
+        let passed = agreement_rate >= AGREEMENT_THRESHOLD && median_diff <= MEDIAN_DIFF_THRESHOLD;
 
         details.push(ProofCheckDetail {
             layer: proof.layer,
@@ -400,22 +394,31 @@ pub fn verify_proofs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prefill::{
+        load_prefill_cache, store_prefill_cache_with_proofs, token_hash, PREFILL_MAGIC_V2,
+    };
     use candle_core::{DType, Device, Tensor};
     use harmony_content::book::MemoryBookStore;
     use harmony_content::cid::ContentId;
-    use crate::prefill::{
-        PREFILL_MAGIC_V2, store_prefill_cache_with_proofs, load_prefill_cache, token_hash,
-    };
 
-    fn make_cache_with_data(num_layers: usize, num_kv_heads: usize, head_dim: usize, n_tokens: usize) -> InferenceCache {
+    fn make_cache_with_data(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        n_tokens: usize,
+    ) -> InferenceCache {
         let mut cache = InferenceCache::new(num_layers, head_dim, num_kv_heads);
         if n_tokens > 0 {
             let shape = (1, num_kv_heads, n_tokens, head_dim);
             for layer in cache.layers.iter_mut() {
                 let k = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
-                    .unwrap().to_dtype(DType::F16).unwrap();
+                    .unwrap()
+                    .to_dtype(DType::F16)
+                    .unwrap();
                 let v = Tensor::rand(0f32, 1f32, shape, &Device::Cpu)
-                    .unwrap().to_dtype(DType::F16).unwrap();
+                    .unwrap()
+                    .to_dtype(DType::F16)
+                    .unwrap();
                 *layer = Some((k, v));
             }
             cache.position = n_tokens;
@@ -451,7 +454,11 @@ mod tests {
         header_with_proofs.proofs = proofs;
 
         let result = verify_proofs(&cache, &header_with_proofs).unwrap();
-        assert!(result.is_valid(), "verification should pass for identical cache: {:?}", result.details);
+        assert!(
+            result.is_valid(),
+            "verification should pass for identical cache: {:?}",
+            result.details
+        );
     }
 
     #[test]
@@ -470,7 +477,10 @@ mod tests {
         header_with_proofs.proofs = proofs;
 
         let result = verify_proofs(&tampered, &header_with_proofs).unwrap();
-        assert!(!result.is_valid(), "verification should fail for tampered cache");
+        assert!(
+            !result.is_valid(),
+            "verification should fail for tampered cache"
+        );
     }
 
     #[test]
@@ -487,9 +497,9 @@ mod tests {
         let model_cid = ContentId::for_book(b"test-model", Default::default()).unwrap();
         let mut store = MemoryBookStore::new();
 
-        let root = store_prefill_cache_with_proofs(
-            &cache, &model_cid, &token_ids, proofs, &mut store
-        ).unwrap();
+        let root =
+            store_prefill_cache_with_proofs(&cache, &model_cid, &token_ids, proofs, &mut store)
+                .unwrap();
 
         // Load and check proofs survived
         let (_, loaded_header) = load_prefill_cache(&root, &model_cid, &store).unwrap();

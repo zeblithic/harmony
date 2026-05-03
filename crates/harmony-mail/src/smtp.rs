@@ -1558,7 +1558,10 @@ mod tests {
         match &actions[0] {
             SmtpAction::SendResponse(code, msg) => {
                 assert_eq!(*code, 451);
-                assert!(msg.contains("please retry"), "message should be generic: {msg}");
+                assert!(
+                    msg.contains("please retry"),
+                    "message should be generic: {msg}"
+                );
             }
             other => panic!("expected SendResponse(451), got: {other:?}"),
         }
