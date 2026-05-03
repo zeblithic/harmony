@@ -205,10 +205,26 @@ pub enum RuntimeEvent {
     /// Tier 1: Client requests a Reticulum unicast send to a specific
     /// destination. Translated to `RuntimeAction::SendOnInterface` during
     /// the next tick by looking up `destination_hash` in the inner
-    /// router's path table. If the lookup misses, the request is logged
-    /// and dropped — retry/expiration semantics are the client's concern
-    /// (handled at the outbox layer in harmony-client per ZEB-216 Sub-B
-    /// Phase 3b).
+    /// router's path table.
+    ///
+    /// Path-table miss semantics (round-10 race+budget fix):
+    ///   - **While the router queue still has backlog** (e.g. announces
+    ///     queued in the same batch), the request is **deferred** —
+    ///     re-queued at the front of `pending_unicast_sends` for a later
+    ///     tick after the queued router events apply to the path table.
+    ///     This avoids spurious drops when an announce that would create
+    ///     the route is sitting one event behind in the same batch.
+    ///   - **Once the router queue fully drains** without producing the
+    ///     route, the request is logged at WARN and dropped.
+    ///   - Both deferred re-queues and final drops count against
+    ///     `router_max_per_tick` (round-11 budget fix) to bound per-tick
+    ///     latency — a defer-only tick cannot walk the entire pending
+    ///     queue.
+    ///
+    /// Retry/expiration semantics live above this surface — harmony-client's
+    /// outbox layer (ZEB-216 Sub-B Phase 3b, ZEB-227) owns retry policy,
+    /// 30-day expiration, and the user-visible "couldn't deliver" surface.
+    /// Callers MUST NOT assume immediate drop on miss.
     ///
     /// **`destination_hash` is a Reticulum destination hash, NOT a raw
     /// device identity hash.** The path table is keyed by destination
