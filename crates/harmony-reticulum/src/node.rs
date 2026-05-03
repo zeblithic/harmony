@@ -233,10 +233,23 @@ pub enum NodeAction {
         hops: u8,
     },
     /// A packet should be delivered to a locally registered destination.
+    ///
+    /// `source` is the remote sender's 16-byte identity hash. Reticulum data
+    /// packets do not carry the sender identity in their wire header — the
+    /// source is bound at the link layer (link handshake records the remote
+    /// identity in `Link::remote_identity`). The `Node` does not currently
+    /// track terminal-link state for non-transport delivery, so this field
+    /// is populated with `[0u8; 16]` at the construction site below until
+    /// link/identity binding is wired (ZEB-227, harmony-client Phase 3b).
+    /// Until then, the field carries the contract on the type so the runtime
+    /// dispatch path can surface a real identity once upstream code learns it.
+    ///
+    /// (ZEB-216 Sub-B Phase 3a — DM transport surface; field added in ZEB-226)
     DeliverLocally {
         destination_hash: DestinationHash,
         packet: Packet,
         interface_name: Arc<str>,
+        source: [u8; 16],
     },
     /// Expired paths were removed from the path table.
     PathsExpired { count: usize },
@@ -1247,10 +1260,18 @@ impl Node {
 
         // 1. Local delivery takes priority
         if self.local_destinations.contains(&destination_hash) {
+            // Source identity is not present in the Reticulum wire header for
+            // generic data packets — it's bound at the link layer (handshake).
+            // The `Node` does not currently track terminal-link state for
+            // delivered packets; populating `[0u8; 16]` until ZEB-227 wires
+            // link → identity binding from harmony-client Phase 3b.
+            // The runtime's dispatch path forwards this field as-is to
+            // `RuntimeAction::UnicastReceived { source, .. }`.
             return vec![NodeAction::DeliverLocally {
                 destination_hash,
                 packet,
                 interface_name,
+                source: [0u8; 16],
             }];
         }
 

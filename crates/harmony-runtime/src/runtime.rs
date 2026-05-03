@@ -2385,6 +2385,23 @@ impl<B: BookStore> NodeRuntime<B> {
                         }
                     }
                 }
+                // ZEB-216 Sub-B Phase 3a — Task 3 (ZEB-226): surface inbound
+                // unicast packets to the client. Source identity travels on
+                // `NodeAction::DeliverLocally::source` (Option A — field
+                // added to the Reticulum action). The reticulum-layer
+                // construction site populates `[0u8; 16]` as a placeholder
+                // until link/identity binding lands in Phase 3b (ZEB-227).
+                NodeAction::DeliverLocally {
+                    destination_hash: _, // local; not surfaced to the client
+                    packet,
+                    interface_name: _, // diagnostic only at this layer
+                    source,
+                } => {
+                    out.push(RuntimeAction::UnicastReceived {
+                        source,
+                        packet: packet.data.to_vec(),
+                    });
+                }
                 // Other router actions are diagnostics — drop for now.
                 _ => {}
             }
@@ -4663,6 +4680,82 @@ mod tests {
             }
             _ => panic!("expected SendUnicastToDevice variant"),
         }
+    }
+
+    #[test]
+    fn dispatch_router_actions_surfaces_deliver_locally_as_unicast_received() {
+        // ZEB-216 Sub-B Phase 3a — Task 3: inbound wiring.
+        //
+        // Construct a NodeAction::DeliverLocally with a known source +
+        // packet, feed it through dispatch_router_actions, and assert
+        // that the runtime emits exactly one RuntimeAction::UnicastReceived
+        // carrying the same source + packet bytes.
+        //
+        // Source resolution approach (Option A): a `source: [u8; 16]`
+        // field is added directly to NodeAction::DeliverLocally so the
+        // identity travels with the action. The reticulum-layer
+        // construction site populates it as a placeholder for now (real
+        // link-state binding is deferred to Phase 3b in harmony-client).
+        // For this dispatch-layer test we construct the action directly
+        // and pin a non-zero source, which exercises the full wiring
+        // independent of the upstream construction-site placeholder.
+        use harmony_reticulum::packet::{
+            DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType,
+            PropagationType,
+        };
+
+        let (mut rt, _startup) = make_runtime();
+
+        let dest_hash = [0x42u8; 16];
+        let source = [0xcdu8; 16];
+        let payload: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef];
+
+        let packet = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: dest_hash,
+                context: harmony_reticulum::PacketContext::None,
+            },
+            data: Arc::from(payload.clone().into_boxed_slice()),
+        };
+
+        let node_actions = vec![NodeAction::DeliverLocally {
+            destination_hash: dest_hash,
+            packet,
+            interface_name: Arc::from("test"),
+            source,
+        }];
+
+        let mut out: Vec<RuntimeAction> = Vec::new();
+        rt.dispatch_router_actions(node_actions, &mut out);
+
+        let unicast: Vec<_> = out
+            .iter()
+            .filter_map(|a| match a {
+                RuntimeAction::UnicastReceived { source, packet } => {
+                    Some((*source, packet.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            unicast.len(),
+            1,
+            "expected exactly one UnicastReceived, got actions: {:?}",
+            out
+        );
+        assert_eq!(unicast[0].0, source, "source identity must round-trip");
+        assert_eq!(unicast[0].1, payload, "packet bytes must round-trip");
     }
 
     #[test]
