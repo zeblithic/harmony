@@ -2023,11 +2023,30 @@ impl<B: BookStore> NodeRuntime<B> {
                     .handle(StorageTierEvent::S3ReadFailed { cid, query_id });
                 self.dispatch_storage_actions_inline(storage_actions);
             }
-            RuntimeEvent::SendUnicastToDevice { .. } => {
-                // Placeholder arm — variant exists from ZEB-226 Task 1 (this
-                // commit) so harmony-client can build against it. Translation
-                // to RuntimeAction::SendOnInterface is wired in Task 4. The
-                // explicit no-op keeps the match exhaustive without a wildcard.
+            RuntimeEvent::SendUnicastToDevice { target, packet } => {
+                // ZEB-216 Sub-B Phase 3a — Task 4 (ZEB-226): outbound wiring.
+                //
+                // Resolve the target identity hash to a reachable interface
+                // through the inner Reticulum router's path table. A hit
+                // means we have a learned route (from a prior announce);
+                // we then forward through `Node::route_packet` so IFAC
+                // masking and the existing send_on_interface plumbing run
+                // unchanged. A miss is logged at WARN and dropped — the
+                // harmony-client outbox layer (Phase 3b, ZEB-227) owns
+                // retry/expiration semantics on top of this surface.
+                if self.router.path_table().get(&target).is_some() {
+                    let node_actions = self.router.route_packet(&target, packet);
+                    let mut out = std::mem::take(&mut self.pending_direct_actions);
+                    self.dispatch_router_actions(node_actions, &mut out);
+                    self.pending_direct_actions = out;
+                } else {
+                    tracing::warn!(
+                        target_first_4 = ?&target[..4],
+                        packet_len = packet.len(),
+                        "SendUnicastToDevice target unknown — dropping. \
+                         Client (harmony-client) owns retry/expiration via outbox."
+                    );
+                }
             }
         }
     }
@@ -4756,6 +4775,123 @@ mod tests {
         );
         assert_eq!(unicast[0].0, source, "source identity must round-trip");
         assert_eq!(unicast[0].1, payload, "packet bytes must round-trip");
+    }
+
+    #[test]
+    fn send_unicast_to_device_emits_send_on_interface_for_known_target() {
+        // ZEB-216 Sub-B Phase 3a — Task 4: outbound wiring (happy path).
+        //
+        // Approach: target → interface lookup goes through the inner
+        // Reticulum router's path table (`Node::path_table`). The default
+        // NodeRuntime registers a `udp0` interface on construction, so
+        // we pre-seed a path entry pointing the target hash at `udp0`
+        // via the `path_table_mut()` test seam (added on Node alongside
+        // the existing read-only `path_table()` accessor).
+        //
+        // Then we feed RuntimeEvent::SendUnicastToDevice and tick(),
+        // expecting exactly one RuntimeAction::SendOnInterface routed
+        // to `udp0` with the original packet bytes (udp0 has no IFAC,
+        // so masking is a no-op and the bytes round-trip unchanged).
+        use harmony_reticulum::path_table::PathUpdateResult;
+
+        let (mut rt, _startup) = make_runtime();
+
+        let target = [0xaau8; 16];
+        let payload: Vec<u8> = vec![0x01, 0x02, 0x03];
+
+        // Seed the path table directly. Build a minimal random_blob
+        // (10 bytes; last 5 carry the announce timestamp). The exact
+        // values don't matter — we just need a valid entry that
+        // route_packet() will resolve to udp0.
+        let random_blob = {
+            let mut b = [0u8; 10];
+            let ts: u64 = 1000;
+            let ts_bytes = ts.to_be_bytes();
+            b[5..10].copy_from_slice(&ts_bytes[3..8]);
+            b
+        };
+        let result = rt.router.path_table_mut().update(
+            target,
+            target, // next_hop = target itself (single-hop)
+            0,      // hops
+            Arc::from("udp0"),
+            [0u8; 16], // announce_packet_hash
+            random_blob,
+            harmony_reticulum::InterfaceMode::Full,
+            1000,
+        );
+        assert_eq!(
+            result,
+            PathUpdateResult::Inserted,
+            "test seed should have inserted a fresh entry"
+        );
+
+        rt.push_event(RuntimeEvent::SendUnicastToDevice {
+            target,
+            packet: payload.clone(),
+        });
+        let actions = rt.tick();
+
+        let sends: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                RuntimeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                    weight,
+                } => Some((interface_name.clone(), raw.clone(), *weight)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            sends.len(),
+            1,
+            "expected exactly one SendOnInterface for the known target, \
+             got actions: {:?}",
+            actions
+        );
+        assert_eq!(
+            &*sends[0].0, "udp0",
+            "interface_name should match the seeded path-table entry"
+        );
+        assert_eq!(sends[0].1, payload, "packet bytes must round-trip");
+        assert_eq!(
+            sends[0].2, None,
+            "directed unicast send carries weight=None (not broadcast)"
+        );
+    }
+
+    #[test]
+    fn send_unicast_to_device_drops_for_unknown_target() {
+        // ZEB-216 Sub-B Phase 3a — Task 4: outbound wiring (unknown target).
+        //
+        // With an empty path table, the runtime cannot resolve the target
+        // to an interface. Phase 3a behavior: log a WARN and drop the
+        // packet — retry/expiration semantics live in harmony-client's
+        // outbox layer (ZEB-216 Sub-B Phase 3b). Here we assert that
+        // the runtime does NOT produce any SendOnInterface action.
+        let (mut rt, _startup) = make_runtime();
+
+        let target = [0x99u8; 16];
+        let payload: Vec<u8> = vec![0xaa, 0xbb];
+
+        rt.push_event(RuntimeEvent::SendUnicastToDevice {
+            target,
+            packet: payload.clone(),
+        });
+        let actions = rt.tick();
+
+        let sends: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .collect();
+
+        assert!(
+            sends.is_empty(),
+            "expected no SendOnInterface for unknown target, got: {:?}",
+            sends
+        );
     }
 
     #[test]

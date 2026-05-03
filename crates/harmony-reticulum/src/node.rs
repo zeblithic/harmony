@@ -724,6 +724,17 @@ impl Node {
         &self.path_table
     }
 
+    /// Mutable access to the path table.
+    ///
+    /// Primarily intended for tests and bootstrap paths that need to seed
+    /// routing entries directly (e.g. without a full announce flow).
+    /// Production code should prefer driving updates through
+    /// `process_inbound` (real announces) so cooperation scoring,
+    /// reverse-table bookkeeping, and replay detection all stay in sync.
+    pub fn path_table_mut(&mut self) -> &mut PathTable {
+        &mut self.path_table
+    }
+
     /// Number of registered interfaces.
     pub fn interface_count(&self) -> usize {
         self.interfaces.len()
