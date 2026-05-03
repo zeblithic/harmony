@@ -1279,6 +1279,15 @@ impl<B: BookStore> NodeRuntime<B> {
         self.router_queue.len()
     }
 
+    /// Number of pending unicast sends (`RuntimeEvent::SendUnicastToDevice`)
+    /// awaiting drain on the next `tick()`. Test-only seam — round-10
+    /// review (ZEB-226) added budget + defer-on-miss semantics that need
+    /// queue-length introspection to assert.
+    #[doc(hidden)]
+    pub fn pending_unicast_sends_len(&self) -> usize {
+        self.pending_unicast_sends.len()
+    }
+
     /// Number of pending Tier 2 (storage) events.
     pub fn storage_queue_len(&self) -> usize {
         self.storage_queue.len()
@@ -2178,18 +2187,58 @@ impl<B: BookStore> NodeRuntime<B> {
 
                     // ZEB-216 Sub-B Phase 3a — Task 4 (ZEB-226): drain
                     // queued unicast sends AFTER the router queue. Any
-                    // announces in the same batch have now been applied
-                    // to the path table, so the lookup sees fresh state.
-                    // A path-table miss is logged at WARN and dropped —
-                    // harmony-client's outbox (Phase 3b, ZEB-227) owns
-                    // retry/expiration semantics on top of this surface.
-                    while let Some((destination_hash, packet)) =
-                        self.pending_unicast_sends.pop_front()
-                    {
+                    // announces drained in this tick have now been
+                    // applied to the path table, so the lookup sees
+                    // fresh state for that batch.
+                    //
+                    // Round-10 review fixes (ZEB-226):
+                    // - **Defer-on-miss when router still has work
+                    //   (Finding 1, race).** If `router_max_per_tick`
+                    //   capped the router-queue drain, an announce that
+                    //   would have created the route may still be
+                    //   queued. Treating that as "unknown" would drop
+                    //   the unicast even though next tick's announce
+                    //   drain would populate the path table. So we
+                    //   capture `router_queue_drained` BEFORE this loop
+                    //   and only log+drop when the router is fully
+                    //   drained — otherwise re-queue for the next tick.
+                    // - **Bound the unicast drain by `router_max_per_tick`
+                    //   (Finding 3, latency).** Every other Tier 1 queue
+                    //   respects this budget; an unbounded unicast burst
+                    //   would block the tick loop. Drops also count
+                    //   against the budget so a flood of unknown targets
+                    //   can't bypass the cap.
+                    //
+                    // Final fallback (router fully drained AND route
+                    // still missing) remains: WARN + drop. The client's
+                    // outbox (Phase 3b, ZEB-227) owns retry/expiration
+                    // semantics on top of this surface.
+                    let router_queue_drained = self.router_queue.is_empty();
+                    let unicast_limit = self.schedule.router_max_per_tick.unwrap_or(usize::MAX);
+                    let mut processed_unicasts = 0usize;
+                    let mut deferred_unicasts: VecDeque<([u8; 16], Vec<u8>)> = VecDeque::new();
+                    while processed_unicasts < unicast_limit {
+                        let Some((destination_hash, packet)) =
+                            self.pending_unicast_sends.pop_front()
+                        else {
+                            break;
+                        };
                         if self.router.path_table().get(&destination_hash).is_some() {
                             let node_actions = self.router.route_packet(&destination_hash, packet);
                             self.dispatch_router_actions(node_actions, &mut actions);
+                            processed_unicasts += 1;
+                        } else if !router_queue_drained {
+                            // Router queue still has unprocessed events
+                            // (possibly an announce that would create
+                            // this route). Defer rather than drop —
+                            // re-queue for the next tick when those
+                            // announces have applied to the path table.
+                            deferred_unicasts.push_back((destination_hash, packet));
                         } else {
+                            // Router fully drained yet route still
+                            // missing — genuine miss. Count drops
+                            // against the budget too so a flood of
+                            // unknown targets can't bypass the cap.
                             tracing::warn!(
                                 destination_hash_first_4 = ?&destination_hash[..4],
                                 packet_len = packet.len(),
@@ -2197,7 +2246,15 @@ impl<B: BookStore> NodeRuntime<B> {
                                  dropping. Client (harmony-client) owns retry/\
                                  expiration via outbox."
                             );
+                            processed_unicasts += 1;
                         }
+                    }
+                    // Re-queue deferred entries at the FRONT so they
+                    // retain their arrival-order priority over any
+                    // unicasts pushed in subsequent ticks. extend() at
+                    // the back would reorder them behind newer events.
+                    for entry in deferred_unicasts.into_iter().rev() {
+                        self.pending_unicast_sends.push_front(entry);
                     }
                 }
                 1 => {
@@ -4957,6 +5014,176 @@ mod tests {
             "expected no SendOnInterface for unknown target, got: {:?}",
             sends
         );
+    }
+
+    #[test]
+    fn unicast_drain_respects_router_max_per_tick() {
+        // ZEB-226 round-10 review (Finding 3, latency budget): the
+        // pending_unicast_sends drain in tick() must respect
+        // `router_max_per_tick` like every other Tier 1 queue. A burst
+        // of unicasts must NOT block the tick loop. With limit=2 and
+        // 5 queued unicasts to a known target, the first tick should
+        // process 2 (emit 2 SendOnInterface) and leave 3 in the queue
+        // for the next tick.
+        use harmony_reticulum::path_table::PathUpdateResult;
+
+        let mut config = NodeConfig::default();
+        config.schedule.router_max_per_tick = Some(2);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        // Seed a path so all sends resolve to udp0 (avoids the
+        // unknown-target drop path; we want to exercise the budget,
+        // not the drop semantics).
+        let target = [0xa1u8; 16];
+        let random_blob = {
+            let mut b = [0u8; 10];
+            let ts: u64 = 1000;
+            let ts_bytes = ts.to_be_bytes();
+            b[5..10].copy_from_slice(&ts_bytes[3..8]);
+            b
+        };
+        let result = rt.router.path_table_mut_for_tests().update(
+            target,
+            target,
+            0,
+            Arc::from("udp0"),
+            [0u8; 16],
+            random_blob,
+            harmony_reticulum::InterfaceMode::Full,
+            1000,
+        );
+        assert_eq!(result, PathUpdateResult::Inserted);
+
+        for _ in 0..5 {
+            rt.push_event(RuntimeEvent::SendUnicastToDevice {
+                destination_hash: target,
+                packet: vec![0xde, 0xad],
+            });
+        }
+        assert_eq!(rt.pending_unicast_sends_len(), 5);
+
+        let actions = rt.tick();
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
+        assert_eq!(
+            send_count, 2,
+            "first tick must process exactly router_max_per_tick=2 unicasts, \
+             got actions: {:?}",
+            actions
+        );
+        assert_eq!(
+            rt.pending_unicast_sends_len(),
+            3,
+            "remaining 3 unicasts must stay queued for the next tick"
+        );
+
+        let actions = rt.tick();
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
+        assert_eq!(send_count, 2, "second tick processes another 2");
+        assert_eq!(rt.pending_unicast_sends_len(), 1);
+
+        let actions = rt.tick();
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
+        assert_eq!(send_count, 1, "third tick processes the final 1");
+        assert_eq!(rt.pending_unicast_sends_len(), 0);
+    }
+
+    #[test]
+    fn unicast_defers_when_router_queue_has_backlog() {
+        // ZEB-226 round-10 review (Finding 1, race): if the router queue
+        // has unprocessed events (e.g. an announce that would create the
+        // route for a queued unicast), a path-table miss must DEFER
+        // (re-queue), not drop. Otherwise an announce + send-to-just-
+        // -announced-target submitted in the same batch loses the send
+        // when `router_max_per_tick` caps the announce drain.
+        //
+        // Race-window proxy: capture `router_queue_drained` happens
+        // AFTER the router-queue drain inside tick(), so it reflects
+        // whatever's still queued post-drain. To force is_empty()=false
+        // at unicast-drain time, we need >1 router event AND a cap that
+        // can't drain them all in one tick. Two TimerTicks + cap=1 fits:
+        // one TimerTick is processed, one is left queued, the unicast
+        // sees the leftover and defers instead of dropping.
+        let mut config = NodeConfig::default();
+        config.schedule.router_max_per_tick = Some(1);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        // Two router events; cap=1 means after the router drain the
+        // queue still has 1. The unicast drain will see `router_queue`
+        // non-empty and defer the unknown-target unicast.
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 0,
+        });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1001,
+            unix_now: 0,
+        });
+        assert_eq!(rt.router_queue_len(), 2);
+
+        // Push a unicast to an unknown destination. With the round-10
+        // fix, this MUST be deferred (router queue still has backlog),
+        // NOT dropped — even though the path-table lookup misses.
+        let unknown = [0x77u8; 16];
+        rt.push_event(RuntimeEvent::SendUnicastToDevice {
+            destination_hash: unknown,
+            packet: vec![0xbe, 0xef],
+        });
+        assert_eq!(rt.pending_unicast_sends_len(), 1);
+
+        let actions = rt.tick();
+
+        // Router cap=1 means 1 TimerTick processed, 1 still queued.
+        // Critically: the unicast sees router_queue still non-empty and
+        // DEFERS (no warn-and-drop, no SendOnInterface, the unicast
+        // stays queued for next tick).
+        assert_eq!(
+            rt.router_queue_len(),
+            1,
+            "router cap=1 leaves the second TimerTick queued"
+        );
+        assert_eq!(
+            rt.pending_unicast_sends_len(),
+            1,
+            "unicast must be DEFERRED (re-queued) — not dropped — \
+             because the router queue still has backlog this tick"
+        );
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
+        assert_eq!(
+            send_count, 0,
+            "deferred unicast must NOT have produced a SendOnInterface \
+             (no real route, just a defer); got actions: {:?}",
+            actions
+        );
+
+        // Second tick: router queue drains the second TimerTick (now
+        // empty), then the unicast drain sees router_queue_drained=true
+        // AND the route is still unknown — finally the genuine drop
+        // path fires. Unicast leaves the queue, no SendOnInterface.
+        let actions = rt.tick();
+        assert_eq!(rt.router_queue_len(), 0);
+        assert_eq!(
+            rt.pending_unicast_sends_len(),
+            0,
+            "second tick: router fully drained, unknown route → \
+             genuine drop after defer attempts exhausted"
+        );
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
+        assert_eq!(send_count, 0);
     }
 
     #[test]
