@@ -2217,9 +2217,14 @@ impl<B: BookStore> NodeRuntime<B> {
                     // - **Bound the unicast drain by `router_max_per_tick`
                     //   (Finding 3, latency).** Every other Tier 1 queue
                     //   respects this budget; an unbounded unicast burst
-                    //   would block the tick loop. Drops also count
-                    //   against the budget so a flood of unknown targets
-                    //   can't bypass the cap.
+                    //   would block the tick loop. Round-11 fix
+                    //   (CodeRabbit Major / Greptile P1): the budget
+                    //   counter is incremented at the TOP of the loop so
+                    //   ALL three branches (route, defer, drop) consume
+                    //   budget. The previous shape only counted route
+                    //   and drop, so a defer-only tick (router queue has
+                    //   backlog) could walk the entire pending queue in
+                    //   one tick and bypass the cap.
                     //
                     // Final fallback (router fully drained AND route
                     // still missing) remains: WARN + drop. The client's
@@ -2235,10 +2240,14 @@ impl<B: BookStore> NodeRuntime<B> {
                         else {
                             break;
                         };
+                        // Round-11 fix: count BEFORE branching so defer
+                        // (and drop, and route) all consume one budget
+                        // slot. Without this, the defer branch can
+                        // walk the entire queue in a single tick.
+                        processed_unicasts += 1;
                         if self.router.path_table().get(&destination_hash).is_some() {
                             let node_actions = self.router.route_packet(&destination_hash, packet);
                             self.dispatch_router_actions(node_actions, &mut actions);
-                            processed_unicasts += 1;
                         } else if !router_queue_drained {
                             // Router queue still has unprocessed events
                             // (possibly an announce that would create
@@ -2248,9 +2257,8 @@ impl<B: BookStore> NodeRuntime<B> {
                             deferred_unicasts.push_back((destination_hash, packet));
                         } else {
                             // Router fully drained yet route still
-                            // missing — genuine miss. Count drops
-                            // against the budget too so a flood of
-                            // unknown targets can't bypass the cap.
+                            // missing — genuine miss. Log and drop;
+                            // budget already consumed at top of loop.
                             tracing::warn!(
                                 destination_hash_first_4 = ?&destination_hash[..4],
                                 packet_len = packet.len(),
@@ -2258,7 +2266,6 @@ impl<B: BookStore> NodeRuntime<B> {
                                  dropping. Client (harmony-client) owns retry/\
                                  expiration via outbox."
                             );
-                            processed_unicasts += 1;
                         }
                     }
                     // Re-queue deferred entries at the FRONT so they
@@ -5214,6 +5221,123 @@ mod tests {
             .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
             .count();
         assert_eq!(send_count, 0);
+    }
+
+    #[test]
+    fn unicast_drain_defers_count_against_router_max_per_tick() {
+        // ZEB-226 round-11 fix (CodeRabbit Major / Greptile P1):
+        // deferred unicasts must consume the unicast budget, not just
+        // routed/dropped ones. Without this, a flood of unknown-target
+        // sends during any tick where the router has backlog can walk
+        // the entire pending_unicast_sends queue in a single tick,
+        // bypassing router_max_per_tick.
+        //
+        // Setup chosen to be observable in a SINGLE tick:
+        //   - router_max_per_tick = 2
+        //   - router_queue: 3 TimerTicks (post-drain has 1 left → drained=false)
+        //   - pending_unicast_sends: 3 unknown destinations FOLLOWED BY
+        //     1 known destination
+        //
+        // With the fix: budget=2 is consumed by 2 of the 3 unknown
+        // defers; the third unknown and the known target are NEVER
+        // popped this tick → 0 SendOnInterface emitted.
+        //
+        // Without the fix: defers don't count → all 3 unknowns get
+        // deferred and the loop continues to pop the known target,
+        // routing it → 1 SendOnInterface emitted. The bug bypasses
+        // the cap.
+        use harmony_reticulum::path_table::PathUpdateResult;
+
+        let mut config = NodeConfig::default();
+        config.schedule.router_max_per_tick = Some(2);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        // Seed a known path so the trailing known unicast WOULD route
+        // if the loop were to reach it.
+        let known_target = [0xa1u8; 16];
+        let random_blob = {
+            let mut b = [0u8; 10];
+            let ts: u64 = 1000;
+            let ts_bytes = ts.to_be_bytes();
+            b[5..10].copy_from_slice(&ts_bytes[3..8]);
+            b
+        };
+        let result = rt.router.path_table_mut_for_tests().update(
+            known_target,
+            known_target,
+            0,
+            Arc::from("udp0"),
+            [0u8; 16],
+            random_blob,
+            harmony_reticulum::InterfaceMode::Full,
+            1000,
+        );
+        assert_eq!(result, PathUpdateResult::Inserted);
+
+        // Push 3 router events; cap=2 means 1 leftover after drain →
+        // router_queue_drained=false at unicast-drain time.
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 0,
+        });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1001,
+            unix_now: 0,
+        });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1002,
+            unix_now: 0,
+        });
+        assert_eq!(rt.router_queue_len(), 3);
+
+        // Push 3 unknowns followed by 1 known. Order matters: the loop
+        // must hit unknowns first so the budget gets consumed by defers.
+        for i in 0..3u8 {
+            rt.push_event(RuntimeEvent::SendUnicastToDevice {
+                destination_hash: [0xb0 | i; 16],
+                packet: vec![0xde, 0xad],
+            });
+        }
+        rt.push_event(RuntimeEvent::SendUnicastToDevice {
+            destination_hash: known_target,
+            packet: vec![0xbe, 0xef],
+        });
+        assert_eq!(rt.pending_unicast_sends_len(), 4);
+
+        let actions = rt.tick();
+
+        // Router cap=2 leaves 1 TimerTick queued → router_queue_drained
+        // was false in the unicast loop.
+        assert_eq!(
+            rt.router_queue_len(),
+            1,
+            "router cap=2 with 3 events leaves 1 queued"
+        );
+
+        // CORE ASSERTION: with the fix, the 2 defers consumed the
+        // entire unicast budget. The known target was never reached,
+        // so NO SendOnInterface was emitted. Without the fix, the
+        // 3 defers wouldn't count and the loop would reach the known
+        // target → 1 SendOnInterface.
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
+        assert_eq!(
+            send_count, 0,
+            "unicast budget=2 must be consumed by the first 2 unknown \
+             defers, leaving the known target untouched. Got actions: {:?}",
+            actions
+        );
+
+        // pending_unicast_sends total: 2 deferred (re-pushed to front) +
+        // 1 unknown still untouched + 1 known still untouched = 4.
+        assert_eq!(
+            rt.pending_unicast_sends_len(),
+            4,
+            "all 4 unicasts still pending: 2 deferred, 2 untouched (1 \
+             unknown + 1 known) — none routed, none dropped"
+        );
     }
 
     #[test]
