@@ -738,6 +738,14 @@ impl Node {
     /// detection. Use this only in tests / bootstrap paths that need
     /// to seed routing entries without a real announce flow; production
     /// code MUST drive updates through the inbound path.
+    ///
+    /// Round-11 (Greptile P2): gated behind `cfg(test)` (in-crate
+    /// tests) OR the internal `test-seams` feature (downstream test
+    /// crates that need cross-crate access — currently
+    /// harmony-runtime's tests). `#[doc(hidden)]` was insufficient on
+    /// its own because it only hides from rustdoc; downstream crates
+    /// could still call the method in production builds.
+    #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn path_table_mut_for_tests(&mut self) -> &mut PathTable {
         &mut self.path_table

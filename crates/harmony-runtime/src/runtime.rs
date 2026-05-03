@@ -1294,9 +1294,11 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Number of pending unicast sends (`RuntimeEvent::SendUnicastToDevice`)
     /// awaiting drain on the next `tick()`. Test-only seam — round-10
     /// review (ZEB-226) added budget + defer-on-miss semantics that need
-    /// queue-length introspection to assert.
-    #[doc(hidden)]
-    pub fn pending_unicast_sends_len(&self) -> usize {
+    /// queue-length introspection to assert. Round-11 (Greptile P2):
+    /// crate-private (`pub(crate)`) since the consumers are all
+    /// in-crate tests; `#[doc(hidden)]` only hid from rustdoc and
+    /// would have left the seam callable from downstream crates.
+    pub(crate) fn pending_unicast_sends_len(&self) -> usize {
         self.pending_unicast_sends.len()
     }
 
