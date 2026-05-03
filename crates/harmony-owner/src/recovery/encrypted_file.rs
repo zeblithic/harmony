@@ -359,9 +359,11 @@ mod decrypt_tests {
         let mut bytes = fixture_bytes();
         // Mutate kdf_t low byte: 3 → 2.
         bytes[11] ^= 0x01;
-        let err = decrypt_inner(&bytes, &SecretString::from("correct".to_string()))
-            .unwrap_err();
-        assert!(matches!(err, RecoveryError::UnsupportedKdfParams { id: 0x01 }));
+        let err = decrypt_inner(&bytes, &SecretString::from("correct".to_string())).unwrap_err();
+        assert!(matches!(
+            err,
+            RecoveryError::UnsupportedKdfParams { id: 0x01 }
+        ));
     }
 
     #[test]

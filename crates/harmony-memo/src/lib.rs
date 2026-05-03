@@ -54,7 +54,9 @@ impl core::fmt::Display for MemoError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Credential(e) => write!(f, "credential error: {e}"),
-            Self::SelfAttestationViolated => write!(f, "memo issuer != subject (not self-attested)"),
+            Self::SelfAttestationViolated => {
+                write!(f, "memo issuer != subject (not self-attested)")
+            }
             Self::ClaimDecodingFailed => write!(f, "memo claim decoding failed"),
             Self::InputOutputMismatch => write!(f, "memo input/output does not match claim"),
             Self::SerializationError => write!(f, "memo serialization error"),
@@ -72,8 +74,7 @@ impl From<CredentialError> for MemoError {
 pub fn serialize(memo: &Memo) -> Result<Vec<u8>, MemoError> {
     let mut buf = Vec::new();
     buf.push(FORMAT_VERSION);
-    let inner =
-        postcard::to_allocvec(memo).map_err(|_| MemoError::SerializationError)?;
+    let inner = postcard::to_allocvec(memo).map_err(|_| MemoError::SerializationError)?;
     buf.extend_from_slice(&inner);
     Ok(buf)
 }

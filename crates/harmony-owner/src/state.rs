@@ -52,10 +52,7 @@ struct EnrollmentPair(
 );
 
 #[derive(Serialize, Deserialize)]
-struct LivenessPair(
-    #[serde(with = "crate::cbor::arr16")] [u8; 16],
-    LivenessCert,
-);
+struct LivenessPair(#[serde(with = "crate::cbor::arr16")] [u8; 16], LivenessCert);
 
 impl TryFrom<OwnerStateWire> for OwnerState {
     type Error = OwnerError;
@@ -182,7 +179,10 @@ impl From<OwnerState> for OwnerStateWire {
 
 impl OwnerState {
     pub fn new(owner_id: [u8; 16]) -> Self {
-        Self { owner_id, ..Default::default() }
+        Self {
+            owner_id,
+            ..Default::default()
+        }
     }
 
     pub fn add_enrollment(
@@ -192,27 +192,43 @@ impl OwnerState {
         active_window_secs: u64,
     ) -> Result<(), OwnerError> {
         if cert.owner_id != self.owner_id {
-            return Err(OwnerError::WrongOwner { expected: self.owner_id, got: cert.owner_id });
+            return Err(OwnerError::WrongOwner {
+                expected: self.owner_id,
+                got: cert.owner_id,
+            });
         }
         // Remove-Wins revocation is permanent: a revoked device_id cannot be
         // re-enrolled (would silently overwrite the stored bundle, even though
         // the device stays revoked, breaking key linkage other code depends on).
         if self.is_revoked(cert.device_id) {
-            return Err(OwnerError::Revoked { device: cert.device_id });
+            return Err(OwnerError::Revoked {
+                device: cert.device_id,
+            });
         }
         cert.verify()?;
         // For Quorum certs, also walk back to verify each signer's enrollment
         // is present and was issued before this cert's `issued_at`.
-        if let EnrollmentIssuer::Quorum { signers, signatures } = &cert.issuer {
+        if let EnrollmentIssuer::Quorum {
+            signers,
+            signatures,
+        } = &cert.issuer
+        {
             if signers.len() < 2 {
-                return Err(OwnerError::InsufficientQuorum { min: 2, got: signers.len() });
+                return Err(OwnerError::InsufficientQuorum {
+                    min: 2,
+                    got: signers.len(),
+                });
             }
             if signers.len() != signatures.len() {
-                return Err(OwnerError::InvalidSignature { cert_type: "Enrollment-Quorum-Length-Mismatch" });
+                return Err(OwnerError::InvalidSignature {
+                    cert_type: "Enrollment-Quorum-Length-Mismatch",
+                });
             }
             let unique: std::collections::HashSet<[u8; 16]> = signers.iter().copied().collect();
             if unique.len() != signers.len() {
-                return Err(OwnerError::InvalidSignature { cert_type: "Enrollment-Quorum-Duplicate-Signer" });
+                return Err(OwnerError::InvalidSignature {
+                    cert_type: "Enrollment-Quorum-Duplicate-Signer",
+                });
             }
             for signer_id in signers {
                 if self.is_revoked(*signer_id) {
@@ -237,13 +253,24 @@ impl OwnerState {
             // across iterations — compute it once.
             let payload_bytes = quorum_signing_payload(&cert)?;
             for (signer_id, sig) in signers.iter().zip(signatures.iter()) {
-                let signer_enrollment = self.enrollments.get(signer_id)
-                    .ok_or(OwnerError::NotEnrolled { owner: self.owner_id, device: *signer_id })?;
+                let signer_enrollment =
+                    self.enrollments
+                        .get(signer_id)
+                        .ok_or(OwnerError::NotEnrolled {
+                            owner: self.owner_id,
+                            device: *signer_id,
+                        })?;
                 if signer_enrollment.issued_at > cert.issued_at {
-                    return Err(OwnerError::InvalidSignature { cert_type: "Enrollment-Quorum-Backdated-Signer" });
+                    return Err(OwnerError::InvalidSignature {
+                        cert_type: "Enrollment-Quorum-Backdated-Signer",
+                    });
                 }
-                let vk = VerifyingKey::from_bytes(&signer_enrollment.device_pubkeys.classical.ed25519_verify)
-                    .map_err(|_| OwnerError::InvalidSignature { cert_type: "Enrollment-Quorum-Member" })?;
+                let vk = VerifyingKey::from_bytes(
+                    &signer_enrollment.device_pubkeys.classical.ed25519_verify,
+                )
+                .map_err(|_| OwnerError::InvalidSignature {
+                    cert_type: "Enrollment-Quorum-Member",
+                })?;
                 crate::signing::verify_with_tag(
                     &vk,
                     crate::signing::tags::ENROLLMENT,
@@ -276,34 +303,60 @@ impl OwnerState {
 
     pub fn add_liveness(&mut self, cert: LivenessCert) -> Result<(), OwnerError> {
         if cert.owner_id != self.owner_id {
-            return Err(OwnerError::WrongOwner { expected: self.owner_id, got: cert.owner_id });
+            return Err(OwnerError::WrongOwner {
+                expected: self.owner_id,
+                got: cert.owner_id,
+            });
         }
         if self.is_revoked(cert.signer) {
-            return Err(OwnerError::Revoked { device: cert.signer });
+            return Err(OwnerError::Revoked {
+                device: cert.signer,
+            });
         }
-        let enrollment = self.enrollments.get(&cert.signer)
-            .ok_or(OwnerError::NotEnrolled { owner: self.owner_id, device: cert.signer })?;
+        let enrollment = self
+            .enrollments
+            .get(&cert.signer)
+            .ok_or(OwnerError::NotEnrolled {
+                owner: self.owner_id,
+                device: cert.signer,
+            })?;
         let vk = VerifyingKey::from_bytes(&enrollment.device_pubkeys.classical.ed25519_verify)
-            .map_err(|_| OwnerError::InvalidSignature { cert_type: "Liveness" })?;
+            .map_err(|_| OwnerError::InvalidSignature {
+                cert_type: "Liveness",
+            })?;
         cert.verify(&vk)?;
         match self.liveness.get(&cert.signer) {
             Some(existing) if existing.timestamp >= cert.timestamp => { /* keep newer */ }
-            _ => { self.liveness.insert(cert.signer, cert); }
+            _ => {
+                self.liveness.insert(cert.signer, cert);
+            }
         }
         Ok(())
     }
 
     pub fn add_vouching(&mut self, cert: crate::certs::VouchingCert) -> Result<(), OwnerError> {
         if cert.owner_id != self.owner_id {
-            return Err(OwnerError::WrongOwner { expected: self.owner_id, got: cert.owner_id });
+            return Err(OwnerError::WrongOwner {
+                expected: self.owner_id,
+                got: cert.owner_id,
+            });
         }
         if self.is_revoked(cert.signer) {
-            return Err(OwnerError::Revoked { device: cert.signer });
+            return Err(OwnerError::Revoked {
+                device: cert.signer,
+            });
         }
-        let enrollment = self.enrollments.get(&cert.signer)
-            .ok_or(OwnerError::NotEnrolled { owner: self.owner_id, device: cert.signer })?;
+        let enrollment = self
+            .enrollments
+            .get(&cert.signer)
+            .ok_or(OwnerError::NotEnrolled {
+                owner: self.owner_id,
+                device: cert.signer,
+            })?;
         let vk = VerifyingKey::from_bytes(&enrollment.device_pubkeys.classical.ed25519_verify)
-            .map_err(|_| OwnerError::InvalidSignature { cert_type: "Vouching" })?;
+            .map_err(|_| OwnerError::InvalidSignature {
+                cert_type: "Vouching",
+            })?;
         cert.verify(&vk)?;
         self.vouching.insert(cert);
         Ok(())
@@ -311,15 +364,26 @@ impl OwnerState {
 
     pub fn add_revocation(&mut self, cert: crate::certs::RevocationCert) -> Result<(), OwnerError> {
         if cert.owner_id != self.owner_id {
-            return Err(OwnerError::WrongOwner { expected: self.owner_id, got: cert.owner_id });
+            return Err(OwnerError::WrongOwner {
+                expected: self.owner_id,
+                got: cert.owner_id,
+            });
         }
         // SelfDevice verification needs the device's pubkey from its enrollment.
         match &cert.issuer {
             crate::certs::RevocationIssuer::SelfDevice => {
-                let enrollment = self.enrollments.get(&cert.target)
-                    .ok_or(OwnerError::NotEnrolled { owner: self.owner_id, device: cert.target })?;
-                let vk = VerifyingKey::from_bytes(&enrollment.device_pubkeys.classical.ed25519_verify)
-                    .map_err(|_| OwnerError::InvalidSignature { cert_type: "Revocation" })?;
+                let enrollment =
+                    self.enrollments
+                        .get(&cert.target)
+                        .ok_or(OwnerError::NotEnrolled {
+                            owner: self.owner_id,
+                            device: cert.target,
+                        })?;
+                let vk =
+                    VerifyingKey::from_bytes(&enrollment.device_pubkeys.classical.ed25519_verify)
+                        .map_err(|_| OwnerError::InvalidSignature {
+                        cert_type: "Revocation",
+                    })?;
                 cert.verify(Some(&vk))?;
             }
             crate::certs::RevocationIssuer::Quorum { .. } => {
@@ -335,7 +399,8 @@ impl OwnerState {
 
     pub fn active_devices(&self, now: u64, active_window_secs: u64) -> Vec<[u8; 16]> {
         let cutoff = now.saturating_sub(active_window_secs);
-        self.enrollments.keys()
+        self.enrollments
+            .keys()
             .filter(|id| !self.revocations.is_revoked(**id))
             .filter(|id| match self.liveness.get(*id) {
                 Some(l) => l.timestamp >= cutoff,
@@ -359,7 +424,11 @@ fn quorum_signing_payload(cert: &EnrollmentCert) -> Result<Vec<u8>, OwnerError> 
 
     let signers = match &cert.issuer {
         EnrollmentIssuer::Quorum { signers, .. } => signers,
-        _ => return Err(OwnerError::InvalidSignature { cert_type: "Enrollment-Quorum-Member" }),
+        _ => {
+            return Err(OwnerError::InvalidSignature {
+                cert_type: "Enrollment-Quorum-Member",
+            })
+        }
     };
 
     // issuer_data for Quorum = cbor(signers list), same as enrollment.rs
@@ -388,7 +457,10 @@ mod tests {
     fn keypair_and_bundle() -> (SigningKey, PubKeyBundle) {
         let sk = SigningKey::generate(&mut OsRng);
         let bundle = PubKeyBundle {
-            classical: ClassicalKeys { ed25519_verify: sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
+            classical: ClassicalKeys {
+                ed25519_verify: sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
             post_quantum: None,
         };
         (sk, bundle)
@@ -402,11 +474,23 @@ mod tests {
         let device_id = device_bundle.identity_hash();
 
         let enrollment = EnrollmentCert::sign_master(
-            &master_sk, master_bundle, device_id, device_bundle, 1_000_000, None
-        ).unwrap();
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000_000,
+            None,
+        )
+        .unwrap();
 
         let mut state = OwnerState::new(owner_id);
-        state.add_enrollment(enrollment, 1_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
+        state
+            .add_enrollment(
+                enrollment,
+                1_000_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
 
         let liveness = LivenessCert::sign(&device_sk, owner_id, 1_500_000).unwrap();
         state.add_liveness(liveness).unwrap();
@@ -423,19 +507,35 @@ mod tests {
         let device_id = device_bundle.identity_hash();
 
         let enrollment = EnrollmentCert::sign_master(
-            &master_sk, master_bundle, device_id, device_bundle, 1_000_000, None
-        ).unwrap();
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000_000,
+            None,
+        )
+        .unwrap();
 
         let mut state = OwnerState::new(owner_id);
-        state.add_enrollment(enrollment, 1_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
+        state
+            .add_enrollment(
+                enrollment,
+                1_000_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
 
         let liveness = LivenessCert::sign(&device_sk, owner_id, 1_500_000).unwrap();
         state.add_liveness(liveness).unwrap();
 
         let revocation = crate::certs::RevocationCert::sign_self(
-            &device_sk, owner_id, device_id, 1_400_000,
+            &device_sk,
+            owner_id,
+            device_id,
+            1_400_000,
             crate::certs::RevocationReason::Decommissioned,
-        ).unwrap();
+        )
+        .unwrap();
         state.add_revocation(revocation).unwrap();
 
         let active = state.active_devices(1_500_000, 24 * 60 * 60);
@@ -453,20 +553,30 @@ mod tests {
 
         // Cert under a different owner_id (just zero-bytes)
         let wrong_owner_cert = EnrollmentCert::sign_master(
-            &master_sk, master_bundle, device_id, device_bundle, 1_000_000, None
-        ).unwrap();
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000_000,
+            None,
+        )
+        .unwrap();
         let mut tampered = wrong_owner_cert;
         tampered.owner_id = [99u8; 16]; // simulate cross-owner cert
-        // (cert.verify() will fail first because owner_id mismatch breaks the signature,
-        //  but the OwnerState invariant is the first guard now)
-        let result = state.add_enrollment(tampered, 1_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS);
+                                        // (cert.verify() will fail first because owner_id mismatch breaks the signature,
+                                        //  but the OwnerState invariant is the first guard now)
+        let result = state.add_enrollment(
+            tampered,
+            1_000_000,
+            crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+        );
         assert!(matches!(result, Err(OwnerError::WrongOwner { .. })));
     }
 
     #[test]
     fn quorum_with_duplicate_signers_rejected() {
-        use crate::certs::{EnrollmentIssuer, EnrollmentCert};
         use crate::cbor;
+        use crate::certs::{EnrollmentCert, EnrollmentIssuer};
 
         // Build a state with one device A
         let (master_sk, master_bundle) = keypair_and_bundle();
@@ -474,9 +584,21 @@ mod tests {
         let (sk_a, bundle_a) = keypair_and_bundle();
         let device_a_id = bundle_a.identity_hash();
         let mut state = OwnerState::new(owner_id);
-        state.add_enrollment(EnrollmentCert::sign_master(
-            &master_sk, master_bundle.clone(), device_a_id, bundle_a, 1_000_000, None
-        ).unwrap(), 1_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
+        state
+            .add_enrollment(
+                EnrollmentCert::sign_master(
+                    &master_sk,
+                    master_bundle.clone(),
+                    device_a_id,
+                    bundle_a,
+                    1_000_000,
+                    None,
+                )
+                .unwrap(),
+                1_000_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
 
         // Forge a quorum cert with [A, A] — same signer twice
         let (_, bundle_c) = keypair_and_bundle();
@@ -504,8 +626,10 @@ mod tests {
             expires_at: None,
             issuer_kind: 1,
             issuer_data,
-        }).unwrap();
-        let sig_a = crate::signing::sign_with_tag(&sk_a, crate::signing::tags::ENROLLMENT, &payload_bytes);
+        })
+        .unwrap();
+        let sig_a =
+            crate::signing::sign_with_tag(&sk_a, crate::signing::tags::ENROLLMENT, &payload_bytes);
         let cert = EnrollmentCert {
             version: crate::certs::enrollment::ENROLLMENT_VERSION,
             owner_id,
@@ -519,7 +643,8 @@ mod tests {
             },
             signature: Vec::new(),
         };
-        let result = state.add_enrollment(cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS);
+        let result =
+            state.add_enrollment(cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS);
         // Defense-in-depth: EnrollmentCert::verify now also catches duplicate
         // signers (returning cert_type "Enrollment"), and that fires before
         // OwnerState's own "Enrollment-Quorum-Duplicate-Signer" check. Either
@@ -540,9 +665,21 @@ mod tests {
         let (sk_a, bundle_a) = keypair_and_bundle();
         let device_a_id = bundle_a.identity_hash();
         let mut state = OwnerState::new(owner_id);
-        state.add_enrollment(EnrollmentCert::sign_master(
-            &master_sk, master_bundle, device_a_id, bundle_a, 1_000_000, None
-        ).unwrap(), 1_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
+        state
+            .add_enrollment(
+                EnrollmentCert::sign_master(
+                    &master_sk,
+                    master_bundle,
+                    device_a_id,
+                    bundle_a,
+                    1_000_000,
+                    None,
+                )
+                .unwrap(),
+                1_000_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
 
         // Construct a Quorum revocation manually
         let cert = RevocationCert {
@@ -558,7 +695,10 @@ mod tests {
             signature: Vec::new(),
         };
         let result = state.add_revocation(cert);
-        assert!(matches!(result, Err(OwnerError::QuorumRevocationNotImplemented)));
+        assert!(matches!(
+            result,
+            Err(OwnerError::QuorumRevocationNotImplemented)
+        ));
     }
 
     #[test]
@@ -573,17 +713,41 @@ mod tests {
         let id_c = bundle_c.identity_hash();
 
         let mut state = OwnerState::new(owner_id);
-        state.add_enrollment(
-            EnrollmentCert::sign_master(&master_sk, master_bundle.clone(), id_a, bundle_a, 1_000_000, None).unwrap(),
-            1_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
-        ).unwrap();
-        state.add_enrollment(
-            EnrollmentCert::sign_master(&master_sk, master_bundle, id_c, bundle_c, 1_000_001, None).unwrap(),
-            1_000_001, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
-        ).unwrap();
+        state
+            .add_enrollment(
+                EnrollmentCert::sign_master(
+                    &master_sk,
+                    master_bundle.clone(),
+                    id_a,
+                    bundle_a,
+                    1_000_000,
+                    None,
+                )
+                .unwrap(),
+                1_000_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
+        state
+            .add_enrollment(
+                EnrollmentCert::sign_master(
+                    &master_sk,
+                    master_bundle,
+                    id_c,
+                    bundle_c,
+                    1_000_001,
+                    None,
+                )
+                .unwrap(),
+                1_000_001,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
 
         // A publishes liveness, C does not.
-        state.add_liveness(LivenessCert::sign(&sk_a, owner_id, 1_000_500).unwrap()).unwrap();
+        state
+            .add_liveness(LivenessCert::sign(&sk_a, owner_id, 1_000_500).unwrap())
+            .unwrap();
 
         // Attempt quorum enrollment of new device D using [A, C] — C is inactive.
         use crate::cbor;
@@ -601,9 +765,12 @@ mod tests {
             expires_at: None,
             issuer_kind: 1,
             issuer_data,
-        }).unwrap();
-        let sig_a = crate::signing::sign_with_tag(&sk_a, crate::signing::tags::ENROLLMENT, &payload_bytes);
-        let sig_c = crate::signing::sign_with_tag(&sk_c, crate::signing::tags::ENROLLMENT, &payload_bytes);
+        })
+        .unwrap();
+        let sig_a =
+            crate::signing::sign_with_tag(&sk_a, crate::signing::tags::ENROLLMENT, &payload_bytes);
+        let sig_c =
+            crate::signing::sign_with_tag(&sk_c, crate::signing::tags::ENROLLMENT, &payload_bytes);
         let cert = EnrollmentCert {
             version: crate::certs::enrollment::ENROLLMENT_VERSION,
             owner_id,
@@ -617,10 +784,13 @@ mod tests {
             },
             signature: Vec::new(),
         };
-        let result = state.add_enrollment(cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS);
+        let result =
+            state.add_enrollment(cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS);
         assert!(matches!(
             result,
-            Err(OwnerError::InvalidSignature { cert_type: "Enrollment-Quorum-Inactive-Signer" })
+            Err(OwnerError::InvalidSignature {
+                cert_type: "Enrollment-Quorum-Inactive-Signer"
+            })
         ));
     }
 
@@ -631,13 +801,29 @@ mod tests {
         let (sk_a, bundle_a) = keypair_and_bundle();
         let id_a = bundle_a.identity_hash();
         let mut state = OwnerState::new(owner_id);
-        state.add_enrollment(
-            EnrollmentCert::sign_master(&master_sk, master_bundle, id_a, bundle_a, 1_000_000, None).unwrap(),
-            1_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
-        ).unwrap();
+        state
+            .add_enrollment(
+                EnrollmentCert::sign_master(
+                    &master_sk,
+                    master_bundle,
+                    id_a,
+                    bundle_a,
+                    1_000_000,
+                    None,
+                )
+                .unwrap(),
+                1_000_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
         let rev = crate::certs::RevocationCert::sign_self(
-            &sk_a, owner_id, id_a, 1_000_500, crate::certs::RevocationReason::Compromised
-        ).unwrap();
+            &sk_a,
+            owner_id,
+            id_a,
+            1_000_500,
+            crate::certs::RevocationReason::Compromised,
+        )
+        .unwrap();
         state.add_revocation(rev).unwrap();
 
         let liveness = LivenessCert::sign(&sk_a, owner_id, 1_001_000).unwrap();
@@ -681,7 +867,9 @@ mod tests {
             state.add_enrollment(older, 2_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS);
         assert!(matches!(
             result,
-            Err(OwnerError::InvalidSignature { cert_type: "Enrollment-Rollback-Rejected" })
+            Err(OwnerError::InvalidSignature {
+                cert_type: "Enrollment-Rollback-Rejected"
+            })
         ));
     }
 
@@ -721,17 +909,14 @@ mod tests {
 
         // Re-enroll attempt with a fresh enrollment cert for the same device_id
         // — must be rejected because the device is revoked (Remove-Wins is permanent).
-        let new_cert = EnrollmentCert::sign_master(
-            &master_sk,
-            master_bundle,
-            id_a,
-            bundle_a,
+        let new_cert =
+            EnrollmentCert::sign_master(&master_sk, master_bundle, id_a, bundle_a, 1_001_000, None)
+                .unwrap();
+        let result = state.add_enrollment(
+            new_cert,
             1_001_000,
-            None,
-        )
-        .unwrap();
-        let result =
-            state.add_enrollment(new_cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS);
+            crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+        );
         assert!(matches!(result, Err(OwnerError::Revoked { device }) if device == id_a));
     }
 
@@ -977,18 +1162,39 @@ mod tests {
         let (sk_a, bundle_a) = keypair_and_bundle();
         let id_a = bundle_a.identity_hash();
         let mut state = OwnerState::new(owner_id);
-        state.add_enrollment(
-            EnrollmentCert::sign_master(&master_sk, master_bundle, id_a, bundle_a, 1_000_000, None).unwrap(),
-            1_000_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
-        ).unwrap();
+        state
+            .add_enrollment(
+                EnrollmentCert::sign_master(
+                    &master_sk,
+                    master_bundle,
+                    id_a,
+                    bundle_a,
+                    1_000_000,
+                    None,
+                )
+                .unwrap(),
+                1_000_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
         let rev = crate::certs::RevocationCert::sign_self(
-            &sk_a, owner_id, id_a, 1_000_500, crate::certs::RevocationReason::Compromised
-        ).unwrap();
+            &sk_a,
+            owner_id,
+            id_a,
+            1_000_500,
+            crate::certs::RevocationReason::Compromised,
+        )
+        .unwrap();
         state.add_revocation(rev).unwrap();
 
         let vouch = crate::certs::VouchingCert::sign(
-            &sk_a, owner_id, [9u8; 16], crate::certs::Stance::Vouch, 1_001_000
-        ).unwrap();
+            &sk_a,
+            owner_id,
+            [9u8; 16],
+            crate::certs::Stance::Vouch,
+            1_001_000,
+        )
+        .unwrap();
         let result = state.add_vouching(vouch);
         assert!(matches!(result, Err(OwnerError::Revoked { device }) if device == id_a));
     }

@@ -36,17 +36,15 @@
 
 use harmony_owner::lifecycle::mint::RecoveryArtifact;
 use harmony_owner::recovery::{
-    encrypt_with_params_for_test, FORMAT_STRING, NONCE_LEN, RecoveryFileBody, SALT_LEN,
+    encrypt_with_params_for_test, RecoveryFileBody, FORMAT_STRING, NONCE_LEN, SALT_LEN,
 };
 use secrecy::SecretString;
 use std::path::{Path, PathBuf};
 
 const FIXTURE_PASSPHRASE: &str = "harmony-recovery-fixture-v1";
 const FIXTURE_SEED: [u8; 32] = [
-    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
-    0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
-    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
 ];
 const FIXTURE_SALT: [u8; SALT_LEN] = [0x5A; SALT_LEN];
 const FIXTURE_NONCE: [u8; NONCE_LEN] = [0xA5; NONCE_LEN];
@@ -124,7 +122,11 @@ fn run_fixture_check(rel: &str, path: &Path, expected_fn: impl Fn() -> Vec<u8>) 
 #[test]
 fn wire_format_v1_full_metadata_pinned() {
     let path = fixture_path(FULL_FIXTURE_REL_PATH);
-    run_fixture_check(FULL_FIXTURE_REL_PATH, &path, deterministic_full_metadata_bytes);
+    run_fixture_check(
+        FULL_FIXTURE_REL_PATH,
+        &path,
+        deterministic_full_metadata_bytes,
+    );
 
     let on_disk = std::fs::read(&path).unwrap();
     let restored = RecoveryArtifact::from_encrypted_file(
@@ -146,7 +148,11 @@ fn wire_format_v1_full_metadata_pinned() {
 #[test]
 fn wire_format_v1_no_metadata_pinned() {
     let path = fixture_path(NO_METADATA_FIXTURE_REL_PATH);
-    run_fixture_check(NO_METADATA_FIXTURE_REL_PATH, &path, deterministic_no_metadata_bytes);
+    run_fixture_check(
+        NO_METADATA_FIXTURE_REL_PATH,
+        &path,
+        deterministic_no_metadata_bytes,
+    );
 
     let on_disk = std::fs::read(&path).unwrap();
     let restored = RecoveryArtifact::from_encrypted_file(

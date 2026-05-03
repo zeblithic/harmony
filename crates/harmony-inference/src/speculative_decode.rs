@@ -276,7 +276,12 @@ impl SpeculativeDecodeScheduler {
                 confidences,
                 cumulative_confidence,
                 effective_max_len,
-            } => (tokens, confidences, cumulative_confidence, *effective_max_len),
+            } => (
+                tokens,
+                confidences,
+                cumulative_confidence,
+                *effective_max_len,
+            ),
             SpecDecState::Idle => {
                 return Err(InferenceError::SpeculativeDecodeFailed(
                     "push_draft called while idle — call begin_draft first".into(),

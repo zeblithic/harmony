@@ -81,9 +81,9 @@ async fn build_remote_delivery(
     use std::time::Duration;
 
     let identity_bytes = std::fs::read(&config.gateway.identity_key)?;
-    let gateway_identity = Arc::new(
-        harmony_identity::PrivateIdentity::from_private_bytes(&identity_bytes)?
-    );
+    let gateway_identity = Arc::new(harmony_identity::PrivateIdentity::from_private_bytes(
+        &identity_bytes,
+    )?);
 
     let zenoh_config = match config.zenoh.as_ref() {
         Some(zc) if zc.enabled => zc.to_zenoh_config(),
@@ -91,38 +91,34 @@ async fn build_remote_delivery(
     }
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let zenoh_session = Arc::new(
-        zenoh::open(zenoh_config)
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e.to_string())) })?,
-    );
+    let zenoh_session = Arc::new(zenoh::open(zenoh_config).await.map_err(
+        |e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e.to_string())) },
+    )?);
 
-    let recipient_resolver: Arc<dyn harmony_mail::remote_delivery::RecipientResolver> = Arc::new(
-        harmony_mail::remote_delivery::ZenohRecipientResolver::new(
+    let recipient_resolver: Arc<dyn harmony_mail::remote_delivery::RecipientResolver> =
+        Arc::new(harmony_mail::remote_delivery::ZenohRecipientResolver::new(
             Arc::clone(&zenoh_session),
             Duration::from_secs(5),
-        ),
-    );
+        ));
 
     let dns: Arc<dyn harmony_mail_discovery::dns::DnsClient> = Arc::new(
         harmony_mail_discovery::dns::HickoryDnsClient::from_system(Duration::from_secs(5))?,
     );
-    let http: Arc<dyn harmony_mail_discovery::http::HttpClient> = Arc::new(
-        harmony_mail_discovery::http::ReqwestHttpClient::new(
+    let http: Arc<dyn harmony_mail_discovery::http::HttpClient> =
+        Arc::new(harmony_mail_discovery::http::ReqwestHttpClient::new(
             Duration::from_secs(5),
             Duration::from_secs(10),
             1_000_000,
-        )?,
-    );
+        )?);
     let time: Arc<dyn harmony_mail_discovery::cache::TimeSource> =
         Arc::new(harmony_mail_discovery::cache::SystemTimeSource);
 
-    let email_resolver = Arc::new(
-        harmony_mail_discovery::resolver::DefaultEmailResolver::new(
-            dns, http, time,
-            harmony_mail_discovery::resolver::ResolverConfig::default(),
-        ),
-    );
+    let email_resolver = Arc::new(harmony_mail_discovery::resolver::DefaultEmailResolver::new(
+        dns,
+        http,
+        time,
+        harmony_mail_discovery::resolver::ResolverConfig::default(),
+    ));
     email_resolver.spawn_background_refresh().await;
 
     Ok(harmony_mail::RemoteDeliveryContext {
@@ -199,14 +195,16 @@ async fn main() {
                 };
 
                 // Prompt for password
-                let password = rpassword::prompt_password_stderr("Password: ").unwrap_or_else(|e| {
-                    eprintln!("Error reading password: {e}");
-                    std::process::exit(1);
-                });
-                let confirm = rpassword::prompt_password_stderr("Confirm password: ").unwrap_or_else(|e| {
-                    eprintln!("Error reading password: {e}");
-                    std::process::exit(1);
-                });
+                let password =
+                    rpassword::prompt_password_stderr("Password: ").unwrap_or_else(|e| {
+                        eprintln!("Error reading password: {e}");
+                        std::process::exit(1);
+                    });
+                let confirm = rpassword::prompt_password_stderr("Confirm password: ")
+                    .unwrap_or_else(|e| {
+                        eprintln!("Error reading password: {e}");
+                        std::process::exit(1);
+                    });
                 if password != confirm {
                     eprintln!("Error: passwords do not match");
                     std::process::exit(1);
@@ -222,11 +220,12 @@ async fn main() {
                         eprintln!("Failed to load config from {config_path}: {e}");
                         std::process::exit(1);
                     });
-                let store = harmony_mail::imap_store::ImapStore::open(Path::new(&cfg.imap.store_path))
-                    .unwrap_or_else(|e| {
-                        eprintln!("Failed to open IMAP store: {e}");
-                        std::process::exit(1);
-                    });
+                let store =
+                    harmony_mail::imap_store::ImapStore::open(Path::new(&cfg.imap.store_path))
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to open IMAP store: {e}");
+                            std::process::exit(1);
+                        });
 
                 match store.create_user(&name, &password, &addr_bytes) {
                     Ok(()) => println!("User '{name}' created successfully"),

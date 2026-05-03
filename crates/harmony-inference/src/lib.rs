@@ -29,34 +29,33 @@ pub mod harmony_model;
 #[cfg(feature = "kv-compress")]
 pub(crate) mod kv_compress;
 pub(crate) mod kv_quantize;
+pub mod latent_projection;
 pub mod paged_kv;
 pub(crate) mod qwen3_ext;
 pub mod sampling;
 pub mod speculative_decode;
 pub mod uq_features;
 pub mod uq_head;
-pub mod latent_projection;
 
 pub use block_attnres::{BlockAttnRes, BlockAttnResConfig, BlockAttnResState};
 pub use chunked_engram::{
     step_decode, ChunkedEngramConfig, ChunkedEngramScheduler, ShardFetcher, StepResult,
 };
 pub use continuous_thought::{ContinuousThoughtConfig, ThoughtAction};
-pub use harmony_engine::HarmonyEngine;
-pub use harmony_model::{HarmonyModel, HarmonyModelConfig, HarmonyForwardOutput};
-pub use uq_features::{extract_uq_features, UqFeatureConfig};
-pub use uq_head::{UqClass, UqHead, UqHeadConfig, UqOutput};
-pub use latent_projection::LatentProjection;
-pub use latent_projection::contrastive_loss;
 pub use engine::EngramContext;
 pub use engine::QwenEngine;
 pub use engram_residual::EngramGatedResidual;
 pub use error::InferenceError;
+pub use harmony_engine::HarmonyEngine;
+pub use harmony_model::{HarmonyForwardOutput, HarmonyModel, HarmonyModelConfig};
+pub use latent_projection::contrastive_loss;
+pub use latent_projection::LatentProjection;
 pub use paged_kv::{PagedKvCache, PagedKvConfig};
 pub use speculative_decode::{
-    DraftAction, DraftTree, SpecContext, SpecDecConfig, SpecDecMetrics,
-    SpeculativeDecodeScheduler,
+    DraftAction, DraftTree, SpecContext, SpecDecConfig, SpecDecMetrics, SpeculativeDecodeScheduler,
 };
+pub use uq_features::{extract_uq_features, UqFeatureConfig};
+pub use uq_head::{UqClass, UqHead, UqHeadConfig, UqOutput};
 
 use candle_core::{Device, Tensor};
 
@@ -268,16 +267,13 @@ impl InferenceCache {
         // If not q8, borrow from self.layers directly.
         let dequantized: Vec<Option<(Tensor, Tensor)>>;
         let source: &[Option<(Tensor, Tensor)>] = if self.q8_enabled {
-            let mut buf: Vec<Option<(Tensor, Tensor)>> =
-                Vec::with_capacity(self.num_layers);
+            let mut buf: Vec<Option<(Tensor, Tensor)>> = Vec::with_capacity(self.num_layers);
             for i in 0..self.num_layers {
                 match (&self.q8_layers[i], &self.layers[i]) {
                     (Some(q8), _) => {
                         let (k, v) = q8
                             .dequantize(&candle_core::Device::Cpu)
-                            .map_err(|e| {
-                                InferenceError::CompressionFailed(e.to_string())
-                            })?;
+                            .map_err(|e| InferenceError::CompressionFailed(e.to_string()))?;
                         buf.push(Some((k, v)));
                     }
                     (None, Some((k, v))) => buf.push(Some((k.clone(), v.clone()))),
@@ -599,11 +595,8 @@ mod kv_compress_cache_tests {
     use candle_core::{DType, Device, Tensor};
 
     fn test_tq_state(head_dim: usize) -> kv_compress::TurboQuantState {
-        kv_compress::TurboQuantState::new(&kv_compress::TurboQuantConfig {
-            head_dim,
-            seed: 42,
-        })
-        .unwrap()
+        kv_compress::TurboQuantState::new(&kv_compress::TurboQuantConfig { head_dim, seed: 42 })
+            .unwrap()
     }
 
     /// Create a cache with `n_tokens` of random f16 KV tensors in layer 0.

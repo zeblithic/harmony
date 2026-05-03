@@ -108,8 +108,7 @@ fn lookup_resolve_produces_correct_shape() {
     let tokens = [1u32, 2, 3, 4, 5];
 
     let request = prepare_engram_request(&client, &tokens).unwrap();
-    let tensor =
-        resolve_engram_embeddings(&client, &request, &shard_data, &Device::Cpu).unwrap();
+    let tensor = resolve_engram_embeddings(&client, &request, &shard_data, &Device::Cpu).unwrap();
 
     // Output: [1, seq_len, embedding_dim]
     assert_eq!(tensor.dims(), &[1, tokens.len(), EMBEDDING_DIM]);
@@ -124,15 +123,10 @@ fn lookup_resolve_position_zero_is_zero() {
     let tokens = [10u32, 20, 30];
 
     let request = prepare_engram_request(&client, &tokens).unwrap();
-    let tensor =
-        resolve_engram_embeddings(&client, &request, &shard_data, &Device::Cpu).unwrap();
+    let tensor = resolve_engram_embeddings(&client, &request, &shard_data, &Device::Cpu).unwrap();
 
     // Extract position 0
-    let pos0 = tensor
-        .i((0, 0, ..))
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
+    let pos0 = tensor.i((0, 0, ..)).unwrap().to_vec1::<f32>().unwrap();
 
     let max_abs: f32 = pos0.iter().map(|v: &f32| v.abs()).fold(0f32, f32::max);
     assert!(
@@ -149,15 +143,10 @@ fn lookup_resolve_later_positions_are_nonzero() {
     let tokens = [1u32, 2, 3, 4];
 
     let request = prepare_engram_request(&client, &tokens).unwrap();
-    let tensor =
-        resolve_engram_embeddings(&client, &request, &shard_data, &Device::Cpu).unwrap();
+    let tensor = resolve_engram_embeddings(&client, &request, &shard_data, &Device::Cpu).unwrap();
 
     for pos in 1..tokens.len() {
-        let pos_vec = tensor
-            .i((0, pos, ..))
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
+        let pos_vec = tensor.i((0, pos, ..)).unwrap().to_vec1::<f32>().unwrap();
         let max_abs: f32 = pos_vec.iter().map(|v: &f32| v.abs()).fold(0f32, f32::max);
         assert!(
             max_abs > 1e-6,
@@ -174,12 +163,10 @@ fn lookup_is_deterministic() {
     let tokens = [5u32, 10, 15, 20];
 
     let request1 = prepare_engram_request(&client, &tokens).unwrap();
-    let tensor1 =
-        resolve_engram_embeddings(&client, &request1, &shard_data, &Device::Cpu).unwrap();
+    let tensor1 = resolve_engram_embeddings(&client, &request1, &shard_data, &Device::Cpu).unwrap();
 
     let request2 = prepare_engram_request(&client, &tokens).unwrap();
-    let tensor2 =
-        resolve_engram_embeddings(&client, &request2, &shard_data, &Device::Cpu).unwrap();
+    let tensor2 = resolve_engram_embeddings(&client, &request2, &shard_data, &Device::Cpu).unwrap();
 
     let diff: f32 = (&tensor1 - &tensor2)
         .unwrap()
@@ -201,12 +188,10 @@ fn different_tokens_produce_different_embeddings() {
     let tokens_b = [100u32, 200, 300];
 
     let req_a = prepare_engram_request(&client, &tokens_a).unwrap();
-    let tensor_a =
-        resolve_engram_embeddings(&client, &req_a, &shard_data, &Device::Cpu).unwrap();
+    let tensor_a = resolve_engram_embeddings(&client, &req_a, &shard_data, &Device::Cpu).unwrap();
 
     let req_b = prepare_engram_request(&client, &tokens_b).unwrap();
-    let tensor_b =
-        resolve_engram_embeddings(&client, &req_b, &shard_data, &Device::Cpu).unwrap();
+    let tensor_b = resolve_engram_embeddings(&client, &req_b, &shard_data, &Device::Cpu).unwrap();
 
     // Compare position 1 (first bigram position) — should differ
     let a1 = tensor_a.i((0, 1, ..)).unwrap().to_vec1::<f32>().unwrap();
@@ -303,19 +288,14 @@ fn inject_position_zero_unchanged() {
     )
     .unwrap();
 
-    let hidden_state =
-        Tensor::randn(0f32, 1f32, (1, tokens.len(), hidden_dim), &device).unwrap();
+    let hidden_state = Tensor::randn(0f32, 1f32, (1, tokens.len(), hidden_dim), &device).unwrap();
 
     let residual = module.forward(&hidden_state, &engram_embeddings).unwrap();
 
     // Position 0 has zero engram embedding (no N-gram coverage) → zero value
     // projection → zero gated value → zero conv input at this position →
     // silu(0) = 0.
-    let res0 = residual
-        .i((0, 0, ..))
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
+    let res0 = residual.i((0, 0, ..)).unwrap().to_vec1::<f32>().unwrap();
     let max_at_0: f32 = res0.iter().map(|v: &f32| v.abs()).fold(0f32, f32::max);
     assert!(
         max_at_0 < 1e-6,
@@ -348,8 +328,7 @@ fn single_token_produces_zero_embeddings() {
     let request = prepare_engram_request(&client, &tokens).unwrap();
     assert!(request.lookups.is_empty(), "single token has no N-grams");
 
-    let tensor =
-        resolve_engram_embeddings(&client, &request, &shard_data, &Device::Cpu).unwrap();
+    let tensor = resolve_engram_embeddings(&client, &request, &shard_data, &Device::Cpu).unwrap();
     assert_eq!(tensor.dims(), &[1, 1, EMBEDDING_DIM]);
 
     let max_val: f32 = tensor
@@ -359,5 +338,8 @@ fn single_token_produces_zero_embeddings() {
         .unwrap()
         .to_scalar()
         .unwrap();
-    assert!(max_val < 1e-6, "single token should produce zero embeddings");
+    assert!(
+        max_val < 1e-6,
+        "single token should produce zero embeddings"
+    );
 }

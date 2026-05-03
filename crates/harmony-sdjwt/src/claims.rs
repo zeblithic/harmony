@@ -44,8 +44,7 @@ pub fn verify_disclosures(sd_jwt: &SdJwt) -> Result<VerifiedDisclosures<'_>, SdJ
     }
 
     // Build a BTreeSet for O((k + m) log m) lookup instead of O(k × m) linear scan.
-    let sd_set: alloc::collections::BTreeSet<&String> =
-        sd_jwt.payload.sd.iter().collect();
+    let sd_set: alloc::collections::BTreeSet<&String> = sd_jwt.payload.sd.iter().collect();
     let mut seen = alloc::collections::BTreeSet::new();
 
     for disclosure in &sd_jwt.disclosures {
@@ -239,10 +238,8 @@ mod tests {
 
     #[test]
     fn verify_matching_disclosures() {
-        let (raw1, digest1) =
-            make_disclosure_with_digest(r#"["salt1","given_name","Alice"]"#);
-        let (raw2, digest2) =
-            make_disclosure_with_digest(r#"["salt2","family_name","Smith"]"#);
+        let (raw1, digest1) = make_disclosure_with_digest(r#"["salt1","given_name","Alice"]"#);
+        let (raw2, digest2) = make_disclosure_with_digest(r#"["salt2","family_name","Smith"]"#);
 
         let d1 = disclosure_from_raw(&raw1, "salt1", Some("given_name"), r#""Alice""#);
         let d2 = disclosure_from_raw(&raw2, "salt2", Some("family_name"), r#""Smith""#);
@@ -255,15 +252,17 @@ mod tests {
 
     #[test]
     fn verify_rejects_unmatched_disclosure() {
-        let (raw1, digest1) =
-            make_disclosure_with_digest(r#"["salt1","given_name","Alice"]"#);
+        let (raw1, digest1) = make_disclosure_with_digest(r#"["salt1","given_name","Alice"]"#);
         // Forge a disclosure whose raw value doesn't match any digest.
         let forged = disclosure_from_raw("forged_raw", "salt1", Some("given_name"), r#""Alice""#);
 
-        let sd_jwt = make_test_sdjwt(vec![digest1], vec![
-            disclosure_from_raw(&raw1, "salt1", Some("given_name"), r#""Alice""#),
-            forged,
-        ]);
+        let sd_jwt = make_test_sdjwt(
+            vec![digest1],
+            vec![
+                disclosure_from_raw(&raw1, "salt1", Some("given_name"), r#""Alice""#),
+                forged,
+            ],
+        );
         let result = verify_disclosures(&sd_jwt);
         assert!(matches!(result, Err(SdJwtError::DisclosureHashMismatch)));
     }
@@ -300,8 +299,7 @@ mod tests {
     #[test]
     fn verify_default_sha256_when_sd_alg_none() {
         // sd_alg = None should default to sha-256 and succeed.
-        let (raw, digest) =
-            make_disclosure_with_digest(r#"["s","name","val"]"#);
+        let (raw, digest) = make_disclosure_with_digest(r#"["s","name","val"]"#);
         let d = disclosure_from_raw(&raw, "s", Some("name"), r#""val""#);
         let sd_jwt = make_test_sdjwt(vec![digest], vec![d]);
         assert!(verify_disclosures(&sd_jwt).is_ok());
@@ -311,7 +309,12 @@ mod tests {
 
     #[test]
     fn map_known_vocabulary_claims() {
-        let d = disclosure_from_raw("raw", "MDEyMzQ1Njc4OWFiY2RlZg", Some("given_name"), r#""Alice""#);
+        let d = disclosure_from_raw(
+            "raw",
+            "MDEyMzQ1Njc4OWFiY2RlZg",
+            Some("given_name"),
+            r#""Alice""#,
+        );
         let verified = VerifiedDisclosures(vec![&d]);
         let claims = map_claims(&verified).unwrap();
         assert_eq!(claims.len(), 1);
@@ -321,7 +324,12 @@ mod tests {
 
     #[test]
     fn map_unknown_claim_gets_hash_derived_id() {
-        let d = disclosure_from_raw("raw", "MDEyMzQ1Njc4OWFiY2RlZg", Some("custom_field"), r#""value""#);
+        let d = disclosure_from_raw(
+            "raw",
+            "MDEyMzQ1Njc4OWFiY2RlZg",
+            Some("custom_field"),
+            r#""value""#,
+        );
         let verified = VerifiedDisclosures(vec![&d]);
         let claims = map_claims(&verified).unwrap();
         assert_eq!(claims.len(), 1);

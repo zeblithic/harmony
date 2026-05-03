@@ -87,7 +87,9 @@ impl ReclamationCert {
             return Err(OwnerError::IdentityHashMismatch);
         }
         let vk = VerifyingKey::from_bytes(&self.new_owner_pubkey.classical.ed25519_verify)
-            .map_err(|_| OwnerError::InvalidSignature { cert_type: "Reclamation" })?;
+            .map_err(|_| OwnerError::InvalidSignature {
+                cert_type: "Reclamation",
+            })?;
         let payload_bytes = cbor::to_canonical(&ReclamationSigningPayload {
             version: self.version,
             new_owner_id: self.new_owner_id,
@@ -97,7 +99,13 @@ impl ReclamationCert {
             challenge_window_end: self.challenge_window_end,
             note: &self.note,
         })?;
-        verify_with_tag(&vk, tags::RECLAMATION, &payload_bytes, &self.signature, "Reclamation")
+        verify_with_tag(
+            &vk,
+            tags::RECLAMATION,
+            &payload_bytes,
+            &self.signature,
+            "Reclamation",
+        )
     }
 
     /// True if a `LivenessCert` with timestamp > self.issued_at and signed by
@@ -122,12 +130,21 @@ mod tests {
     fn reclamation_verifies() {
         let sk = SigningKey::generate(&mut OsRng);
         let bundle = PubKeyBundle {
-            classical: ClassicalKeys { ed25519_verify: sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
+            classical: ClassicalKeys {
+                ed25519_verify: sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
             post_quantum: None,
         };
         let cert = ReclamationCert::sign(
-            &sk, bundle, [9u8; 16], 1_700_000_000, DEFAULT_CHALLENGE_WINDOW_SECS, "lost devices in fire".into()
-        ).unwrap();
+            &sk,
+            bundle,
+            [9u8; 16],
+            1_700_000_000,
+            DEFAULT_CHALLENGE_WINDOW_SECS,
+            "lost devices in fire".into(),
+        )
+        .unwrap();
         cert.verify().unwrap();
     }
 
@@ -135,10 +152,14 @@ mod tests {
     fn refutation_logic() {
         let sk = SigningKey::generate(&mut OsRng);
         let bundle = PubKeyBundle {
-            classical: ClassicalKeys { ed25519_verify: sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
+            classical: ClassicalKeys {
+                ed25519_verify: sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
             post_quantum: None,
         };
-        let cert = ReclamationCert::sign(&sk, bundle, [9u8; 16], 1_000_000, 1000, "n/a".into()).unwrap();
+        let cert =
+            ReclamationCert::sign(&sk, bundle, [9u8; 16], 1_000_000, 1000, "n/a".into()).unwrap();
         assert!(cert.is_refuted_by_timestamp(1_000_001));
         assert!(!cert.is_refuted_by_timestamp(999_999));
         assert!(!cert.is_refuted_by_timestamp(1_000_000));
@@ -150,12 +171,21 @@ mod tests {
     fn reclamation_with_inverted_window_rejected_in_verify() {
         let sk = SigningKey::generate(&mut OsRng);
         let bundle = PubKeyBundle {
-            classical: ClassicalKeys { ed25519_verify: sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
+            classical: ClassicalKeys {
+                ed25519_verify: sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
             post_quantum: None,
         };
         let mut cert = ReclamationCert::sign(
-            &sk, bundle.clone(), [9u8; 16], 1_000_000, DEFAULT_CHALLENGE_WINDOW_SECS, "n/a".into()
-        ).unwrap();
+            &sk,
+            bundle.clone(),
+            [9u8; 16],
+            1_000_000,
+            DEFAULT_CHALLENGE_WINDOW_SECS,
+            "n/a".into(),
+        )
+        .unwrap();
         // Manually corrupt window_end to be before issued_at
         cert.challenge_window_end = cert.issued_at - 1;
         let result = cert.verify();
@@ -166,7 +196,10 @@ mod tests {
     fn zero_length_window_rejected_in_sign() {
         let sk = SigningKey::generate(&mut OsRng);
         let bundle = PubKeyBundle {
-            classical: ClassicalKeys { ed25519_verify: sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
+            classical: ClassicalKeys {
+                ed25519_verify: sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
             post_quantum: None,
         };
         let result = ReclamationCert::sign(&sk, bundle, [9u8; 16], 1_000_000, 0, "n/a".into());
@@ -177,12 +210,21 @@ mod tests {
     fn zero_length_window_rejected_in_verify() {
         let sk = SigningKey::generate(&mut OsRng);
         let bundle = PubKeyBundle {
-            classical: ClassicalKeys { ed25519_verify: sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
+            classical: ClassicalKeys {
+                ed25519_verify: sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
             post_quantum: None,
         };
         let mut cert = ReclamationCert::sign(
-            &sk, bundle, [9u8; 16], 1_000_000, DEFAULT_CHALLENGE_WINDOW_SECS, "n/a".into()
-        ).unwrap();
+            &sk,
+            bundle,
+            [9u8; 16],
+            1_000_000,
+            DEFAULT_CHALLENGE_WINDOW_SECS,
+            "n/a".into(),
+        )
+        .unwrap();
         // Force end == start (zero-length on the wire)
         cert.challenge_window_end = cert.issued_at;
         let result = cert.verify();
@@ -193,10 +235,14 @@ mod tests {
     fn refutation_outside_window_does_not_refute() {
         let sk = SigningKey::generate(&mut OsRng);
         let bundle = PubKeyBundle {
-            classical: ClassicalKeys { ed25519_verify: sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
+            classical: ClassicalKeys {
+                ed25519_verify: sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
             post_quantum: None,
         };
-        let cert = ReclamationCert::sign(&sk, bundle, [9u8; 16], 1_000_000, 1000, "n/a".into()).unwrap();
+        let cert =
+            ReclamationCert::sign(&sk, bundle, [9u8; 16], 1_000_000, 1000, "n/a".into()).unwrap();
         // Liveness AFTER window expires (window ends at 1_001_000)
         assert!(!cert.is_refuted_by_timestamp(1_002_000));
         // Liveness AT window end is still valid (boundary is inclusive)

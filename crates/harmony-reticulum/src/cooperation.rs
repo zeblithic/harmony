@@ -123,7 +123,8 @@ impl CooperationTable {
     pub fn observe_announce_forwarded(&mut self, interface: &str, now: u64) {
         let (alpha, floor) = (self.alpha, self.floor);
         if let Some(score) = self.scores.get_mut(interface) {
-            score.announce_score = Self::ema_update_params(alpha, floor, score.announce_score, true);
+            score.announce_score =
+                Self::ema_update_params(alpha, floor, score.announce_score, true);
             score.observation_count += 1;
             score.last_observed = now;
             Self::recombine(score);
@@ -276,10 +277,7 @@ mod tests {
             table.observe_announce_timeout("eth0", 1000);
         }
         let score = table.scores["eth0"].announce_score;
-        assert!(
-            score >= 0.05,
-            "score dropped below floor: {score}"
-        );
+        assert!(score >= 0.05, "score dropped below floor: {score}");
     }
 
     #[test]

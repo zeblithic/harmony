@@ -125,8 +125,7 @@ impl WasmiRuntime {
                 if output_len < 0 {
                     #[cfg(feature = "inference")]
                     {
-                        self.shared_inference_engine =
-                            ctx.store.into_data().inference_engine;
+                        self.shared_inference_engine = ctx.store.into_data().inference_engine;
                     }
                     return ComputeResult::Failed {
                         error: ComputeError::Trap {
@@ -142,8 +141,7 @@ impl WasmiRuntime {
                     None => {
                         #[cfg(feature = "inference")]
                         {
-                            self.shared_inference_engine =
-                                ctx.store.into_data().inference_engine;
+                            self.shared_inference_engine = ctx.store.into_data().inference_engine;
                         }
                         return ComputeResult::Failed {
                             error: ComputeError::ExportNotFound {
@@ -159,8 +157,7 @@ impl WasmiRuntime {
                 if output_end > mem_size {
                     #[cfg(feature = "inference")]
                     {
-                        self.shared_inference_engine =
-                            ctx.store.into_data().inference_engine;
+                        self.shared_inference_engine = ctx.store.into_data().inference_engine;
                     }
                     return ComputeResult::Failed {
                         error: ComputeError::MemoryTooSmall {
@@ -236,8 +233,7 @@ impl WasmiRuntime {
                     // Recover inference engine before dropping the store.
                     #[cfg(feature = "inference")]
                     {
-                        self.shared_inference_engine =
-                            ctx.store.into_data().inference_engine;
+                        self.shared_inference_engine = ctx.store.into_data().inference_engine;
                     }
                     ComputeResult::Failed {
                         error: ComputeError::Trap {
@@ -250,8 +246,7 @@ impl WasmiRuntime {
                 // Recover inference engine before dropping the store.
                 #[cfg(feature = "inference")]
                 {
-                    self.shared_inference_engine =
-                        ctx.store.into_data().inference_engine;
+                    self.shared_inference_engine = ctx.store.into_data().inference_engine;
                 }
                 ComputeResult::Failed {
                     error: ComputeError::Trap {
@@ -881,7 +876,7 @@ impl ComputeRuntime for WasmiRuntime {
             _ => None,
         };
 
-        let return_val: i32 = if let Some((_load_gguf_cid, _load_tok_cid)) = model_load_cids {
+        let return_val: i32 = if let Some((load_gguf_cid, load_tok_cid)) = model_load_cids {
             #[cfg(feature = "inference")]
             {
                 match response {
@@ -898,8 +893,7 @@ impl ComputeRuntime for WasmiRuntime {
                             -4
                         } else {
                             let data = session.store.data_mut();
-                            data.inference_engine =
-                                Some((load_gguf_cid, load_tok_cid, engine));
+                            data.inference_engine = Some((load_gguf_cid, load_tok_cid, engine));
                             data.last_logits = None;
                             0
                         }

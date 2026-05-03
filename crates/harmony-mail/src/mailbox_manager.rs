@@ -28,7 +28,9 @@ const RAW_PUBLISH_CONCURRENCY: usize = 256;
 /// indicates a stalled link. Abort rather than pile up.
 const RAW_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
-use crate::mailbox::{FolderKind, MailFolder, MailPage, MailRoot, MessageEntry, FOLDER_COUNT, MAX_SNIPPET_LEN};
+use crate::mailbox::{
+    FolderKind, MailFolder, MailPage, MailRoot, MessageEntry, FOLDER_COUNT, MAX_SNIPPET_LEN,
+};
 use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
 
 /// Zenoh publisher for mailbox notifications.
@@ -946,9 +948,9 @@ impl MailboxManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harmony_content::book::BookStore as _;
     use crate::mailbox::{FolderKind, PAGE_CAPACITY};
     use crate::message::MESSAGE_ID_LEN;
+    use harmony_content::book::BookStore as _;
 
     fn dummy_msg_cid(tag: u8) -> [u8; CID_LEN] {
         let mut cid = [0u8; CID_LEN];
@@ -1053,7 +1055,9 @@ mod tests {
         let inbox_cid = root.folder_cid(FolderKind::Inbox);
         assert_ne!(inbox_cid, &[0u8; CID_LEN]);
         let folder_content_id = harmony_content::cid::ContentId::from_bytes(*inbox_cid);
-        let folder_bytes = book.get(&folder_content_id).expect("inbox folder should be in CAS");
+        let folder_bytes = book
+            .get(&folder_content_id)
+            .expect("inbox folder should be in CAS");
         let folder = MailFolder::from_bytes(folder_bytes).unwrap();
         assert_eq!(folder.message_count, 0);
         assert_eq!(folder.unread_count, 0);
@@ -1109,20 +1113,25 @@ mod tests {
         // Load and verify the tree
         let book = harmony_db::DiskBookStore::new(&cas_path);
         let root = MailRoot::from_bytes(
-            book.get(&harmony_content::cid::ContentId::from_bytes(new_cid)).unwrap(),
+            book.get(&harmony_content::cid::ContentId::from_bytes(new_cid))
+                .unwrap(),
         )
         .unwrap();
 
         let inbox_cid = root.folder_cid(FolderKind::Inbox);
         let folder = MailFolder::from_bytes(
-            book.get(&harmony_content::cid::ContentId::from_bytes(*inbox_cid)).unwrap(),
+            book.get(&harmony_content::cid::ContentId::from_bytes(*inbox_cid))
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(folder.message_count, 1);
         assert_eq!(folder.unread_count, 1);
 
         let page = MailPage::from_bytes(
-            book.get(&harmony_content::cid::ContentId::from_bytes(folder.page_cids[0])).unwrap(),
+            book.get(&harmony_content::cid::ContentId::from_bytes(
+                folder.page_cids[0],
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(page.entries.len(), 1);
@@ -1160,11 +1169,15 @@ mod tests {
         let book = harmony_db::DiskBookStore::new(&cas_path);
         let root_cid = *mgr.get_root(&addr).unwrap();
         let root = MailRoot::from_bytes(
-            book.get(&harmony_content::cid::ContentId::from_bytes(root_cid)).unwrap(),
+            book.get(&harmony_content::cid::ContentId::from_bytes(root_cid))
+                .unwrap(),
         )
         .unwrap();
         let folder = MailFolder::from_bytes(
-            book.get(&harmony_content::cid::ContentId::from_bytes(*root.folder_cid(FolderKind::Inbox))).unwrap(),
+            book.get(&harmony_content::cid::ContentId::from_bytes(
+                *root.folder_cid(FolderKind::Inbox),
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(folder.message_count as usize, PAGE_CAPACITY);
@@ -1186,11 +1199,15 @@ mod tests {
         // Verify: 2 pages now
         let root_cid = *mgr.get_root(&addr).unwrap();
         let root = MailRoot::from_bytes(
-            book.get(&harmony_content::cid::ContentId::from_bytes(root_cid)).unwrap(),
+            book.get(&harmony_content::cid::ContentId::from_bytes(root_cid))
+                .unwrap(),
         )
         .unwrap();
         let folder = MailFolder::from_bytes(
-            book.get(&harmony_content::cid::ContentId::from_bytes(*root.folder_cid(FolderKind::Inbox))).unwrap(),
+            book.get(&harmony_content::cid::ContentId::from_bytes(
+                *root.folder_cid(FolderKind::Inbox),
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(folder.message_count as usize, PAGE_CAPACITY + 1);
@@ -1198,7 +1215,10 @@ mod tests {
 
         // Head page has 1 entry (the newest)
         let head_page = MailPage::from_bytes(
-            book.get(&harmony_content::cid::ContentId::from_bytes(folder.page_cids[0])).unwrap(),
+            book.get(&harmony_content::cid::ContentId::from_bytes(
+                folder.page_cids[0],
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(head_page.entries.len(), 1);
@@ -1245,21 +1265,33 @@ mod tests {
         let book = harmony_db::DiskBookStore::new(&cas_path);
 
         let alice_root = MailRoot::from_bytes(
-            book.get(&harmony_content::cid::ContentId::from_bytes(*mgr.get_root(&alice).unwrap())).unwrap(),
+            book.get(&harmony_content::cid::ContentId::from_bytes(
+                *mgr.get_root(&alice).unwrap(),
+            ))
+            .unwrap(),
         )
         .unwrap();
         let alice_folder = MailFolder::from_bytes(
-            book.get(&harmony_content::cid::ContentId::from_bytes(*alice_root.folder_cid(FolderKind::Inbox))).unwrap(),
+            book.get(&harmony_content::cid::ContentId::from_bytes(
+                *alice_root.folder_cid(FolderKind::Inbox),
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(alice_folder.message_count, 3);
 
         let bob_root = MailRoot::from_bytes(
-            book.get(&harmony_content::cid::ContentId::from_bytes(*mgr.get_root(&bob).unwrap())).unwrap(),
+            book.get(&harmony_content::cid::ContentId::from_bytes(
+                *mgr.get_root(&bob).unwrap(),
+            ))
+            .unwrap(),
         )
         .unwrap();
         let bob_folder = MailFolder::from_bytes(
-            book.get(&harmony_content::cid::ContentId::from_bytes(*bob_root.folder_cid(FolderKind::Inbox))).unwrap(),
+            book.get(&harmony_content::cid::ContentId::from_bytes(
+                *bob_root.folder_cid(FolderKind::Inbox),
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(bob_folder.message_count, 1);
@@ -1299,17 +1331,24 @@ mod tests {
 
             let book = harmony_db::DiskBookStore::new(&cas_path);
             let root = MailRoot::from_bytes(
-                book.get(&harmony_content::cid::ContentId::from_bytes(*root_cid)).unwrap(),
+                book.get(&harmony_content::cid::ContentId::from_bytes(*root_cid))
+                    .unwrap(),
             )
             .unwrap();
             let folder = MailFolder::from_bytes(
-                book.get(&harmony_content::cid::ContentId::from_bytes(*root.folder_cid(FolderKind::Inbox))).unwrap(),
+                book.get(&harmony_content::cid::ContentId::from_bytes(
+                    *root.folder_cid(FolderKind::Inbox),
+                ))
+                .unwrap(),
             )
             .unwrap();
             assert_eq!(folder.message_count, 3);
 
             let page = MailPage::from_bytes(
-                book.get(&harmony_content::cid::ContentId::from_bytes(folder.page_cids[0])).unwrap(),
+                book.get(&harmony_content::cid::ContentId::from_bytes(
+                    folder.page_cids[0],
+                ))
+                .unwrap(),
             )
             .unwrap();
             assert_eq!(page.entries.len(), 3);
@@ -1432,9 +1471,16 @@ mod tests {
             .raw
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(raw.len(), 3, "each call must record one publish — no coalescing");
+        assert_eq!(
+            raw.len(),
+            3,
+            "each call must record one publish — no coalescing"
+        );
         assert_eq!(raw[0].0, alice_hex);
-        assert!(Arc::ptr_eq(&raw[0].1, &payload_a), "shared-buffer handle must be preserved");
+        assert!(
+            Arc::ptr_eq(&raw[0].1, &payload_a),
+            "shared-buffer handle must be preserved"
+        );
         assert_eq!(raw[1].0, bob_hex);
         assert!(Arc::ptr_eq(&raw[1].1, &payload_b));
         assert_eq!(raw[2].0, alice_hex);
@@ -1479,9 +1525,16 @@ mod tests {
             .sealed_unicast
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(sealed.len(), 1, "expected exactly one sealed-unicast capture");
+        assert_eq!(
+            sealed.len(),
+            1,
+            "expected exactly one sealed-unicast capture"
+        );
         let (key, payload) = &sealed[0];
-        assert_eq!(key, "harmony/msg/v1/unicast/aabbccddeeff00112233445566778899");
+        assert_eq!(
+            key,
+            "harmony/msg/v1/unicast/aabbccddeeff00112233445566778899"
+        );
         assert_eq!(payload.as_slice(), envelope.as_slice());
     }
 
@@ -1563,13 +1616,11 @@ mod tests {
 
         // The drain task must pick up the coalesced update and run
         // session.put().
-        let sample = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            subscriber.recv_async(),
-        )
-        .await
-        .expect("subscriber never received the real zenoh publish within 5s")
-        .expect("subscriber channel closed");
+        let sample =
+            tokio::time::timeout(std::time::Duration::from_secs(5), subscriber.recv_async())
+                .await
+                .expect("subscriber never received the real zenoh publish within 5s")
+                .expect("subscriber channel closed");
 
         let payload = sample.payload().to_bytes();
         assert_eq!(payload.len(), CID_LEN);
@@ -1609,13 +1660,11 @@ mod tests {
 
         // Sanity: the drain task is alive and publishes before cancel.
         publisher.notify(addr, [0x01u8; CID_LEN]);
-        let before = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            subscriber.recv_async(),
-        )
-        .await
-        .expect("pre-cancel publish should succeed")
-        .expect("subscriber channel closed");
+        let before =
+            tokio::time::timeout(std::time::Duration::from_secs(5), subscriber.recv_async())
+                .await
+                .expect("pre-cancel publish should succeed")
+                .expect("subscriber channel closed");
         assert_eq!(before.payload().to_bytes().len(), CID_LEN);
 
         // Cancel and give the drain task a moment to exit.

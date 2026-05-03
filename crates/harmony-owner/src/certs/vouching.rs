@@ -54,7 +54,8 @@ impl VouchingCert {
         stance: Stance,
         issued_at: u64,
     ) -> Result<Self, OwnerError> {
-        let signer = PubKeyBundle::classical_only(signer_sk.verifying_key().to_bytes()).identity_hash();
+        let signer =
+            PubKeyBundle::classical_only(signer_sk.verifying_key().to_bytes()).identity_hash();
         let payload_bytes = cbor::to_canonical(&VouchingSigningPayload {
             version: VOUCHING_VERSION,
             owner_id,
@@ -83,7 +84,8 @@ impl VouchingCert {
         // this prevents a cert that names device-A as signer from being
         // accepted as if signed by device-B (callers that only check the
         // ed25519 signature would otherwise be fooled).
-        let expected_signer = PubKeyBundle::classical_only(signer_pubkey.to_bytes()).identity_hash();
+        let expected_signer =
+            PubKeyBundle::classical_only(signer_pubkey.to_bytes()).identity_hash();
         if self.signer != expected_signer {
             return Err(OwnerError::IdentityHashMismatch);
         }
@@ -95,7 +97,13 @@ impl VouchingCert {
             stance: self.stance,
             issued_at: self.issued_at,
         })?;
-        verify_with_tag(signer_pubkey, tags::VOUCHING, &payload_bytes, &self.signature, "Vouching")
+        verify_with_tag(
+            signer_pubkey,
+            tags::VOUCHING,
+            &payload_bytes,
+            &self.signature,
+            "Vouching",
+        )
     }
 }
 
@@ -107,26 +115,16 @@ mod tests {
     #[test]
     fn vouch_signs_and_verifies() {
         let sk = SigningKey::generate(&mut OsRng);
-        let cert = VouchingCert::sign(
-            &sk,
-            [1u8; 16],
-            [3u8; 16],
-            Stance::Vouch,
-            1_700_000_000,
-        ).unwrap();
+        let cert =
+            VouchingCert::sign(&sk, [1u8; 16], [3u8; 16], Stance::Vouch, 1_700_000_000).unwrap();
         cert.verify(&sk.verifying_key()).unwrap();
     }
 
     #[test]
     fn challenge_signs_and_verifies() {
         let sk = SigningKey::generate(&mut OsRng);
-        let cert = VouchingCert::sign(
-            &sk,
-            [1u8; 16],
-            [3u8; 16],
-            Stance::Challenge,
-            1_700_000_000,
-        ).unwrap();
+        let cert = VouchingCert::sign(&sk, [1u8; 16], [3u8; 16], Stance::Challenge, 1_700_000_000)
+            .unwrap();
         cert.verify(&sk.verifying_key()).unwrap();
     }
 

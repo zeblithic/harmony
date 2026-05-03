@@ -97,11 +97,7 @@ impl MemoStore {
     /// A signer may have multiple memos for the same input with different outputs
     /// (e.g., if they recomputed and got a different result).
     /// Increments LFU counters for each matching memo.
-    pub fn get_by_input_and_signer(
-        &mut self,
-        input: &ContentId,
-        signer: &[u8; 16],
-    ) -> Vec<&Memo> {
+    pub fn get_by_input_and_signer(&mut self, input: &ContentId, signer: &[u8; 16]) -> Vec<&Memo> {
         let memos = match self.by_input.get(input) {
             Some(v) => v,
             None => return Vec::new(),
@@ -158,8 +154,7 @@ impl MemoStore {
 
     /// Serialize LFU counters to bytes using postcard.
     pub fn serialize_lfu_counts(&self) -> Result<Vec<u8>, postcard::Error> {
-        let entries: Vec<(MemoKey, u32)> =
-            self.lfu_counts.iter().map(|(k, v)| (*k, *v)).collect();
+        let entries: Vec<(MemoKey, u32)> = self.lfu_counts.iter().map(|(k, v)| (*k, *v)).collect();
         postcard::to_allocvec(&entries)
     }
 
@@ -236,11 +231,7 @@ mod tests {
         ContentId::from_bytes([byte; 32])
     }
 
-    fn make_memo(
-        identity: &PqPrivateIdentity,
-        input_byte: u8,
-        output_byte: u8,
-    ) -> Memo {
+    fn make_memo(identity: &PqPrivateIdentity, input_byte: u8, output_byte: u8) -> Memo {
         create_memo(
             make_cid(input_byte),
             make_cid(output_byte),
@@ -334,10 +325,16 @@ mod tests {
         let groups = store.outputs_for_input(&input);
         assert_eq!(groups.len(), 2, "should have two distinct output CIDs");
 
-        let group_02 = groups.iter().find(|(cid, _)| *cid == make_cid(0x02)).expect("group for 0x02");
+        let group_02 = groups
+            .iter()
+            .find(|(cid, _)| *cid == make_cid(0x02))
+            .expect("group for 0x02");
         assert_eq!(group_02.1.len(), 2, "two signers for output 0x02");
 
-        let group_03 = groups.iter().find(|(cid, _)| *cid == make_cid(0x03)).expect("group for 0x03");
+        let group_03 = groups
+            .iter()
+            .find(|(cid, _)| *cid == make_cid(0x03))
+            .expect("group for 0x03");
         assert_eq!(group_03.1.len(), 1, "one signer for output 0x03");
     }
 
@@ -357,9 +354,22 @@ mod tests {
 
         store.insert(memo_alice);
 
-        assert!(!store.get_by_input_and_signer(&input, &alice_hash).is_empty(), "alice's memo should be found");
-        assert!(store.get_by_input_and_signer(&input, &bob_hash).is_empty(), "bob has no memo");
-        assert!(store.get_by_input_and_signer(&make_cid(0xFF), &alice_hash).is_empty(), "unknown input");
+        assert!(
+            !store
+                .get_by_input_and_signer(&input, &alice_hash)
+                .is_empty(),
+            "alice's memo should be found"
+        );
+        assert!(
+            store.get_by_input_and_signer(&input, &bob_hash).is_empty(),
+            "bob has no memo"
+        );
+        assert!(
+            store
+                .get_by_input_and_signer(&make_cid(0xFF), &alice_hash)
+                .is_empty(),
+            "unknown input"
+        );
     }
 
     #[test]
@@ -440,7 +450,10 @@ mod tests {
     #[test]
     fn evict_lfu_empty_returns_none() {
         let mut store = MemoStore::new();
-        assert!(store.evict_lfu().is_none(), "eviction on empty store should return None");
+        assert!(
+            store.evict_lfu().is_none(),
+            "eviction on empty store should return None"
+        );
     }
 
     #[test]
@@ -473,6 +486,10 @@ mod tests {
         // Load the serialized counts
         let loaded = store2.load_lfu_counts(&data).expect("load_lfu_counts");
         assert_eq!(loaded, 1, "one counter should be loaded");
-        assert_eq!(store2.lfu_count(&input, &output, &signer_hash), 3, "count should be restored");
+        assert_eq!(
+            store2.lfu_count(&input, &output, &signer_hash),
+            3,
+            "count should be restored"
+        );
     }
 }

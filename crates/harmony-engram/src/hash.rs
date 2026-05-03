@@ -203,10 +203,7 @@ mod tests {
     #[test]
     fn compute_lookup_from_bytes_matches_manual() {
         let config = test_config();
-        let bytes: Vec<u8> = [1u32, 2, 3]
-            .iter()
-            .flat_map(|t| t.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = [1u32, 2, 3].iter().flat_map(|t| t.to_le_bytes()).collect();
         let from_bytes = compute_lookup_from_bytes(&config, &bytes);
         let from_tokens = compute_lookup(&config, &[1, 2, 3]);
         assert_eq!(from_bytes.shard_indices, from_tokens.shard_indices);

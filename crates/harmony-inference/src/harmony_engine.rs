@@ -15,8 +15,8 @@ use std::io::Cursor;
 use crate::continuous_thought::{ContinuousThoughtConfig, ThoughtAction};
 use crate::engine::EngramContext;
 use crate::error::InferenceError;
-use crate::latent_projection::LatentProjection;
 use crate::harmony_model::{EngramFn, HarmonyForwardOutput, HarmonyModel, HarmonyModelConfig};
+use crate::latent_projection::LatentProjection;
 use crate::uq_features::{extract_uq_features, UqFeatureConfig};
 use crate::uq_head::{UqClass, UqHead};
 use crate::{logits_to_vec, InferenceCache, InferenceEngine, SamplingParams};
@@ -346,21 +346,52 @@ impl InferenceEngine for HarmonyEngine {
         // Auto-detect latent projection weights.
         let lp_key = "harmony.latent_projection.layer1.weight";
         if content.tensor_infos.contains_key(lp_key) {
-            let w1 = content.tensor(&mut cursor, "harmony.latent_projection.layer1.weight", &self.device)
+            let w1 = content
+                .tensor(
+                    &mut cursor,
+                    "harmony.latent_projection.layer1.weight",
+                    &self.device,
+                )
                 .and_then(|qt| qt.dequantize(&self.device))
-                .map_err(|e| InferenceError::InvalidGguf(format!("latent projection layer1.weight: {e}")))?;
-            let b1 = content.tensor(&mut cursor, "harmony.latent_projection.layer1.bias", &self.device)
+                .map_err(|e| {
+                    InferenceError::InvalidGguf(format!("latent projection layer1.weight: {e}"))
+                })?;
+            let b1 = content
+                .tensor(
+                    &mut cursor,
+                    "harmony.latent_projection.layer1.bias",
+                    &self.device,
+                )
                 .and_then(|qt| qt.dequantize(&self.device))
-                .map_err(|e| InferenceError::InvalidGguf(format!("latent projection layer1.bias: {e}")))?;
-            let w2 = content.tensor(&mut cursor, "harmony.latent_projection.layer2.weight", &self.device)
+                .map_err(|e| {
+                    InferenceError::InvalidGguf(format!("latent projection layer1.bias: {e}"))
+                })?;
+            let w2 = content
+                .tensor(
+                    &mut cursor,
+                    "harmony.latent_projection.layer2.weight",
+                    &self.device,
+                )
                 .and_then(|qt| qt.dequantize(&self.device))
-                .map_err(|e| InferenceError::InvalidGguf(format!("latent projection layer2.weight: {e}")))?;
-            let b2 = content.tensor(&mut cursor, "harmony.latent_projection.layer2.bias", &self.device)
+                .map_err(|e| {
+                    InferenceError::InvalidGguf(format!("latent projection layer2.weight: {e}"))
+                })?;
+            let b2 = content
+                .tensor(
+                    &mut cursor,
+                    "harmony.latent_projection.layer2.bias",
+                    &self.device,
+                )
                 .and_then(|qt| qt.dequantize(&self.device))
-                .map_err(|e| InferenceError::InvalidGguf(format!("latent projection layer2.bias: {e}")))?;
+                .map_err(|e| {
+                    InferenceError::InvalidGguf(format!("latent projection layer2.bias: {e}"))
+                })?;
             let proj = LatentProjection::from_tensors(w1, b1, w2, b2)
                 .map_err(|e| InferenceError::InvalidGguf(format!("latent projection: {e}")))?;
-            tracing::info!(latent_dim = proj.latent_dim(), "latent projection weights loaded from GGUF");
+            tracing::info!(
+                latent_dim = proj.latent_dim(),
+                "latent projection weights loaded from GGUF"
+            );
             self.latent_projection = Some(proj);
         } else {
             self.latent_projection = None;
@@ -690,7 +721,13 @@ mod tests {
         let mut cache = InferenceCache::new(99, 8, 2);
         let result = engine.forward(&[1, 2, 3], &mut cache);
         assert!(
-            matches!(result, Err(InferenceError::CacheMismatch { expected: 4, actual: 99 })),
+            matches!(
+                result,
+                Err(InferenceError::CacheMismatch {
+                    expected: 4,
+                    actual: 99
+                })
+            ),
             "expected CacheMismatch, got {result:?}"
         );
     }
@@ -936,9 +973,7 @@ mod tests {
         // Generate one output token (will think max_think_steps=4 times first).
         let mut consecutive_thinks = 0u32;
         loop {
-            let output = engine
-                .forward_full(&tokens, &mut cache, None)
-                .unwrap();
+            let output = engine.forward_full(&tokens, &mut cache, None).unwrap();
 
             match engine.route_thought(&output, consecutive_thinks).unwrap() {
                 ThoughtAction::Emit => {
@@ -971,7 +1006,10 @@ mod tests {
         // Think tokens are in history but not in emitted output.
         let think_in_history = history.iter().filter(|&&t| t == think_id).count();
         assert_eq!(think_in_history, 4);
-        assert!(!emitted.contains(&think_id), "<think> should not be in output");
+        assert!(
+            !emitted.contains(&think_id),
+            "<think> should not be in output"
+        );
 
         // KV cache advanced by: 3 (prefill) + 4 (think forward passes) = 7
         // (the emit samples from the last think's logits, no extra forward pass)
@@ -1025,7 +1063,10 @@ mod tests {
 
         let logits = engine.forward(&[1, 2, 3], &mut cache).unwrap();
         assert_eq!(logits.len(), vocab_size);
-        assert!(logits.iter().all(|v| v.is_finite()), "logits should be finite");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "logits should be finite"
+        );
     }
 
     // 20. q8_decode_extends_cache
@@ -1162,8 +1203,12 @@ mod tests {
         let config = HarmonyModelConfig::tiny();
         let mut engine = HarmonyEngine::new(config.clone(), Device::Cpu);
         let proj = crate::latent_projection::LatentProjection::new_random(
-            config.hidden_dim, 16, 8, &Device::Cpu,
-        ).unwrap();
+            config.hidden_dim,
+            16,
+            8,
+            &Device::Cpu,
+        )
+        .unwrap();
         engine.set_latent_projection(proj);
         assert!(engine.latent_projection().is_some());
     }

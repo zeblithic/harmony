@@ -122,7 +122,9 @@ pub fn resolve_did(did: &str) -> Result<ResolvedDid, DidError> {
         #[cfg(not(feature = "std"))]
         {
             let _ = encoded;
-            Err(DidError::UnsupportedMethod(String::from("jwk (requires std)")))
+            Err(DidError::UnsupportedMethod(String::from(
+                "jwk (requires std)",
+            )))
         }
     } else if did.starts_with("did:web:") {
         Err(DidError::UnsupportedMethod(String::from("web")))
@@ -141,9 +143,11 @@ pub fn resolve_did(did: &str) -> Result<ResolvedDid, DidError> {
 /// Format: `z<base58btc(varint(multicodec) || raw_public_key)>`
 pub fn parse_multibase_key(encoded: &str) -> Result<ResolvedDid, DidError> {
     // Strip multibase prefix 'z' (base58btc)
-    let b58_str = encoded
-        .strip_prefix('z')
-        .ok_or_else(|| DidError::MalformedDid(String::from("did:key value must start with 'z' multibase prefix")))?;
+    let b58_str = encoded.strip_prefix('z').ok_or_else(|| {
+        DidError::MalformedDid(String::from(
+            "did:key value must start with 'z' multibase prefix",
+        ))
+    })?;
 
     // Base58 decode
     let bytes = bs58::decode(b58_str)
@@ -212,9 +216,9 @@ pub fn parse_jwk_value(jwk: &serde_json::Value) -> Result<ResolvedDid, DidError>
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| DidError::MalformedDid(String::from("JWK missing 'x' field")))?;
 
-            let key_bytes = URL_SAFE_NO_PAD
-                .decode(x)
-                .map_err(|e| DidError::DecodingError(format!("base64url decode of 'x' failed: {e}")))?;
+            let key_bytes = URL_SAFE_NO_PAD.decode(x).map_err(|e| {
+                DidError::DecodingError(format!("base64url decode of 'x' failed: {e}"))
+            })?;
 
             if key_bytes.len() != 32 {
                 return Err(DidError::MalformedDid(format!(
@@ -286,9 +290,7 @@ fn decode_varint(bytes: &[u8]) -> Result<(u32, usize), DidError> {
         }
     }
 
-    Err(DidError::MalformedDid(String::from(
-        "unterminated varint",
-    )))
+    Err(DidError::MalformedDid(String::from("unterminated varint")))
 }
 
 /// Expected raw public key length for a given crypto suite.
@@ -528,7 +530,8 @@ mod jwk_tests {
 
     #[test]
     fn did_jwk_unsupported_curve() {
-        let jwk_json = r#"{"kty":"EC","crv":"P-256","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#;
+        let jwk_json =
+            r#"{"kty":"EC","crv":"P-256","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#;
         let encoded = URL_SAFE_NO_PAD.encode(jwk_json.as_bytes());
         let err = resolve_did_jwk(&encoded).unwrap_err();
         assert!(matches!(err, DidError::MalformedDid(_)));

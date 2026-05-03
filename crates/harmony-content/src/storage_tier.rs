@@ -466,7 +466,10 @@ impl<B: BookStore> StorageTier<B> {
                 // archive_index so content is immediately queryable (not only
                 // after restart). On the rare write-failure path, ArchiveReadFailed
                 // self-heals by retracting the phantom entry.
-                actions.push(StorageTierAction::CascadeToArchive { cid: candidate, size: evicted_size });
+                actions.push(StorageTierAction::CascadeToArchive {
+                    cid: candidate,
+                    size: evicted_size,
+                });
                 self.record_archive_persist(candidate, evicted_size, &mut actions);
             } else {
                 // Already in archive (promoted then re-evicted) or archive disabled.
@@ -757,8 +760,7 @@ impl<B: BookStore> StorageTier<B> {
                 // Retract the index entry so subsequent queries don't re-trigger
                 // futile ArchiveLookup cycles.
                 if let Some(entry_size) = self.archive_index.remove(&cid) {
-                    self.archive_used_bytes =
-                        self.archive_used_bytes.saturating_sub(entry_size);
+                    self.archive_used_bytes = self.archive_used_bytes.saturating_sub(entry_size);
                     self.archive_lru.retain(|c| c != &cid);
                 }
                 // Cascade to S3 for this query if available, rather than
@@ -777,8 +779,7 @@ impl<B: BookStore> StorageTier<B> {
                 // Retract the speculative archive_index entry so accounting
                 // stays accurate and the phantom entry doesn't inflate quota.
                 if let Some(entry_size) = self.archive_index.remove(&cid) {
-                    self.archive_used_bytes =
-                        self.archive_used_bytes.saturating_sub(entry_size);
+                    self.archive_used_bytes = self.archive_used_bytes.saturating_sub(entry_size);
                     self.archive_lru.retain(|c| c != &cid);
                 }
                 vec![]
@@ -788,8 +789,7 @@ impl<B: BookStore> StorageTier<B> {
                 // Retract archive phantom and re-insert into disk_index so
                 // the content stays reachable via the NVMe copy.
                 if let Some(entry_size) = self.archive_index.remove(&cid) {
-                    self.archive_used_bytes =
-                        self.archive_used_bytes.saturating_sub(entry_size);
+                    self.archive_used_bytes = self.archive_used_bytes.saturating_sub(entry_size);
                     self.archive_lru.retain(|c| c != &cid);
                 }
                 if !self.disk_index.contains_key(&cid) {
@@ -1219,7 +1219,10 @@ impl<B: BookStore> StorageTier<B> {
                 // Content is on disk but not in archive — cascade. Pre-insert
                 // into archive_index so content is immediately queryable.
                 // ArchiveReadFailed self-heals phantom entries on write failure.
-                actions.push(StorageTierAction::CascadeToArchive { cid: candidate, size: evicted_size });
+                actions.push(StorageTierAction::CascadeToArchive {
+                    cid: candidate,
+                    size: evicted_size,
+                });
                 self.record_archive_persist(candidate, evicted_size, actions);
             } else {
                 // Already in archive (promoted then re-evicted) or archive disabled.
@@ -1282,8 +1285,12 @@ impl<B: BookStore> StorageTier<B> {
             if let StorageTierAction::RemoveFromArchive { cid: evict_cid } = &evict_action {
                 // Find the size from the pending cascade/persist action.
                 let pending_size = actions.iter().find_map(|a| match a {
-                    StorageTierAction::CascadeToArchive { cid: c, size: s } if c == evict_cid => Some(*s),
-                    StorageTierAction::PersistToArchive { cid: c, data } if c == evict_cid => Some(data.len() as u64),
+                    StorageTierAction::CascadeToArchive { cid: c, size: s } if c == evict_cid => {
+                        Some(*s)
+                    }
+                    StorageTierAction::PersistToArchive { cid: c, data } if c == evict_cid => {
+                        Some(data.len() as u64)
+                    }
                     _ => None,
                 });
                 if let Some(entry_size) = pending_size {
@@ -3389,12 +3396,9 @@ mod tests {
         let data_a = b"aaaa";
         let data_b = b"bbbb";
         let data_c = b"cccc";
-        let cid_a =
-            ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
-        let cid_b =
-            ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
-        let cid_c =
-            ContentId::for_book(data_c, crate::cid::ContentFlags::default()).unwrap();
+        let cid_a = ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
+        let cid_b = ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
+        let cid_c = ContentId::for_book(data_c, crate::cid::ContentFlags::default()).unwrap();
 
         // First two inserts: no evictions expected.
         let actions = tier.handle(StorageTierEvent::PublishContent {
@@ -3402,7 +3406,9 @@ mod tests {
             data: data_a.to_vec(),
         });
         assert!(
-            !actions.iter().any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
+            !actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
             "no eviction push on first insert"
         );
 
@@ -3411,7 +3417,9 @@ mod tests {
             data: data_b.to_vec(),
         });
         assert!(
-            !actions.iter().any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
+            !actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
             "no eviction push on second insert"
         );
 
@@ -3424,7 +3432,10 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, StorageTierAction::EvictionPush { .. }))
             .count();
-        assert!(push_count > 0, "expected at least one EvictionPush on third insert");
+        assert!(
+            push_count > 0,
+            "expected at least one EvictionPush on third insert"
+        );
         assert_eq!(tier.metrics().eviction_pushes, push_count as u64);
     }
 
@@ -3445,12 +3456,9 @@ mod tests {
         let data_a = b"aaaa";
         let data_b = b"bbbb";
         let data_c = b"cccc";
-        let cid_a =
-            ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
-        let cid_b =
-            ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
-        let cid_c =
-            ContentId::for_book(data_c, crate::cid::ContentFlags::default()).unwrap();
+        let cid_a = ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
+        let cid_b = ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
+        let cid_c = ContentId::for_book(data_c, crate::cid::ContentFlags::default()).unwrap();
 
         tier.handle(StorageTierEvent::PublishContent {
             cid: cid_a,
@@ -3465,7 +3473,9 @@ mod tests {
             data: data_c.to_vec(),
         });
         assert!(
-            !actions.iter().any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
+            !actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
             "no EvictionPush when feature is disabled"
         );
         assert_eq!(tier.metrics().eviction_pushes, 0);
@@ -3488,12 +3498,9 @@ mod tests {
         let data_a = b"aaaa";
         let data_b = b"bbbb";
         let data_c = b"cccc";
-        let cid_a =
-            ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
-        let cid_b =
-            ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
-        let cid_c =
-            ContentId::for_book(data_c, crate::cid::ContentFlags::default()).unwrap();
+        let cid_a = ContentId::for_book(data_a, crate::cid::ContentFlags::default()).unwrap();
+        let cid_b = ContentId::for_book(data_b, crate::cid::ContentFlags::default()).unwrap();
+        let cid_c = ContentId::for_book(data_c, crate::cid::ContentFlags::default()).unwrap();
 
         // Enable disk and pre-populate disk_index with all three CIDs.
         tier.enable_disk(vec![
@@ -3515,7 +3522,9 @@ mod tests {
             data: data_c.to_vec(),
         });
         assert!(
-            !actions.iter().any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
+            !actions
+                .iter()
+                .any(|a| matches!(a, StorageTierAction::EvictionPush { .. })),
             "no EvictionPush when CID is already on disk"
         );
         assert_eq!(tier.metrics().eviction_pushes, 0);
@@ -3527,7 +3536,10 @@ mod tests {
 
         let (mut tier, _actions) = StorageTier::new(
             MemoryBookStore::new(),
-            StorageBudget { cache_capacity: 100, max_pinned_bytes: 1000 },
+            StorageBudget {
+                cache_capacity: 100,
+                max_pinned_bytes: 1000,
+            },
             ContentPolicy::default(),
             FilterBroadcastConfig {
                 mutation_threshold: 10,
@@ -3538,11 +3550,11 @@ mod tests {
         );
 
         let cid = ContentId::from_bytes([0x42; 32]);
-        assert!(!tier.cache().is_pinned(&cid));  // precondition: not yet pinned
-        assert!(tier.pin(cid));                   // pin returns true
-        assert!(tier.cache().is_pinned(&cid));    // visible through read accessor
+        assert!(!tier.cache().is_pinned(&cid)); // precondition: not yet pinned
+        assert!(tier.pin(cid)); // pin returns true
+        assert!(tier.cache().is_pinned(&cid)); // visible through read accessor
 
         tier.unpin(&cid);
-        assert!(!tier.cache().is_pinned(&cid));   // unpin takes effect
+        assert!(!tier.cache().is_pinned(&cid)); // unpin takes effect
     }
 }

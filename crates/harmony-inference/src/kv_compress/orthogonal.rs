@@ -18,9 +18,7 @@ pub fn generate_orthogonal_matrix(dim: usize, seed: u64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
 
     // Generate random matrix in f64 for numerical precision
-    let mut m: Vec<f64> = (0..dim * dim)
-        .map(|_| rng.gen_range(-1.0..1.0))
-        .collect();
+    let mut m: Vec<f64> = (0..dim * dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
 
     // Modified Gram-Schmidt (column-wise)
     for i in 0..dim {
@@ -248,7 +246,8 @@ mod tests {
             assert!(
                 (v[i] - recovered[i]).abs() < 1e-4,
                 "recovery failed at [{i}]: {} vs {}",
-                v[i], recovered[i]
+                v[i],
+                recovered[i]
             );
         }
     }

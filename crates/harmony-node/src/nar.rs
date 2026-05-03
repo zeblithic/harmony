@@ -236,11 +236,7 @@ pub fn get_references(store_path: &str) -> Result<Vec<String>, Box<dyn Error>> {
     let basenames = String::from_utf8(output.stdout)?
         .lines()
         .filter(|l| !l.is_empty())
-        .map(|l| {
-            l.strip_prefix("/nix/store/")
-                .unwrap_or(l)
-                .to_string()
-        })
+        .map(|l| l.strip_prefix("/nix/store/").unwrap_or(l).to_string())
         .collect();
 
     Ok(basenames)
@@ -297,9 +293,12 @@ fn persist_dag_recursive(
         return Ok(());
     }
 
-    let data = store
-        .get(cid)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("CID not in store: {cid:?}")))?;
+    let data = store.get(cid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("CID not in store: {cid:?}"),
+        )
+    })?;
 
     // Write this node to disk.
     write_book(data_dir, cid, data)?;
@@ -326,10 +325,10 @@ fn persist_dag_recursive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use crate::disk_io::read_book;
     use crate::memo_io::scan_memos;
     use crate::narinfo::NarInfo;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use harmony_content::{
         book::{BookStore, MemoryBookStore},
         chunker::ChunkerConfig,
@@ -343,8 +342,7 @@ mod tests {
         let mut combined = Vec::with_capacity(64);
         combined.extend_from_slice(&seed);
         combined.extend_from_slice(&pubkey);
-        NixSigningKey::from_nix_format(&format!("test-key-1:{}", BASE64.encode(&combined)))
-            .unwrap()
+        NixSigningKey::from_nix_format(&format!("test-key-1:{}", BASE64.encode(&combined))).unwrap()
     }
 
     fn test_identity() -> PqPrivateIdentity {
@@ -370,14 +368,8 @@ mod tests {
         let key = test_signing_key();
         let identity = test_identity();
 
-        let result = push_store_path(
-            valid_store_path(),
-            &nar_data,
-            &key,
-            dir.path(),
-            &identity,
-        )
-        .expect("push_store_path should succeed");
+        let result = push_store_path(valid_store_path(), &nar_data, &key, dir.path(), &identity)
+            .expect("push_store_path should succeed");
 
         assert!(!result.skipped, "first push should not be skipped");
         assert_eq!(result.nar_size, nar_data.len() as u64);
@@ -387,8 +379,8 @@ mod tests {
         assert_eq!(memos.len(), 1, "exactly one memo should be written");
 
         // Narinfo book should be readable and parseable.
-        let narinfo_bytes = read_book(dir.path(), &result.narinfo_cid)
-            .expect("narinfo book should be on disk");
+        let narinfo_bytes =
+            read_book(dir.path(), &result.narinfo_cid).expect("narinfo book should be on disk");
         let narinfo_text = std::str::from_utf8(&narinfo_bytes).expect("narinfo must be UTF-8");
         let parsed = NarInfo::from_text(narinfo_text).expect("narinfo must parse");
         assert_eq!(parsed.store_path, valid_store_path());
@@ -407,29 +399,21 @@ mod tests {
         let key = test_signing_key();
         let identity = test_identity();
 
-        let first = push_store_path(
-            valid_store_path(),
-            &nar_data,
-            &key,
-            dir.path(),
-            &identity,
-        )
-        .expect("first push should succeed");
+        let first = push_store_path(valid_store_path(), &nar_data, &key, dir.path(), &identity)
+            .expect("first push should succeed");
         assert!(!first.skipped);
 
-        let second = push_store_path(
-            valid_store_path(),
-            &nar_data,
-            &key,
-            dir.path(),
-            &identity,
-        )
-        .expect("second push should succeed");
+        let second = push_store_path(valid_store_path(), &nar_data, &key, dir.path(), &identity)
+            .expect("second push should succeed");
         assert!(second.skipped, "second push should be skipped");
 
         // Only one memo should exist on disk.
         let memos = scan_memos(dir.path());
-        assert_eq!(memos.len(), 1, "only one memo should exist after two pushes");
+        assert_eq!(
+            memos.len(),
+            1,
+            "only one memo should exist after two pushes"
+        );
     }
 
     #[test]
@@ -456,8 +440,8 @@ mod tests {
 
         assert!(!result.skipped);
 
-        let narinfo_bytes = read_book(dir.path(), &result.narinfo_cid)
-            .expect("narinfo should be on disk");
+        let narinfo_bytes =
+            read_book(dir.path(), &result.narinfo_cid).expect("narinfo should be on disk");
         let narinfo_text = std::str::from_utf8(&narinfo_bytes).unwrap();
         let parsed = NarInfo::from_text(narinfo_text).expect("narinfo must parse");
 
@@ -501,9 +485,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
 
         // Ingest 2 MiB of data to force multiple chunks and a bundle tree.
-        let large_data: Vec<u8> = (0u32..=524287u32)
-            .flat_map(|i| i.to_le_bytes())
-            .collect();
+        let large_data: Vec<u8> = (0u32..=524287u32).flat_map(|i| i.to_le_bytes()).collect();
         assert_eq!(large_data.len(), 2 * 1024 * 1024);
 
         let mut store = MemoryBookStore::new();

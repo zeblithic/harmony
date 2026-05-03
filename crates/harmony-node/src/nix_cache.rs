@@ -291,7 +291,8 @@ mod tests {
         let narinfo_cid = book_store.insert(narinfo_text.as_bytes()).unwrap();
 
         let store_hash = "aaaabbbbccccddddeeeeffffgggghhhh";
-        let input_cid = ContentId::for_book(store_hash.as_bytes(), ContentFlags::default()).unwrap();
+        let input_cid =
+            ContentId::for_book(store_hash.as_bytes(), ContentFlags::default()).unwrap();
 
         let identity =
             harmony_identity::pq_identity::PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
@@ -355,12 +356,7 @@ mod tests {
 
         let uri = format!("/{store_hash}.narinfo");
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(&uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -375,7 +371,10 @@ mod tests {
         );
         let body = to_bytes(resp.into_body(), 4096).await.unwrap();
         let text = std::str::from_utf8(&body).unwrap();
-        assert!(text.contains("StorePath:"), "narinfo body missing StorePath");
+        assert!(
+            text.contains("StorePath:"),
+            "narinfo body missing StorePath"
+        );
     }
 
     #[tokio::test]
@@ -440,12 +439,7 @@ mod tests {
         let cid_hex = hex::encode(cid.to_bytes());
         let uri = format!("/nar/{cid_hex}.nar");
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(&uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -475,12 +469,7 @@ mod tests {
         let cid_hex = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
         let uri = format!("/nar/{cid_hex}.nar");
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(&uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
 

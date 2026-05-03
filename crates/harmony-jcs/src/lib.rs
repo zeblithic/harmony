@@ -62,7 +62,10 @@ fn serialize_string(s: &str, buf: &mut Vec<u8>) {
                 const HEX: &[u8; 16] = b"0123456789abcdef";
                 let b = ch as u8;
                 buf.extend_from_slice(&[
-                    b'\\', b'u', b'0', b'0',
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
                     HEX[(b >> 4) as usize],
                     HEX[(b & 0xF) as usize],
                 ]);

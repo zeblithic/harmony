@@ -110,9 +110,7 @@ pub fn prepare_engram_request_latent(
         );
     }
     if let Some(&pos) = positions.iter().find(|&&p| p >= seq_len) {
-        candle_core::bail!(
-            "token_position {pos} out of bounds for seq_len={seq_len}"
-        );
+        candle_core::bail!("token_position {pos} out of bounds for seq_len={seq_len}");
     }
 
     let mut lookups = Vec::with_capacity(binary_keys.len());
@@ -380,8 +378,7 @@ mod tests {
         let client = test_client();
         let keys = vec![vec![0xABu8, 0xCD], vec![0x12, 0x34], vec![0xFF, 0x00]];
         let positions = vec![1, 2, 2];
-        let request =
-            prepare_engram_request_latent(&client, &keys, &positions, 3).unwrap();
+        let request = prepare_engram_request_latent(&client, &keys, &positions, 3).unwrap();
 
         assert_eq!(request.lookups.len(), 3);
         assert_eq!(request.seq_len, 3);
@@ -393,7 +390,10 @@ mod tests {
 
         for lookup in &request.lookups {
             for &idx in &lookup.lookup.shard_indices {
-                assert!(idx < client.config().num_shards, "shard index out of bounds");
+                assert!(
+                    idx < client.config().num_shards,
+                    "shard index out of bounds"
+                );
             }
         }
     }
@@ -403,8 +403,7 @@ mod tests {
         let client = test_client();
         let keys = vec![vec![0x00u8], vec![0xFF]];
         let positions = vec![1, 1];
-        let request =
-            prepare_engram_request_latent(&client, &keys, &positions, 5).unwrap();
+        let request = prepare_engram_request_latent(&client, &keys, &positions, 5).unwrap();
 
         assert_eq!(request.seq_len, 5);
         assert_eq!(request.lookups.len(), 2);

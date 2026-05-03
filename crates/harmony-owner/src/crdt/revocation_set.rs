@@ -82,7 +82,8 @@ mod tests {
 
     fn make_self_revocation(target: [u8; 16], ts: u64) -> RevocationCert {
         let sk = SigningKey::generate(&mut OsRng);
-        RevocationCert::sign_self(&sk, [0u8; 16], target, ts, RevocationReason::Decommissioned).unwrap()
+        RevocationCert::sign_self(&sk, [0u8; 16], target, ts, RevocationReason::Decommissioned)
+            .unwrap()
     }
 
     #[test]
@@ -174,11 +175,16 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let target = [9u8; 16];
 
-        let r_decom =
-            RevocationCert::sign_self(&sk, [0u8; 16], target, 100, RevocationReason::Decommissioned)
-                .unwrap();
-        let r_lost = RevocationCert::sign_self(&sk, [0u8; 16], target, 100, RevocationReason::Lost)
-            .unwrap();
+        let r_decom = RevocationCert::sign_self(
+            &sk,
+            [0u8; 16],
+            target,
+            100,
+            RevocationReason::Decommissioned,
+        )
+        .unwrap();
+        let r_lost =
+            RevocationCert::sign_self(&sk, [0u8; 16], target, 100, RevocationReason::Lost).unwrap();
         assert_ne!(
             r_decom.signature, r_lost.signature,
             "different reasons must produce different signatures"
@@ -201,13 +207,7 @@ mod tests {
         s_b.insert(lower.clone());
 
         // Both replicas converge on `higher`.
-        assert_eq!(
-            s_a.cert_for(target).unwrap().signature,
-            higher.signature
-        );
-        assert_eq!(
-            s_b.cert_for(target).unwrap().signature,
-            higher.signature
-        );
+        assert_eq!(s_a.cert_for(target).unwrap().signature, higher.signature);
+        assert_eq!(s_b.cert_for(target).unwrap().signature, higher.signature);
     }
 }

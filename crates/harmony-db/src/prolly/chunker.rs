@@ -204,12 +204,7 @@ mod tests {
             })
             .collect();
 
-        let chunks = chunk_items(
-            &items,
-            &config,
-            |item| item.1,
-            |item| &item.0,
-        );
+        let chunks = chunk_items(&items, &config, |item| item.1, |item| &item.0);
 
         // Verify we got multiple chunks (1000 items * 40 bytes = 40000 bytes,
         // target 4096, so we should get roughly 10 chunks).
@@ -227,8 +222,7 @@ mod tests {
             .iter()
             .map(|c| c.iter().map(|item| item.1).sum::<usize>())
             .collect();
-        let avg_size: f64 =
-            chunk_sizes.iter().sum::<usize>() as f64 / chunk_sizes.len() as f64;
+        let avg_size: f64 = chunk_sizes.iter().sum::<usize>() as f64 / chunk_sizes.len() as f64;
 
         // Average should be within a reasonable range of the target.
         assert!(
@@ -258,7 +252,11 @@ mod tests {
         // Single item larger than max_size.
         let items: Vec<(Vec<u8>, usize)> = vec![(b"huge-item".to_vec(), 20000)];
         let chunks = chunk_items(&items, &config, |item| item.1, |item| &item.0);
-        assert_eq!(chunks.len(), 1, "single oversized item should form one chunk");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "single oversized item should form one chunk"
+        );
         assert_eq!(chunks[0].len(), 1);
     }
 }

@@ -122,9 +122,7 @@ async fn smtp_rcpt_to_remote_domain_resolves_seals_publishes() {
 
     // ── IMAP store with NO local user for bob ──────────────────────
     let tmp = tempfile::tempdir().expect("tempdir");
-    let imap = Arc::new(
-        ImapStore::open(&tmp.path().join("a.db")).expect("open imap store"),
-    );
+    let imap = Arc::new(ImapStore::open(&tmp.path().join("a.db")).expect("open imap store"));
 
     // ── Resolvers ─────────────────────────────────────────────────
     let email_resolver: Arc<dyn harmony_mail_discovery::resolver::EmailResolver> =
@@ -323,12 +321,8 @@ async fn smtp_rcpt_to_remote_domain_resolves_seals_publishes() {
     let sealed_bytes = sample.payload().to_bytes().to_vec();
 
     // ── Open the envelope with Bob's private identity ──────────────
-    let opened = HarmonyEnvelope::open(
-        &bob_priv,
-        gateway_a_priv.public_identity(),
-        &sealed_bytes,
-    )
-    .expect("HarmonyEnvelope::open failed");
+    let opened = HarmonyEnvelope::open(&bob_priv, gateway_a_priv.public_identity(), &sealed_bytes)
+        .expect("HarmonyEnvelope::open failed");
 
     // ── The recovered plaintext is the serialized HarmonyMessage ───
     let recovered = HarmonyMessage::from_bytes(&opened.plaintext)
@@ -511,8 +505,7 @@ async fn smtp_rcpt_to_unknown_user_returns_550() {
         }
     }
 
-    let er: Arc<dyn harmony_mail_discovery::resolver::EmailResolver> =
-        Arc::new(AlwaysUserUnknown);
+    let er: Arc<dyn harmony_mail_discovery::resolver::EmailResolver> = Arc::new(AlwaysUserUnknown);
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(ImapStore::open(&tmp.path().join("test.db")).unwrap());
 
@@ -650,7 +643,9 @@ async fn smtp_rcpt_to_mixed_local_and_remote_recipients() {
     let store = Arc::new(ImapStore::open(&tmp.path().join("test.db")).unwrap());
 
     // Add local user "bob" to the IMAP store
-    store.create_user("bob", "hunter2", &bob_address_hash).unwrap();
+    store
+        .create_user("bob", "hunter2", &bob_address_hash)
+        .unwrap();
 
     let mut session = SmtpSession::new(edge_case_smtp_config());
     let mut writer = Vec::<u8>::new();

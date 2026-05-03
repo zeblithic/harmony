@@ -103,9 +103,7 @@ pub fn verify_key_binding(
     let typ = header_json
         .get("typ")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            SdJwtError::KeyBindingInvalid(String::from("KB-JWT typ header missing"))
-        })?;
+        .ok_or_else(|| SdJwtError::KeyBindingInvalid(String::from("KB-JWT typ header missing")))?;
     if !typ.eq_ignore_ascii_case("kb+jwt") && !typ.eq_ignore_ascii_case("application/kb+jwt") {
         return Err(SdJwtError::KeyBindingInvalid(format!(
             "KB-JWT typ must be \"kb+jwt\", got \"{typ}\""
@@ -116,16 +114,14 @@ pub fn verify_key_binding(
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(kb_payload_b64)
         .map_err(|_| SdJwtError::Base64Error)?;
-    let payload_json: serde_json::Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| SdJwtError::JsonError(e.to_string()))?;
+    let payload_json: serde_json::Value =
+        serde_json::from_slice(&payload_bytes).map_err(|e| SdJwtError::JsonError(e.to_string()))?;
 
     // 7. Verify nonce.
     let nonce = payload_json
         .get("nonce")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            SdJwtError::KeyBindingInvalid(String::from("KB-JWT nonce claim missing"))
-        })?;
+        .ok_or_else(|| SdJwtError::KeyBindingInvalid(String::from("KB-JWT nonce claim missing")))?;
     if nonce != expected_nonce {
         return Err(SdJwtError::KeyBindingInvalid(format!(
             "KB-JWT nonce mismatch: expected \"{expected_nonce}\", got \"{nonce}\""
@@ -157,9 +153,11 @@ pub fn verify_key_binding(
         .get("iat")
         .ok_or_else(|| SdJwtError::KeyBindingInvalid(String::from("KB-JWT iat claim missing")))?
         .as_u64()
-        .ok_or_else(|| SdJwtError::KeyBindingInvalid(String::from(
-            "KB-JWT iat claim is not a valid non-negative integer"
-        )))?;
+        .ok_or_else(|| {
+            SdJwtError::KeyBindingInvalid(String::from(
+                "KB-JWT iat claim is not a valid non-negative integer",
+            ))
+        })?;
     if iat > now.saturating_add(MAX_CLOCK_SKEW) {
         return Err(SdJwtError::KeyBindingInvalid(format!(
             "KB-JWT iat is in the future: iat={iat}, now={now}"
@@ -230,11 +228,7 @@ mod tests {
     /// Build a complete SdJwt with a valid Key Binding JWT for testing.
     ///
     /// Returns `(sd_jwt, holder_pub_key_bytes)`.
-    fn make_sd_jwt_with_kb(
-        nonce: &str,
-        aud: &str,
-        iat: u64,
-    ) -> (SdJwt, alloc::vec::Vec<u8>) {
+    fn make_sd_jwt_with_kb(nonce: &str, aud: &str, iat: u64) -> (SdJwt, alloc::vec::Vec<u8>) {
         let issuer = harmony_identity::PrivateIdentity::generate(&mut OsRng);
         let holder = harmony_identity::PrivateIdentity::generate(&mut OsRng);
         let holder_pub = holder.public_identity().verifying_key.to_bytes().to_vec();
@@ -308,7 +302,8 @@ mod tests {
     #[test]
     fn valid_key_binding() {
         let now = 1_700_000_000u64;
-        let (sd_jwt, holder_pub) = make_sd_jwt_with_kb("test-nonce", "https://verifier.example", now);
+        let (sd_jwt, holder_pub) =
+            make_sd_jwt_with_kb("test-nonce", "https://verifier.example", now);
         let result = verify_key_binding(
             &sd_jwt,
             &holder_pub,
@@ -364,8 +359,7 @@ mod tests {
     #[test]
     fn wrong_aud() {
         let now = 1_700_000_000u64;
-        let (sd_jwt, holder_pub) =
-            make_sd_jwt_with_kb("nonce", "https://correct.example", now);
+        let (sd_jwt, holder_pub) = make_sd_jwt_with_kb("nonce", "https://correct.example", now);
         let result = verify_key_binding(
             &sd_jwt,
             &holder_pub,
@@ -401,10 +395,7 @@ mod tests {
         );
         match result {
             Err(SdJwtError::KeyBindingInvalid(msg)) => {
-                assert!(
-                    msg.contains("future"),
-                    "error should mention future: {msg}"
-                );
+                assert!(msg.contains("future"), "error should mention future: {msg}");
             }
             other => panic!("expected KeyBindingInvalid with future, got {:?}", other),
         }
@@ -442,8 +433,7 @@ mod tests {
     #[test]
     fn wrong_holder_key() {
         let now = 1_700_000_000u64;
-        let (sd_jwt, _holder_pub) =
-            make_sd_jwt_with_kb("nonce", "https://verifier.example", now);
+        let (sd_jwt, _holder_pub) = make_sd_jwt_with_kb("nonce", "https://verifier.example", now);
         // Use a different key
         let wrong_key = harmony_identity::PrivateIdentity::generate(&mut OsRng);
         let wrong_pub = wrong_key.public_identity().verifying_key.to_bytes();
@@ -490,11 +480,21 @@ mod tests {
         let kb_jwt = format!("{kb_si}.{}", B64.encode(&kb_sig));
 
         let sd_jwt = SdJwt {
-            header: JwsHeader { alg: "EdDSA".into(), typ: Some("sd+jwt".into()), kid: None },
+            header: JwsHeader {
+                alg: "EdDSA".into(),
+                typ: Some("sd+jwt".into()),
+                kid: None,
+            },
             payload: JwtPayload {
-                iss: Some("i".into()), sub: Some("h".into()),
-                iat: None, exp: None, nbf: None, sd: vec![], sd_alg: None,
-                #[cfg(feature = "std")] extra: vec![],
+                iss: Some("i".into()),
+                sub: Some("h".into()),
+                iat: None,
+                exp: None,
+                nbf: None,
+                sd: vec![],
+                sd_alg: None,
+                #[cfg(feature = "std")]
+                extra: vec![],
             },
             signature: issuer_sig.to_vec(),
             signing_input,
@@ -506,7 +506,10 @@ mod tests {
             &sd_jwt,
             &holder_pub.verifying_key.to_bytes(),
             CryptoSuite::Ed25519,
-            "n", "a", now, 300,
+            "n",
+            "a",
+            now,
+            300,
         );
         assert!(matches!(
             result,
@@ -544,11 +547,21 @@ mod tests {
         let kb_jwt = format!("{kb_si}.{}", B64.encode(&kb_sig));
 
         let sd_jwt = SdJwt {
-            header: JwsHeader { alg: "EdDSA".into(), typ: Some("sd+jwt".into()), kid: None },
+            header: JwsHeader {
+                alg: "EdDSA".into(),
+                typ: Some("sd+jwt".into()),
+                kid: None,
+            },
             payload: JwtPayload {
-                iss: Some("issuer".into()), sub: Some("holder".into()),
-                iat: None, exp: None, nbf: None, sd: vec![], sd_alg: None,
-                #[cfg(feature = "std")] extra: vec![],
+                iss: Some("issuer".into()),
+                sub: Some("holder".into()),
+                iat: None,
+                exp: None,
+                nbf: None,
+                sd: vec![],
+                sd_alg: None,
+                #[cfg(feature = "std")]
+                extra: vec![],
             },
             signature: issuer_sig.to_vec(),
             signing_input,
@@ -564,7 +577,8 @@ mod tests {
             "https://verifier.example",
             now,
             300,
-        ).is_ok());
+        )
+        .is_ok());
     }
 
     #[test]

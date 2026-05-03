@@ -131,9 +131,7 @@ impl VectorIndex {
     /// Validate config invariants shared across new/load/view.
     fn validate_config(config: &VectorIndexConfig) -> SearchResult<()> {
         if config.dimensions == 0 {
-            return Err(SearchError::InvalidConfig(
-                "dimensions must be > 0".into(),
-            ));
+            return Err(SearchError::InvalidConfig("dimensions must be > 0".into()));
         }
         if config.connectivity == 0 {
             return Err(SearchError::InvalidConfig(
@@ -154,7 +152,10 @@ impl VectorIndex {
             .reserve(config.capacity)
             .map_err(|e| SearchError::Index(e.to_string()))?;
 
-        Ok(Self { inner: index, config })
+        Ok(Self {
+            inner: index,
+            config,
+        })
     }
 
     /// Add a vector with the given key.

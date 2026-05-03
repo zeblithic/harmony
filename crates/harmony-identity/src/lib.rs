@@ -13,12 +13,12 @@ pub mod ucan;
 pub mod verify;
 
 pub use crypto_suite::CryptoSuite;
+#[cfg(feature = "std")]
+pub use did::{parse_jwk_value, resolve_did_jwk};
 pub use did::{
     parse_multibase_key, resolve_did, resolve_did_key, DefaultDidResolver, DidError, DidResolver,
     ResolvedDid, ResolvedDidDocument,
 };
-#[cfg(feature = "std")]
-pub use did::{parse_jwk_value, resolve_did_jwk};
 pub use did_document::did_web_to_url;
 #[cfg(feature = "std")]
 pub use did_document::{parse_did_document, WebDidFetcher, WebDidResolver};

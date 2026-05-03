@@ -493,7 +493,8 @@ impl DefaultEmailResolver {
                 };
                 let now = this.time.now();
                 this.caches.sweep_expired(now);
-                this.highest_serial.retain(|k, _| this.caches.has_claim_key(k));
+                this.highest_serial
+                    .retain(|k, _| this.caches.has_claim_key(k));
                 let window = this.config.soft_fail_window_secs;
                 this.revocation_refresh_locks
                     .retain(|domain, _| this.caches.was_domain_seen_within(domain, now, window));
@@ -554,8 +555,7 @@ mod tests {
         let sk = d.mint_signing_key(&mut rng, NOW - 100, NOW + 86_400);
         let claim = ClaimBuilder::new(&d, &sk, NOW).build();
 
-        let key_live: (String, [u8; 32]) =
-            ("example.com".into(), claim.payload.hashed_local_part);
+        let key_live: (String, [u8; 32]) = ("example.com".into(), claim.payload.hashed_local_part);
         let key_stale: (String, [u8; 32]) = ("example.com".into(), [2u8; 32]);
 
         r.caches.put_claim(key_live.clone(), claim, u64::MAX, 0);
@@ -563,8 +563,7 @@ mod tests {
         r.highest_serial.insert(key_stale.clone(), 99);
         assert_eq!(r.highest_serial.len(), 2);
 
-        r.highest_serial
-            .retain(|k, _| r.caches.has_claim_key(k));
+        r.highest_serial.retain(|k, _| r.caches.has_claim_key(k));
         assert_eq!(r.highest_serial.len(), 1);
         assert!(r.highest_serial.contains_key(&key_live));
         assert!(!r.highest_serial.contains_key(&key_stale));

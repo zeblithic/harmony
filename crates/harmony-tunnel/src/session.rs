@@ -321,9 +321,7 @@ impl TunnelSession {
         // Jittered keepalive interval: 25-35 seconds.
         // Mix remote_node_id into the nonce seed so each session has a unique
         // cycle, preventing correlation of keepalive timing across sessions.
-        let remote_id_u64 = u64::from_le_bytes(
-            self.remote_node_id[..8].try_into().unwrap()
-        );
+        let remote_id_u64 = u64::from_le_bytes(self.remote_node_id[..8].try_into().unwrap());
         let timing_seed = self.send_nonce.wrapping_add(remote_id_u64);
         let jitter = (timing_seed % 11) * 1_000; // 0-10s, session-unique cycle
         let interval = KEEPALIVE_BASE_MS - KEEPALIVE_JITTER_MS + jitter;
@@ -621,8 +619,7 @@ mod tests {
                 };
 
                 // Impersonator intercepts and replies with its own identity
-                let impersonator_id =
-                    harmony_identity::PqPrivateIdentity::generate(&mut OsRng);
+                let impersonator_id = harmony_identity::PqPrivateIdentity::generate(&mut OsRng);
                 let (_impersonator_session, accept_actions) =
                     TunnelSession::new_responder(&mut OsRng, &impersonator_id, &init_bytes, 0)
                         .unwrap();

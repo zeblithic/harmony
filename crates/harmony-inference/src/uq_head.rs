@@ -177,10 +177,7 @@ impl UqHead {
             );
         }
         if confidence_b.dims() != [1] {
-            candle_core::bail!(
-                "confidence_b: expected [1], got {:?}",
-                confidence_b.dims()
-            );
+            candle_core::bail!("confidence_b: expected [1], got {:?}", confidence_b.dims());
         }
 
         Ok(Self {
@@ -389,12 +386,7 @@ mod tests {
         }
 
         // All probabilities should be in [0, 1]
-        let all_probs: Vec<f32> = output
-            .class_probs
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
+        let all_probs: Vec<f32> = output.class_probs.flatten_all().unwrap().to_vec1().unwrap();
         for (i, &p) in all_probs.iter().enumerate() {
             assert!(
                 (0.0..=1.0).contains(&p),
@@ -410,12 +402,7 @@ mod tests {
         let features = Tensor::randn(0f32, 1f32, (3, 8), &Device::Cpu).unwrap();
         let output = head.forward(&features).unwrap();
 
-        let confs: Vec<f32> = output
-            .confidence
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
+        let confs: Vec<f32> = output.confidence.flatten_all().unwrap().to_vec1().unwrap();
         for (i, &c) in confs.iter().enumerate() {
             assert!(
                 (0.0..=1.0).contains(&c),
@@ -462,7 +449,10 @@ mod tests {
         let (class, conf) = head.classify(&features).unwrap();
 
         assert_eq!(class, UqClass::Confident);
-        assert!((conf - 0.5).abs() < 1e-5, "confidence = {conf}, expected 0.5");
+        assert!(
+            (conf - 0.5).abs() < 1e-5,
+            "confidence = {conf}, expected 0.5"
+        );
     }
 
     #[test]
@@ -503,12 +493,7 @@ mod tests {
         let features = Tensor::zeros((1, 8), candle_core::DType::F32, d).unwrap();
         let output = head.forward(&features).unwrap();
 
-        let probs: Vec<f32> = output
-            .class_probs
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
+        let probs: Vec<f32> = output.class_probs.flatten_all().unwrap().to_vec1().unwrap();
         for (i, &p) in probs.iter().enumerate() {
             assert!(
                 (p - 0.25).abs() < 1e-5,

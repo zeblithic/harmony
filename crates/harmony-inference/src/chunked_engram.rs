@@ -160,10 +160,7 @@ impl ChunkedEngramScheduler {
     /// Extracts bigrams and trigrams from the full buffer and returns the
     /// request with all required shards (including those already cached).
     /// Use [`missing_shards`](Self::missing_shards) to filter.
-    pub fn prepare_request(
-        &self,
-        client: &EngramClient,
-    ) -> Result<EngramRequest, InferenceError> {
+    pub fn prepare_request(&self, client: &EngramClient) -> Result<EngramRequest, InferenceError> {
         let window: Vec<u32> = self.token_buffer.iter().copied().collect();
         engram_bridge::prepare_engram_request(client, &window)
             .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))
@@ -198,9 +195,8 @@ impl ChunkedEngramScheduler {
         }
 
         // Resolve full embeddings: [1, window_len, engram_dim].
-        let embeddings =
-            engram_bridge::resolve_engram_embeddings(client, request, &merged, device)
-                .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))?;
+        let embeddings = engram_bridge::resolve_engram_embeddings(client, request, &merged, device)
+            .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))?;
 
         // Extract last position: [1, 1, engram_dim].
         let seq_len = request.seq_len;
@@ -260,13 +256,8 @@ impl ChunkedEngramScheduler {
         let (keys, positions) = projection
             .project_ngrams(embeddings, window_len)
             .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))?;
-        engram_bridge::prepare_engram_request_latent(
-            client,
-            &keys,
-            &positions,
-            window_len,
-        )
-        .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))
+        engram_bridge::prepare_engram_request_latent(client, &keys, &positions, window_len)
+            .map_err(|e| InferenceError::EngramResolutionFailed(e.to_string()))
     }
 
     /// Number of shards currently in the persistent cache.
@@ -281,7 +272,9 @@ impl ChunkedEngramScheduler {
 
     /// Steps remaining until the next chunk boundary Engram refresh.
     pub fn steps_until_boundary(&self) -> usize {
-        self.config.chunk_size.saturating_sub(self.steps_since_refresh)
+        self.config
+            .chunk_size
+            .saturating_sub(self.steps_since_refresh)
     }
 
     /// Clear all state (token buffer, cached embedding, shard cache).
@@ -422,7 +415,9 @@ mod tests {
         // shard_size(100) * vector_bytes(4*2=8) = 800 bytes per shard
         let request = scheduler.prepare_request(&client).unwrap();
         let shard_data = zero_shard_data(10, 800);
-        scheduler.resolve(&request, shard_data, &client, &device).unwrap();
+        scheduler
+            .resolve(&request, shard_data, &client, &device)
+            .unwrap();
 
         // Next 3 tokens: continue, continue, boundary.
         assert_eq!(scheduler.push_token(4), StepResult::Continue);
@@ -501,7 +496,9 @@ mod tests {
 
         let request = scheduler.prepare_request(&client).unwrap();
         let shard_data = zero_shard_data(10, 800);
-        scheduler.resolve(&request, shard_data, &client, &device).unwrap();
+        scheduler
+            .resolve(&request, shard_data, &client, &device)
+            .unwrap();
 
         let emb = scheduler.cached_embedding().expect("should have embedding");
         // Shape: [1, 1, embedding_dim=4]
@@ -522,7 +519,9 @@ mod tests {
         let request = scheduler.prepare_request(&client).unwrap();
         let shard_data = zero_shard_data(10, 800);
         let num_shards = shard_data.len();
-        scheduler.resolve(&request, shard_data, &client, &device).unwrap();
+        scheduler
+            .resolve(&request, shard_data, &client, &device)
+            .unwrap();
 
         assert_eq!(scheduler.shard_cache_len(), num_shards);
     }
@@ -578,10 +577,7 @@ mod tests {
     struct MockFetcher;
 
     impl ShardFetcher for MockFetcher {
-        fn fetch(
-            &self,
-            shards: &[&ShardRequest],
-        ) -> Result<HashMap<u64, Vec<u8>>, InferenceError> {
+        fn fetch(&self, shards: &[&ShardRequest]) -> Result<HashMap<u64, Vec<u8>>, InferenceError> {
             Ok(shards
                 .iter()
                 .map(|s| (s.shard_index, vec![0u8; 800]))
@@ -606,10 +602,7 @@ mod tests {
         // Step 3: chunk boundary → auto-resolve.
         step_decode(&mut scheduler, 3, &client, &fetcher, &device).unwrap();
         assert!(scheduler.cached_embedding().is_some());
-        assert_eq!(
-            scheduler.cached_embedding().unwrap().dims(),
-            &[1, 1, 4],
-        );
+        assert_eq!(scheduler.cached_embedding().unwrap().dims(), &[1, 1, 4],);
         assert_eq!(scheduler.steps_since_refresh(), 0);
     }
 
@@ -649,16 +642,17 @@ mod tests {
 
         // Create a tiny latent projection matching EMBEDDING_DIM
         let proj = crate::latent_projection::LatentProjection::new_random(
-            EMBEDDING_DIM, 8, 4, &Device::Cpu,
-        ).unwrap();
+            EMBEDDING_DIM,
+            8,
+            4,
+            &Device::Cpu,
+        )
+        .unwrap();
 
         // Token buffer should have 5 tokens (max_window = chunk_size + 2 = 5)
         let token_buf: Vec<u32> = scheduler.token_buffer().iter().copied().collect();
-        let dummy_embeddings = Tensor::randn(
-            0f32, 1.0,
-            (1, token_buf.len(), EMBEDDING_DIM),
-            &Device::Cpu,
-        ).unwrap();
+        let dummy_embeddings =
+            Tensor::randn(0f32, 1.0, (1, token_buf.len(), EMBEDDING_DIM), &Device::Cpu).unwrap();
 
         let request = scheduler
             .prepare_request_latent(&client, &proj, &dummy_embeddings)

@@ -6,13 +6,13 @@
 //! On encoding changes that bump BindingFormatVersion, regenerate the
 //! fixtures and bump the version byte in the test data.
 
+use ed25519_dalek::SigningKey;
 use harmony_owner::{
     cbor,
     certs::{EnrollmentCert, EnrollmentIssuer},
     pubkey_bundle::{ClassicalKeys, PubKeyBundle},
     signing::{sign_with_tag, tags},
 };
-use ed25519_dalek::SigningKey;
 
 // Golden vector: byte-exact CBOR encoding of the deterministic EnrollmentCert v1
 // fixture. If this changes unintentionally, the wire format has drifted; bump
@@ -76,7 +76,8 @@ fn master_enrollment_cert_v1_is_deterministic() {
         device_bundle,
         1_700_000_000,
         None,
-    ).unwrap();
+    )
+    .unwrap();
 
     let bytes_a = cbor::to_canonical(&cert).unwrap();
     assert_eq!(
@@ -85,7 +86,10 @@ fn master_enrollment_cert_v1_is_deterministic() {
         "wire format changed; bump BindingFormatVersion and regenerate fixture intentionally"
     );
     let bytes_b = cbor::to_canonical(&cert).unwrap();
-    assert_eq!(bytes_a, bytes_b, "encoding must be deterministic across runs");
+    assert_eq!(
+        bytes_a, bytes_b,
+        "encoding must be deterministic across runs"
+    );
 
     // Round-trip
     let decoded: EnrollmentCert = cbor::from_bytes(&bytes_a).unwrap();
@@ -93,7 +97,11 @@ fn master_enrollment_cert_v1_is_deterministic() {
     decoded.verify().unwrap();
 
     // Print bytes for documentation; fixtures consumers can save these.
-    println!("EnrollmentCert (Master) v1 bytes ({}): {}", bytes_a.len(), hex::encode(&bytes_a));
+    println!(
+        "EnrollmentCert (Master) v1 bytes ({}): {}",
+        bytes_a.len(),
+        hex::encode(&bytes_a)
+    );
 }
 
 fn deterministic_signer_a() -> SigningKey {
@@ -162,7 +170,10 @@ fn quorum_enrollment_cert_v1_is_deterministic() {
 
     let bytes_a = cbor::to_canonical(&cert).unwrap();
     let bytes_b = cbor::to_canonical(&cert).unwrap();
-    assert_eq!(bytes_a, bytes_b, "encoding must be deterministic across runs");
+    assert_eq!(
+        bytes_a, bytes_b,
+        "encoding must be deterministic across runs"
+    );
 
     // Round-trip
     let decoded: EnrollmentCert = cbor::from_bytes(&bytes_a).unwrap();

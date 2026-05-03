@@ -1,5 +1,5 @@
 use crate::OwnerError;
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey, Signature};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 /// Domain tags per cert type. Every signature is computed over
 /// `tag || canonical_cbor_bytes(payload)`, which prevents a signature
@@ -12,11 +12,7 @@ pub mod tags {
     pub const RECLAMATION: &[u8] = b"harmony-owner/v1/Reclamation";
 }
 
-pub fn sign_with_tag(
-    sk: &SigningKey,
-    tag: &[u8],
-    payload_bytes: &[u8],
-) -> Vec<u8> {
+pub fn sign_with_tag(sk: &SigningKey, tag: &[u8], payload_bytes: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(tag.len() + payload_bytes.len());
     buf.extend_from_slice(tag);
     buf.extend_from_slice(payload_bytes);
@@ -37,7 +33,8 @@ pub fn verify_with_tag(
     let mut buf = Vec::with_capacity(tag.len() + payload_bytes.len());
     buf.extend_from_slice(tag);
     buf.extend_from_slice(payload_bytes);
-    vk.verify_strict(&buf, &sig).map_err(|_| OwnerError::InvalidSignature { cert_type })
+    vk.verify_strict(&buf, &sig)
+        .map_err(|_| OwnerError::InvalidSignature { cert_type })
 }
 
 #[cfg(test)]

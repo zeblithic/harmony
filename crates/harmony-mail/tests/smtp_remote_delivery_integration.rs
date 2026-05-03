@@ -174,12 +174,8 @@ async fn smtp_remote_delivery_round_trips_through_zenoh_to_recipient() {
     let sealed_bytes = sample.payload().to_bytes().to_vec();
 
     // ── Open the envelope with Bob's private identity ──────────────
-    let opened = HarmonyEnvelope::open(
-        &bob_priv,
-        gateway_a_priv.public_identity(),
-        &sealed_bytes,
-    )
-    .expect("HarmonyEnvelope::open failed");
+    let opened = HarmonyEnvelope::open(&bob_priv, gateway_a_priv.public_identity(), &sealed_bytes)
+        .expect("HarmonyEnvelope::open failed");
 
     // ── The recovered plaintext is the serialized HarmonyMessage ───
     let recovered = HarmonyMessage::from_bytes(&opened.plaintext)

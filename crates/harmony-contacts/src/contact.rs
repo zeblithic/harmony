@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ContactAddress {
-    Reticulum { destination_hash: [u8; 16] },
+    Reticulum {
+        destination_hash: [u8; 16],
+    },
     Tunnel {
         node_id: [u8; 32],
         relay_url: Option<String>,
@@ -232,6 +234,11 @@ mod tests {
         };
         let bytes = postcard::to_allocvec(&contact).unwrap();
         let decoded: Contact = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.replication, Some(ReplicationPolicy { quota_bytes: 10 * 1024 * 1024 * 1024 }));
+        assert_eq!(
+            decoded.replication,
+            Some(ReplicationPolicy {
+                quota_bytes: 10 * 1024 * 1024 * 1024
+            })
+        );
     }
 }

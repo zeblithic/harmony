@@ -70,7 +70,10 @@ fn canonicalize(v: Value) -> Result<Value, OwnerError> {
 
 /// Serde codec: encode `[u8; 16]` as CBOR byte string (not an array of ints).
 pub mod arr16 {
-    use serde::{de::{Error, Visitor}, Deserializer, Serializer};
+    use serde::{
+        de::{Error, Visitor},
+        Deserializer, Serializer,
+    };
     use std::fmt;
 
     pub fn serialize<S: Serializer>(v: &[u8; 16], s: S) -> Result<S::Ok, S::Error> {
@@ -106,7 +109,11 @@ pub mod arr16 {
 /// Serde codec: encode `Vec<[u8; 16]>` as a CBOR array of byte strings
 /// (not an array of arrays of ints).
 pub mod arr16_vec {
-    use serde::{de::{Error, SeqAccess, Visitor}, ser::SerializeSeq, Deserializer, Serializer};
+    use serde::{
+        de::{Error, SeqAccess, Visitor},
+        ser::SerializeSeq,
+        Deserializer, Serializer,
+    };
     use std::fmt;
 
     pub fn serialize<S: Serializer>(v: &Vec<[u8; 16]>, s: S) -> Result<S::Ok, S::Error> {
@@ -144,7 +151,11 @@ pub mod arr16_vec {
 /// Serde codec: encode `Vec<Vec<u8>>` (variable-length signature list) as a
 /// CBOR array of byte strings.
 pub mod bytes_vec {
-    use serde::{de::{SeqAccess, Visitor}, ser::SerializeSeq, Deserializer, Serializer};
+    use serde::{
+        de::{SeqAccess, Visitor},
+        ser::SerializeSeq,
+        Deserializer, Serializer,
+    };
     use std::fmt;
 
     pub fn serialize<S: Serializer>(v: &Vec<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
@@ -187,7 +198,10 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let v = Sample { a: 42, b: "hello".into() };
+        let v = Sample {
+            a: 42,
+            b: "hello".into(),
+        };
         let bytes = to_canonical(&v).unwrap();
         let decoded: Sample = from_bytes(&bytes).unwrap();
         assert_eq!(v, decoded);
@@ -195,7 +209,10 @@ mod tests {
 
     #[test]
     fn deterministic_encoding() {
-        let v = Sample { a: 42, b: "hello".into() };
+        let v = Sample {
+            a: 42,
+            b: "hello".into(),
+        };
         let b1 = to_canonical(&v).unwrap();
         let b2 = to_canonical(&v).unwrap();
         assert_eq!(b1, b2, "encoding must be deterministic");
@@ -238,8 +255,8 @@ mod tests {
         let bytes = to_canonical(&v).unwrap();
         // Outer array of 2; each element bstr-64 (0x58 0x40 ... 64 bytes)
         assert_eq!(bytes[0], 0x82);
-        assert_eq!(bytes[1], 0x58);  // bstr with 1-byte length
-        assert_eq!(bytes[2], 0x40);  // length = 64
+        assert_eq!(bytes[1], 0x58); // bstr with 1-byte length
+        assert_eq!(bytes[2], 0x40); // length = 64
         let decoded: W = from_bytes(&bytes).unwrap();
         assert_eq!(v, decoded);
     }

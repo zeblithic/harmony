@@ -19,7 +19,10 @@ pub fn enroll_via_quorum(
     active_window_secs: u64,
 ) -> Result<EnrollResult, OwnerError> {
     if quorum_signers.len() < 2 {
-        return Err(OwnerError::InsufficientQuorum { min: 2, got: quorum_signers.len() });
+        return Err(OwnerError::InsufficientQuorum {
+            min: 2,
+            got: quorum_signers.len(),
+        });
     }
 
     // Fail-fast validation of quorum signers: distinct, enrolled, not
@@ -40,10 +43,10 @@ pub fn enroll_via_quorum(
     }
     for (sk, id) in &quorum_signers {
         // Must be enrolled
-        let _enrollment = state
-            .enrollments
-            .get(id)
-            .ok_or(OwnerError::NotEnrolled { owner: state.owner_id, device: *id })?;
+        let _enrollment = state.enrollments.get(id).ok_or(OwnerError::NotEnrolled {
+            owner: state.owner_id,
+            device: *id,
+        })?;
         // Must not be revoked
         if state.is_revoked(*id) {
             return Err(OwnerError::Revoked { device: *id });
@@ -85,7 +88,8 @@ pub fn enroll_via_quorum(
         issuer_data,
     })?;
 
-    let signatures: Vec<Vec<u8>> = quorum_signers.iter()
+    let signatures: Vec<Vec<u8>> = quorum_signers
+        .iter()
         .map(|(sk, _)| sign_with_tag(sk, tags::ENROLLMENT, &payload_bytes))
         .collect();
 
@@ -98,23 +102,32 @@ pub fn enroll_via_quorum(
         device_pubkeys: new_device_pubkey,
         issued_at: now,
         expires_at: None,
-        issuer: EnrollmentIssuer::Quorum { signers: signers.clone(), signatures },
+        issuer: EnrollmentIssuer::Quorum {
+            signers: signers.clone(),
+            signatures,
+        },
         signature: Vec::new(),
     };
 
     // Reuse `active` from the fail-fast block (computed once at function entry).
-    let auto_vouch_certs: Vec<VouchingCert> = active.iter()
+    let auto_vouch_certs: Vec<VouchingCert> = active
+        .iter()
         .filter(|s| **s != device_id)
-        .map(|sibling_id| VouchingCert::sign(
-            new_device_sk,
-            state.owner_id,
-            *sibling_id,
-            Stance::Vouch,
-            now,
-        ))
+        .map(|sibling_id| {
+            VouchingCert::sign(
+                new_device_sk,
+                state.owner_id,
+                *sibling_id,
+                Stance::Vouch,
+                now,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(EnrollResult { enrollment_cert, auto_vouch_certs })
+    Ok(EnrollResult {
+        enrollment_cert,
+        auto_vouch_certs,
+    })
 }
 
 #[cfg(test)]
@@ -131,7 +144,9 @@ mod tests {
         let mut state = mint.state;
         let device_a_id = *state.enrollments.keys().next().unwrap();
         let device_a_sk = mint.device_signing_key;
-        state.add_liveness(LivenessCert::sign(&device_a_sk, state.owner_id, 1_000_001).unwrap()).unwrap();
+        state
+            .add_liveness(LivenessCert::sign(&device_a_sk, state.owner_id, 1_000_001).unwrap())
+            .unwrap();
 
         // Enroll device B via master
         let device_b_sk = SigningKey::generate(&mut OsRng);
@@ -142,11 +157,29 @@ mod tests {
             },
             post_quantum: None,
         };
-        let r1 = enroll_via_master(&state, &mint.recovery_artifact, &device_b_sk, device_b_bundle.clone(), 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
+        let r1 = enroll_via_master(
+            &state,
+            &mint.recovery_artifact,
+            &device_b_sk,
+            device_b_bundle.clone(),
+            1_001_000,
+            crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+        )
+        .unwrap();
         let device_b_id = device_b_bundle.identity_hash();
-        state.add_enrollment(r1.enrollment_cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
-        for v in r1.auto_vouch_certs { state.add_vouching(v).unwrap(); }
-        state.add_liveness(LivenessCert::sign(&device_b_sk, state.owner_id, 1_001_001).unwrap()).unwrap();
+        state
+            .add_enrollment(
+                r1.enrollment_cert,
+                1_001_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
+        for v in r1.auto_vouch_certs {
+            state.add_vouching(v).unwrap();
+        }
+        state
+            .add_liveness(LivenessCert::sign(&device_b_sk, state.owner_id, 1_001_001).unwrap())
+            .unwrap();
 
         // Now enroll device C via quorum of A+B
         let device_c_sk = SigningKey::generate(&mut OsRng);
@@ -165,21 +198,35 @@ mod tests {
             device_c_bundle.clone(),
             1_002_000,
             crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
-        ).unwrap();
+        )
+        .unwrap();
 
-        state.add_enrollment(r2.enrollment_cert, 1_002_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS).unwrap();
-        for v in r2.auto_vouch_certs { state.add_vouching(v).unwrap(); }
+        state
+            .add_enrollment(
+                r2.enrollment_cert,
+                1_002_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
+        for v in r2.auto_vouch_certs {
+            state.add_vouching(v).unwrap();
+        }
 
         // Verify Device C is now enrolled
-        assert!(state.enrollments.contains_key(&device_c_bundle.identity_hash()));
+        assert!(state
+            .enrollments
+            .contains_key(&device_c_bundle.identity_hash()));
 
         // Trust evaluation: enroll_via_quorum auto-vouches C-for-each-active-sibling,
         // i.e. C vouches FOR A and FOR B. A and B have NOT vouched FOR C yet, so C
         // is Provisional initially. Once A explicitly ratifies C, C transitions to Full.
-        state.add_liveness(LivenessCert::sign(&device_c_sk, state.owner_id, 1_002_001).unwrap()).unwrap();
+        state
+            .add_liveness(LivenessCert::sign(&device_c_sk, state.owner_id, 1_002_001).unwrap())
+            .unwrap();
         let device_c_id = device_c_bundle.identity_hash();
         let decision = crate::trust::evaluate_trust(
-            &state, device_c_id,
+            &state,
+            device_c_id,
             1_002_001,
             crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
             crate::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
@@ -188,12 +235,17 @@ mod tests {
 
         // After A explicitly ratifies C, trust → Full
         let vouch = crate::certs::VouchingCert::sign(
-            &device_a_sk, state.owner_id, device_c_id,
-            crate::certs::Stance::Vouch, 1_002_500,
-        ).unwrap();
+            &device_a_sk,
+            state.owner_id,
+            device_c_id,
+            crate::certs::Stance::Vouch,
+            1_002_500,
+        )
+        .unwrap();
         state.add_vouching(vouch).unwrap();
         let decision = crate::trust::evaluate_trust(
-            &state, device_c_id,
+            &state,
+            device_c_id,
             1_002_500,
             crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
             crate::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
@@ -263,7 +315,9 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(OwnerError::InvalidSignature { cert_type: "Enrollment-Quorum-Inactive-Signer" })
+            Err(OwnerError::InvalidSignature {
+                cert_type: "Enrollment-Quorum-Inactive-Signer"
+            })
         ));
     }
 
@@ -274,10 +328,20 @@ mod tests {
         let device_a_sk = mint.device_signing_key;
         let new_sk = SigningKey::generate(&mut OsRng);
         let new_bundle = PubKeyBundle {
-            classical: ClassicalKeys { ed25519_verify: new_sk.verifying_key().to_bytes(), x25519_pub: [0u8; 32] },
+            classical: ClassicalKeys {
+                ed25519_verify: new_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
             post_quantum: None,
         };
-        let result = enroll_via_quorum(&mint.state, vec![(&device_a_sk, device_a_id)], &new_sk, new_bundle, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS);
+        let result = enroll_via_quorum(
+            &mint.state,
+            vec![(&device_a_sk, device_a_id)],
+            &new_sk,
+            new_bundle,
+            1_001_000,
+            crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+        );
         assert!(matches!(result, Err(OwnerError::InsufficientQuorum { .. })));
     }
 }

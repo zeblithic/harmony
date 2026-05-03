@@ -93,7 +93,10 @@ mod tests {
 
     #[test]
     fn decode_empty_payload() {
-        assert!(matches!(decode_event(&[]), Err(TelemetryError::EmptyPayload)));
+        assert!(matches!(
+            decode_event(&[]),
+            Err(TelemetryError::EmptyPayload)
+        ));
     }
 
     #[test]

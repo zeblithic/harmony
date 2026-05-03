@@ -43,7 +43,10 @@ mod tests {
         assert_eq!(decoded.intent, "object_detected");
         assert_eq!(decoded.sequence, 42);
         assert_eq!(decoded.timestamp, 1711500000);
-        assert_eq!(decoded.payload, json!({"class": "person", "bbox": [10, 20, 100, 200]}));
+        assert_eq!(
+            decoded.payload,
+            json!({"class": "person", "bbox": [10, 20, 100, 200]})
+        );
         assert_eq!(decoded.confidence, Some(0.95));
         assert_eq!(decoded.source.as_deref(), Some("camera:0"));
     }
@@ -92,7 +95,10 @@ mod tests {
         };
         let json2 = serde_json::to_string(&event2).unwrap();
         let decoded2: TelemetryEvent = serde_json::from_str(&json2).unwrap();
-        assert_eq!(decoded2.payload, json!({"nested": {"array": [1, 2, 3], "flag": true}}));
+        assert_eq!(
+            decoded2.payload,
+            json!({"nested": {"array": [1, 2, 3], "flag": true}})
+        );
     }
 
     #[test]
@@ -107,8 +113,17 @@ mod tests {
             source: Some("test".to_string()),
         };
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"node_addr\""), "expected snake_case, got: {json}");
-        assert!(json.contains("\"intent\""), "expected intent key, got: {json}");
-        assert!(!json.contains("\"nodeAddr\""), "unexpected camelCase in: {json}");
+        assert!(
+            json.contains("\"node_addr\""),
+            "expected snake_case, got: {json}"
+        );
+        assert!(
+            json.contains("\"intent\""),
+            "expected intent key, got: {json}"
+        );
+        assert!(
+            !json.contains("\"nodeAddr\""),
+            "unexpected camelCase in: {json}"
+        );
     }
 }

@@ -128,19 +128,11 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
         .to_string();
     let typ: Option<String> = match header_json.get("typ") {
         None => None,
-        Some(v) => Some(
-            v.as_str()
-                .ok_or(SdJwtError::MalformedCompact)?
-                .to_string(),
-        ),
+        Some(v) => Some(v.as_str().ok_or(SdJwtError::MalformedCompact)?.to_string()),
     };
     let kid: Option<String> = match header_json.get("kid") {
         None => None,
-        Some(v) => Some(
-            v.as_str()
-                .ok_or(SdJwtError::MalformedCompact)?
-                .to_string(),
-        ),
+        Some(v) => Some(v.as_str().ok_or(SdJwtError::MalformedCompact)?.to_string()),
     };
 
     let header = crate::types::JwsHeader { alg, typ, kid };
@@ -149,8 +141,8 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(payload_b64)
         .map_err(|_| SdJwtError::Base64Error)?;
-    let payload_json: serde_json::Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| SdJwtError::JsonError(e.to_string()))?;
+    let payload_json: serde_json::Value =
+        serde_json::from_slice(&payload_bytes).map_err(|e| SdJwtError::JsonError(e.to_string()))?;
 
     // RFC 7519 §4: the Claims Set MUST be a JSON object.
     if !payload_json.is_object() {
@@ -198,17 +190,15 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
     // RFC 9901 §5.1: _sd_alg MUST be a string when present.
     let sd_alg: Option<String> = match payload_json.get("_sd_alg") {
         None => None,
-        Some(v) => Some(
-            v.as_str()
-                .ok_or(SdJwtError::MalformedCompact)?
-                .to_string(),
-        ),
+        Some(v) => Some(v.as_str().ok_or(SdJwtError::MalformedCompact)?.to_string()),
     };
 
     // Collect extra claims (everything that isn't a known field).
     // payload_json is guaranteed to be an object by the is_object() guard above.
     let known_fields = ["iss", "sub", "iat", "exp", "nbf", "_sd", "_sd_alg"];
-    let obj = payload_json.as_object().expect("guarded by is_object() above");
+    let obj = payload_json
+        .as_object()
+        .expect("guarded by is_object() above");
     let extra: Vec<(String, serde_json::Value)> = obj
         .iter()
         .filter(|(k, _)| !known_fields.contains(&k.as_str()))
@@ -271,8 +261,8 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
                     .ok_or(SdJwtError::InvalidDisclosure)?
                     .to_string();
                 let value = arr[1].clone();
-                let claim_value = serde_json::to_vec(&value)
-                    .map_err(|e| SdJwtError::JsonError(e.to_string()))?;
+                let claim_value =
+                    serde_json::to_vec(&value).map_err(|e| SdJwtError::JsonError(e.to_string()))?;
 
                 crate::types::Disclosure {
                     raw: (*segment).to_string(),
@@ -293,8 +283,8 @@ pub fn parse(compact: &str) -> Result<crate::types::SdJwt, SdJwtError> {
                     .ok_or(SdJwtError::InvalidDisclosure)?
                     .to_string();
                 let value = arr[2].clone();
-                let claim_value = serde_json::to_vec(&value)
-                    .map_err(|e| SdJwtError::JsonError(e.to_string()))?;
+                let claim_value =
+                    serde_json::to_vec(&value).map_err(|e| SdJwtError::JsonError(e.to_string()))?;
 
                 crate::types::Disclosure {
                     raw: (*segment).to_string(),
@@ -421,7 +411,10 @@ mod tests {
         let compact = build_jws(&header, &payload, b"sig");
 
         let sd_jwt = parse(&compact).unwrap();
-        assert_eq!(sd_jwt.payload.iss.as_deref(), Some("https://issuer.example"));
+        assert_eq!(
+            sd_jwt.payload.iss.as_deref(),
+            Some("https://issuer.example")
+        );
         assert_eq!(sd_jwt.payload.sub.as_deref(), Some("user42"));
         assert_eq!(sd_jwt.payload.iat, Some(1700000000));
         assert_eq!(sd_jwt.payload.exp, Some(1700003600));
@@ -468,7 +461,10 @@ mod tests {
     #[test]
     fn error_missing_jws_segment() {
         // Compact starts with '~' — JWS part is absent.
-        assert!(matches!(parse("~disclosure"), Err(SdJwtError::MalformedCompact)));
+        assert!(matches!(
+            parse("~disclosure"),
+            Err(SdJwtError::MalformedCompact)
+        ));
         assert!(matches!(parse("~"), Err(SdJwtError::MalformedCompact)));
     }
 
@@ -584,12 +580,7 @@ mod tests {
         let payload = serde_json::json!({"_sd": []});
         let kb1 = "eyJhbGciOiJFZERTQSJ9.eyJub25jZSI6IjEifQ.c2ln";
         let kb2 = "eyJhbGciOiJFZERTQSJ9.eyJub25jZSI6IjIifQ.c2ln";
-        let compact = format!(
-            "{}~{}~{}~",
-            build_jws(&header, &payload, b"sig"),
-            kb1,
-            kb2
-        );
+        let compact = format!("{}~{}~{}~", build_jws(&header, &payload, b"sig"), kb1, kb2);
         assert!(matches!(parse(&compact), Err(SdJwtError::MalformedCompact)));
     }
 

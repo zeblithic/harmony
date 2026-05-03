@@ -66,7 +66,10 @@ pub enum GroupAction {
     /// Dissolve (close) the group permanently (founder only).
     Dissolve,
     /// Update group metadata.
-    UpdateInfo { name: Option<String>, mode: Option<GroupMode> },
+    UpdateInfo {
+        name: Option<String>,
+        mode: Option<GroupMode>,
+    },
 }
 
 /// Canonical op payload used for content addressing (excludes `id` and `signature`).
@@ -179,12 +182,24 @@ mod tests {
         assert_eq!(state.role_of(&addr), None);
         assert!(!state.is_member(&addr));
 
-        state.members.insert(addr, MemberEntry { role: Role::Founder, joined_at: 1000 });
+        state.members.insert(
+            addr,
+            MemberEntry {
+                role: Role::Founder,
+                joined_at: 1000,
+            },
+        );
         assert_eq!(state.role_of(&addr), Some(Role::Founder));
         assert!(state.is_member(&addr));
 
         let officer: MemberAddr = [0x02; 16];
-        state.members.insert(officer, MemberEntry { role: Role::Officer, joined_at: 2000 });
+        state.members.insert(
+            officer,
+            MemberEntry {
+                role: Role::Officer,
+                joined_at: 2000,
+            },
+        );
         assert_eq!(state.role_of(&officer), Some(Role::Officer));
     }
 
@@ -206,7 +221,9 @@ mod tests {
             parents: alloc::vec![[0x11; 32], [0x22; 32]],
             author: [0x33; 16],
             timestamp: 1_700_000_000,
-            action: GroupAction::Invite { invitee: [0x44; 16] },
+            action: GroupAction::Invite {
+                invitee: [0x44; 16],
+            },
         };
         let bytes = postcard::to_allocvec(&payload).unwrap();
         let decoded: GroupOpPayload = postcard::from_bytes(&bytes).unwrap();
@@ -215,7 +232,10 @@ mod tests {
 
     #[test]
     fn serde_round_trip_member_entry() {
-        let entry = MemberEntry { role: Role::Officer, joined_at: 999 };
+        let entry = MemberEntry {
+            role: Role::Officer,
+            joined_at: 999,
+        };
         let bytes = postcard::to_allocvec(&entry).unwrap();
         let decoded: MemberEntry = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(entry, decoded);
@@ -242,7 +262,10 @@ mod tests {
         };
         state.members.insert(
             [0x01; 16],
-            MemberEntry { role: Role::Founder, joined_at: 500 },
+            MemberEntry {
+                role: Role::Founder,
+                joined_at: 500,
+            },
         );
         let bytes = postcard::to_allocvec(&state).unwrap();
         let decoded: GroupState = postcard::from_bytes(&bytes).unwrap();

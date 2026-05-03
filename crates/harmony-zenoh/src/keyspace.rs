@@ -441,15 +441,10 @@ pub fn db_block_key(
 /// Build a db block queryable pattern (wildcard for any CID).
 ///
 /// Pattern: `harmony/db/{owner_addr_hex}/{db_name}/block/*`
-pub fn db_block_queryable(
-    owner_addr_hex: &str,
-    db_name: &str,
-) -> Result<OwnedKeyExpr, ZenohError> {
+pub fn db_block_queryable(owner_addr_hex: &str, db_name: &str) -> Result<OwnedKeyExpr, ZenohError> {
     reject_slashes(owner_addr_hex)?;
     reject_slashes(db_name)?;
-    ke(&format!(
-        "harmony/db/{owner_addr_hex}/{db_name}/block/*"
-    ))
+    ke(&format!("harmony/db/{owner_addr_hex}/{db_name}/block/*"))
 }
 
 // ── Re-export the keyexpr type for consumers ─────────────────────────

@@ -67,11 +67,15 @@ impl VouchingSet {
 
     /// Vouches for target from active signers (filter applied externally).
     pub fn vouches_for(&self, target: [u8; 16]) -> impl Iterator<Item = &VouchingCert> {
-        self.cells.values().filter(move |c| c.target == target && c.stance == Stance::Vouch)
+        self.cells
+            .values()
+            .filter(move |c| c.target == target && c.stance == Stance::Vouch)
     }
 
     pub fn challenges_against(&self, target: [u8; 16]) -> impl Iterator<Item = &VouchingCert> {
-        self.cells.values().filter(move |c| c.target == target && c.stance == Stance::Challenge)
+        self.cells
+            .values()
+            .filter(move |c| c.target == target && c.stance == Stance::Challenge)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &VouchingCert> {
@@ -89,7 +93,12 @@ mod tests {
     /// Helper that signs a cert with the supplied key and returns the
     /// derived signer-id alongside the cert (so callers can predict the
     /// CRDT key without re-deriving).
-    fn make_cert_with_key(sk: &SigningKey, target: [u8; 16], stance: Stance, ts: u64) -> ([u8; 16], VouchingCert) {
+    fn make_cert_with_key(
+        sk: &SigningKey,
+        target: [u8; 16],
+        stance: Stance,
+        ts: u64,
+    ) -> ([u8; 16], VouchingCert) {
         let signer = PubKeyBundle::classical_only(sk.verifying_key().to_bytes()).identity_hash();
         let cert = VouchingCert::sign(sk, [0u8; 16], target, stance, ts).unwrap();
         (signer, cert)
@@ -196,7 +205,8 @@ mod tests {
         let signer_sk = SigningKey::generate(&mut OsRng);
         let target = [9u8; 16];
 
-        let c_vouch = VouchingCert::sign(&signer_sk, [1u8; 16], target, Stance::Vouch, 100).unwrap();
+        let c_vouch =
+            VouchingCert::sign(&signer_sk, [1u8; 16], target, Stance::Vouch, 100).unwrap();
         let c_challenge =
             VouchingCert::sign(&signer_sk, [1u8; 16], target, Stance::Challenge, 100).unwrap();
         assert_ne!(

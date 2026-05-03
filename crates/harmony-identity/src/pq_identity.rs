@@ -192,20 +192,12 @@ impl PqPrivateIdentity {
     /// Same seed in → same keypairs out. Used by harmony-client to back up and
     /// restore identity via the ZEB-175 recovery library.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
-        let kem_seed_bytes = harmony_crypto::hkdf::DerivedKey::new(
-            seed,
-            None,
-            SEED_INFO_ML_KEM,
-            ml_kem::SK_LENGTH,
-        )
-        .expect("HKDF length 64 is within the SHA-256 limit");
-        let dsa_seed_bytes = harmony_crypto::hkdf::DerivedKey::new(
-            seed,
-            None,
-            SEED_INFO_ML_DSA,
-            ml_dsa::SK_LENGTH,
-        )
-        .expect("HKDF length 32 is within the SHA-256 limit");
+        let kem_seed_bytes =
+            harmony_crypto::hkdf::DerivedKey::new(seed, None, SEED_INFO_ML_KEM, ml_kem::SK_LENGTH)
+                .expect("HKDF length 64 is within the SHA-256 limit");
+        let dsa_seed_bytes =
+            harmony_crypto::hkdf::DerivedKey::new(seed, None, SEED_INFO_ML_DSA, ml_dsa::SK_LENGTH)
+                .expect("HKDF length 32 is within the SHA-256 limit");
 
         let mut kem_seed: [u8; ml_kem::SK_LENGTH] = kem_seed_bytes
             .as_bytes()
@@ -773,10 +765,8 @@ mod tests {
 
     #[test]
     fn pq_generate_with_proof_produces_valid_proof() {
-        let (id, proof) = PqPrivateIdentity::generate_with_proof(
-            &mut OsRng,
-            &crate::puzzle::PuzzleParams::TEST,
-        );
+        let (id, proof) =
+            PqPrivateIdentity::generate_with_proof(&mut OsRng, &crate::puzzle::PuzzleParams::TEST);
         assert!(id.verify_proof(&proof, &crate::puzzle::PuzzleParams::TEST));
     }
 
@@ -794,10 +784,8 @@ mod tests {
 
     #[test]
     fn pq_generate_with_proof_identity_is_functional() {
-        let (id, _proof) = PqPrivateIdentity::generate_with_proof(
-            &mut OsRng,
-            &crate::puzzle::PuzzleParams::TEST,
-        );
+        let (id, _proof) =
+            PqPrivateIdentity::generate_with_proof(&mut OsRng, &crate::puzzle::PuzzleParams::TEST);
         let sig = id.sign(b"test").unwrap();
         assert!(id.public_identity().verify(b"test", &sig).is_ok());
     }
@@ -809,10 +797,16 @@ mod tests {
         let seed = [0x42u8; 32];
         let a = PqPrivateIdentity::from_seed(&seed);
         let b = PqPrivateIdentity::from_seed(&seed);
-        assert_eq!(a.to_private_bytes(), b.to_private_bytes(),
-            "from_seed must produce identical private bytes for the same seed");
-        assert_eq!(a.public_identity().address_hash, b.public_identity().address_hash,
-            "from_seed must produce identical address hash for the same seed");
+        assert_eq!(
+            a.to_private_bytes(),
+            b.to_private_bytes(),
+            "from_seed must produce identical private bytes for the same seed"
+        );
+        assert_eq!(
+            a.public_identity().address_hash,
+            b.public_identity().address_hash,
+            "from_seed must produce identical address hash for the same seed"
+        );
     }
 
     #[test]
@@ -823,10 +817,13 @@ mod tests {
         // the ML-KEM seed must differ from the ML-DSA seed.
         let seed = [0x42u8; 32];
         let id = PqPrivateIdentity::from_seed(&seed);
-        let kem_bytes = id.encryption_secret.as_bytes();  // 64-byte ML-KEM seed
-        let dsa_bytes = id.signing_key.as_bytes();        // 32-byte ML-DSA seed
-        assert_ne!(&kem_bytes[..32], &dsa_bytes[..],
-            "info-string separation failed: ml-kem and ml-dsa derived to same bytes");
+        let kem_bytes = id.encryption_secret.as_bytes(); // 64-byte ML-KEM seed
+        let dsa_bytes = id.signing_key.as_bytes(); // 32-byte ML-DSA seed
+        assert_ne!(
+            &kem_bytes[..32],
+            &dsa_bytes[..],
+            "info-string separation failed: ml-kem and ml-dsa derived to same bytes"
+        );
     }
 
     #[test]
@@ -883,18 +880,28 @@ mod tests {
         //   classical_bytes: 64 bytes = [X25519 secret (32) || Ed25519 secret (32)]
         //   pq_bytes:        ml_kem::SK_LENGTH + ml_dsa::SK_LENGTH bytes =
         //                    [ML-KEM seed (64) || ML-DSA seed (32)]
-        let classical_x_bytes  = &classical_bytes[..32];
+        let classical_x_bytes = &classical_bytes[..32];
         let classical_ed_bytes = &classical_bytes[32..];
         let pq_kem_bytes = &pq_bytes[..ml_kem::SK_LENGTH];
         let pq_dsa_bytes = &pq_bytes[ml_kem::SK_LENGTH..];
 
-        assert_ne!(classical_ed_bytes, pq_dsa_bytes,
-            "ed25519 and ml-dsa derived to same 32 bytes — info-string separation failed");
-        assert_ne!(classical_x_bytes, pq_dsa_bytes,
-            "x25519 and ml-dsa derived to same 32 bytes — info-string separation failed");
-        assert_ne!(classical_ed_bytes, &pq_kem_bytes[..32],
-            "ed25519 and ml-kem (first 32B) derived to same bytes — info-string separation failed");
-        assert_ne!(classical_x_bytes, &pq_kem_bytes[..32],
-            "x25519 and ml-kem (first 32B) derived to same bytes — info-string separation failed");
+        assert_ne!(
+            classical_ed_bytes, pq_dsa_bytes,
+            "ed25519 and ml-dsa derived to same 32 bytes — info-string separation failed"
+        );
+        assert_ne!(
+            classical_x_bytes, pq_dsa_bytes,
+            "x25519 and ml-dsa derived to same 32 bytes — info-string separation failed"
+        );
+        assert_ne!(
+            classical_ed_bytes,
+            &pq_kem_bytes[..32],
+            "ed25519 and ml-kem (first 32B) derived to same bytes — info-string separation failed"
+        );
+        assert_ne!(
+            classical_x_bytes,
+            &pq_kem_bytes[..32],
+            "x25519 and ml-kem (first 32B) derived to same bytes — info-string separation failed"
+        );
     }
 }

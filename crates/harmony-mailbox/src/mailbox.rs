@@ -33,9 +33,18 @@ use crate::message::{ADDRESS_HASH_LEN, CID_LEN, MESSAGE_ID_LEN};
 // ── Wire format v1 size guards ───────────────────────────────────────
 // If any of these external constants change, the v1 wire format breaks.
 // Fail at compile time rather than producing silently incompatible blobs.
-const _: () = assert!(CID_LEN == 32, "mailbox v1 wire format requires CID_LEN == 32");
-const _: () = assert!(MESSAGE_ID_LEN == 16, "mailbox v1 wire format requires MESSAGE_ID_LEN == 16");
-const _: () = assert!(ADDRESS_HASH_LEN == 16, "mailbox v1 wire format requires ADDRESS_HASH_LEN == 16");
+const _: () = assert!(
+    CID_LEN == 32,
+    "mailbox v1 wire format requires CID_LEN == 32"
+);
+const _: () = assert!(
+    MESSAGE_ID_LEN == 16,
+    "mailbox v1 wire format requires MESSAGE_ID_LEN == 16"
+);
+const _: () = assert!(
+    ADDRESS_HASH_LEN == 16,
+    "mailbox v1 wire format requires ADDRESS_HASH_LEN == 16"
+);
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -272,12 +281,11 @@ impl MailFolder {
                 max: self.message_count as usize,
             });
         }
-        let count = u16::try_from(self.page_cids.len()).map_err(|_| {
-            MailboxError::TooManyEntries {
+        let count =
+            u16::try_from(self.page_cids.len()).map_err(|_| MailboxError::TooManyEntries {
                 count: self.page_cids.len(),
                 max: u16::MAX as usize,
-            }
-        })?;
+            })?;
         let mut buf = Vec::with_capacity(Self::MIN_SIZE + self.page_cids.len() * CID_LEN);
         buf.extend_from_slice(&FOLDER_MAGIC);
         buf.push(MAILBOX_VERSION);
@@ -519,12 +527,11 @@ impl MailPage {
                 max: PAGE_CAPACITY,
             });
         }
-        let count = u16::try_from(self.entries.len()).map_err(|_| {
-            MailboxError::TooManyEntries {
+        let count =
+            u16::try_from(self.entries.len()).map_err(|_| MailboxError::TooManyEntries {
                 count: self.entries.len(),
                 max: u16::MAX as usize,
-            }
-        })?;
+            })?;
 
         let mut buf = Vec::with_capacity(256);
         buf.extend_from_slice(&PAGE_MAGIC);
@@ -581,10 +588,7 @@ impl MailPage {
             });
         }
 
-        Ok(Self {
-            version,
-            entries,
-        })
+        Ok(Self { version, entries })
     }
 }
 
@@ -646,7 +650,9 @@ mod tests {
 
     #[test]
     fn mail_root_rejects_bad_magic() {
-        let mut bytes = MailRoot::new_empty(dummy_address(), 100).to_bytes().unwrap();
+        let mut bytes = MailRoot::new_empty(dummy_address(), 100)
+            .to_bytes()
+            .unwrap();
         bytes[0] = b'X';
         assert!(matches!(
             MailRoot::from_bytes(&bytes),
@@ -730,7 +736,9 @@ mod tests {
         // Should roundtrip without InvalidUtf8 — truncation respects char boundary
         let (decoded, _) = MessageEntry::from_bytes(&bytes).unwrap();
         assert!(decoded.subject_snippet.len() <= MAX_SNIPPET_LEN);
-        assert!(decoded.subject_snippet.is_char_boundary(decoded.subject_snippet.len()));
+        assert!(decoded
+            .subject_snippet
+            .is_char_boundary(decoded.subject_snippet.len()));
     }
 
     #[test]
@@ -796,7 +804,10 @@ mod tests {
         bytes[flag_offset] = 0x02;
         assert!(matches!(
             MessageEntry::from_bytes(&bytes),
-            Err(MailboxError::InvalidFlag { field: "read", value: 0x02 })
+            Err(MailboxError::InvalidFlag {
+                field: "read",
+                value: 0x02
+            })
         ));
     }
 
@@ -827,7 +838,11 @@ mod tests {
         bytes[len_offset..len_offset + 2].copy_from_slice(&bad_len.to_be_bytes());
         assert!(matches!(
             MessageEntry::from_bytes(&bytes),
-            Err(MailboxError::FieldTooLong { field: "subject_snippet", max: MAX_SNIPPET_LEN, .. })
+            Err(MailboxError::FieldTooLong {
+                field: "subject_snippet",
+                max: MAX_SNIPPET_LEN,
+                ..
+            })
         ));
     }
 

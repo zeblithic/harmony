@@ -100,11 +100,7 @@ pub fn unique_message_id() -> [u8; MESSAGE_ID_LEN] {
 /// the crate — should use `unique_message_id()` and get the real entropy
 /// sources. The helper is an internal verification seam only; the module
 /// test submodule can still reach it via `super::*`.
-fn compute_message_id(
-    salt: &[u8; 16],
-    time_nanos: u128,
-    seq: u64,
-) -> [u8; MESSAGE_ID_LEN] {
+fn compute_message_id(salt: &[u8; 16], time_nanos: u128, seq: u64) -> [u8; MESSAGE_ID_LEN] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(salt);
     hasher.update(&time_nanos.to_le_bytes());
@@ -638,8 +634,8 @@ fn read_utf8(
             expected: end - data.len(),
         });
     }
-    let s = std::str::from_utf8(&data[*pos..end])
-        .map_err(|_| MailboxError::InvalidUtf8 { field })?;
+    let s =
+        std::str::from_utf8(&data[*pos..end]).map_err(|_| MailboxError::InvalidUtf8 { field })?;
     *pos = end;
     Ok(s.to_owned())
 }
@@ -919,7 +915,8 @@ mod tests {
         //   + timestamp(8) + message_id(16) + in_reply_to_flag(1)
         //   + sender_address(16) + recipient_count(1) = 45 bytes
         //   then 16-byte address_hash, then the type byte at offset 61.
-        let type_byte_offset = 1 + 1 + 1 + 8 + MESSAGE_ID_LEN + 1 + ADDRESS_HASH_LEN + 1 + ADDRESS_HASH_LEN;
+        let type_byte_offset =
+            1 + 1 + 1 + 8 + MESSAGE_ID_LEN + 1 + ADDRESS_HASH_LEN + 1 + ADDRESS_HASH_LEN;
         assert_eq!(bytes[type_byte_offset], RecipientType::To as u8);
         bytes[type_byte_offset] = RecipientType::Bcc as u8;
 
@@ -1012,7 +1009,10 @@ mod tests {
             msg.flags.bits(),
             "consistent flags must roundtrip unchanged"
         );
-        assert!(decoded.flags.is_forward(), "is_forward must survive roundtrip");
+        assert!(
+            decoded.flags.is_forward(),
+            "is_forward must survive roundtrip"
+        );
         assert!(decoded.flags.is_reply());
         assert!(decoded.flags.has_attachments());
     }
@@ -1046,7 +1046,11 @@ mod tests {
         for _ in 0..N {
             ids.insert(unique_message_id());
         }
-        assert_eq!(ids.len(), N, "unique_message_id produced a collision in {N} calls");
+        assert_eq!(
+            ids.len(),
+            N,
+            "unique_message_id produced a collision in {N} calls"
+        );
     }
 
     #[test]

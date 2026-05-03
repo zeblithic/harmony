@@ -27,8 +27,10 @@ pub fn ops_to_send(local_ops: &[GroupOp], remote_tips: &[OpId]) -> Vec<OpId> {
     }
 
     // Build a map from OpId → parents for fast parent lookups.
-    let parent_map: HashMap<OpId, &[OpId]> =
-        local_ops.iter().map(|o| (o.id, o.parents.as_slice())).collect();
+    let parent_map: HashMap<OpId, &[OpId]> = local_ops
+        .iter()
+        .map(|o| (o.id, o.parents.as_slice()))
+        .collect();
 
     // BFS/DFS backwards from each remote tip to collect all ops the remote has.
     let mut remote_has: HashSet<OpId> = HashSet::new();
@@ -174,7 +176,11 @@ mod tests {
         // are reachable, nothing should be sent.
         let to_send = ops_to_send(&local, &[invite.id]);
 
-        assert!(to_send.is_empty(), "expected nothing to send, got: {:?}", to_send);
+        assert!(
+            to_send.is_empty(),
+            "expected nothing to send, got: {:?}",
+            to_send
+        );
     }
 
     // ── remote behind by one op → sends the missing op ───────────────────
@@ -192,7 +198,9 @@ mod tests {
             vec![invite.id],
             ALICE,
             1002,
-            GroupAction::Accept { invite_op: invite.id },
+            GroupAction::Accept {
+                invite_op: invite.id,
+            },
         );
 
         let local = vec![g.clone(), invite.clone(), accept.clone()];
@@ -245,7 +253,9 @@ mod tests {
             vec![g.id],
             FOUNDER,
             1002,
-            GroupAction::Invite { invitee: [0x05; 16] },
+            GroupAction::Invite {
+                invitee: [0x05; 16],
+            },
         );
 
         let local = vec![g.clone(), invite_a.clone(), invite_b.clone()];
@@ -271,7 +281,9 @@ mod tests {
             vec![invite.id],
             ALICE,
             1002,
-            GroupAction::Accept { invite_op: invite.id },
+            GroupAction::Accept {
+                invite_op: invite.id,
+            },
         );
 
         // Deliberately pass ops in reverse order — expect genesis first.

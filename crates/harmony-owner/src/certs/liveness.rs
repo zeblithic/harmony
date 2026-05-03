@@ -38,7 +38,8 @@ impl LivenessCert {
         owner_id: [u8; 16],
         timestamp: u64,
     ) -> Result<Self, OwnerError> {
-        let signer = PubKeyBundle::classical_only(signer_sk.verifying_key().to_bytes()).identity_hash();
+        let signer =
+            PubKeyBundle::classical_only(signer_sk.verifying_key().to_bytes()).identity_hash();
         let payload_bytes = cbor::to_canonical(&LivenessSigningPayload {
             version: LIVENESS_VERSION,
             owner_id,
@@ -61,7 +62,8 @@ impl LivenessCert {
         }
         // Bind the signer field to the provided verifying key so that a cert
         // claiming to be from device-A can never verify under device-B's key.
-        let expected_signer = PubKeyBundle::classical_only(signer_pubkey.to_bytes()).identity_hash();
+        let expected_signer =
+            PubKeyBundle::classical_only(signer_pubkey.to_bytes()).identity_hash();
         if self.signer != expected_signer {
             return Err(OwnerError::IdentityHashMismatch);
         }
@@ -71,7 +73,13 @@ impl LivenessCert {
             signer: self.signer,
             timestamp: self.timestamp,
         })?;
-        verify_with_tag(signer_pubkey, tags::LIVENESS, &payload_bytes, &self.signature, "Liveness")
+        verify_with_tag(
+            signer_pubkey,
+            tags::LIVENESS,
+            &payload_bytes,
+            &self.signature,
+            "Liveness",
+        )
     }
 }
 

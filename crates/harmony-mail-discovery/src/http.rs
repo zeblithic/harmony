@@ -173,7 +173,11 @@ impl HttpClient for ReqwestHttpClient {
         let cap = self.body_cap_bytes;
         let mut body = Vec::with_capacity(cap.min(8192));
         let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.try_next().await.map_err(|e| HttpError::Other(e.to_string()))? {
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(|e| HttpError::Other(e.to_string()))?
+        {
             if chunk.len() > cap.saturating_sub(body.len()) {
                 return Err(HttpError::BodyTooLarge);
             }

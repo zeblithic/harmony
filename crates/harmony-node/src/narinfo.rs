@@ -206,11 +206,7 @@ impl NarInfo {
                 "URL" => url = Some(value.to_string()),
                 "NarHash" => nar_hash = Some(value.to_string()),
                 "NarSize" => {
-                    nar_size = Some(
-                        value
-                            .parse()
-                            .map_err(|e| format!("invalid NarSize: {e}"))?,
-                    )
+                    nar_size = Some(value.parse().map_err(|e| format!("invalid NarSize: {e}"))?)
                 }
                 "References" => {
                     if !value.is_empty() {
@@ -318,14 +314,22 @@ mod tests {
             "fingerprint must start with '1;/nix/store/'"
         );
         // References in the fingerprint are comma-separated full store paths, sorted.
-        let refs_part = fp.split(';').nth(4).expect("fingerprint has 5 semicolon parts");
+        let refs_part = fp
+            .split(';')
+            .nth(4)
+            .expect("fingerprint has 5 semicolon parts");
         let refs: Vec<&str> = refs_part.split(',').collect();
         assert_eq!(refs.len(), 2);
         // Each ref is a full store path
         assert!(refs[0].starts_with("/nix/store/"), "ref must be full path");
         assert!(refs[1].starts_with("/nix/store/"), "ref must be full path");
         // Sorted alphabetically
-        assert!(refs[0] < refs[1], "references must be sorted: {} < {}", refs[0], refs[1]);
+        assert!(
+            refs[0] < refs[1],
+            "references must be sorted: {} < {}",
+            refs[0],
+            refs[1]
+        );
         assert!(fp.contains(&ni.nar_hash));
         assert!(fp.contains(&ni.nar_size.to_string()));
     }
@@ -340,9 +344,7 @@ mod tests {
         let (name_part, b64_part) = sig.split_once(':').expect("sig must contain ':'");
         assert_eq!(name_part, "test-key-1");
 
-        let sig_bytes = BASE64
-            .decode(b64_part)
-            .expect("sig base64 must be valid");
+        let sig_bytes = BASE64.decode(b64_part).expect("sig base64 must be valid");
         assert_eq!(sig_bytes.len(), 64, "ed25519 signature must be 64 bytes");
     }
 
@@ -376,7 +378,11 @@ mod tests {
         assert!(result.starts_with("sha256:"), "must start with 'sha256:'");
         // SHA-256 (32 bytes / 256 bits) → 52 nix-base32 chars
         let nix32_part = result.strip_prefix("sha256:").unwrap();
-        assert_eq!(nix32_part.len(), 52, "nix-base32 of 32 bytes should be 52 chars");
+        assert_eq!(
+            nix32_part.len(),
+            52,
+            "nix-base32 of 32 bytes should be 52 chars"
+        );
         // All-zero hash should produce all-zero nix-base32 (all '0' chars)
         assert!(
             nix32_part.chars().all(|c| c == '0'),
@@ -391,7 +397,11 @@ mod tests {
         let encoded = super::nix_base32_encode(&hash);
 
         // SHA-256 (32 bytes / 256 bits) → ceil(256/5) = 52 chars
-        assert_eq!(encoded.len(), 52, "nix-base32 of 32 bytes should be 52 chars");
+        assert_eq!(
+            encoded.len(),
+            52,
+            "nix-base32 of 32 bytes should be 52 chars"
+        );
 
         // All chars must be in the nix-base32 alphabet (no e, o, t, u)
         let alphabet = "0123456789abcdfghijklmnpqrsvwxyz";
@@ -430,7 +440,10 @@ mod tests {
         let text = ni.to_text();
         assert!(text.contains("StorePath:"), "must contain StorePath");
         assert!(text.contains("URL:"), "must contain URL");
-        assert!(text.contains("Compression: none"), "must contain Compression");
+        assert!(
+            text.contains("Compression: none"),
+            "must contain Compression"
+        );
         assert!(text.contains("FileHash:"), "must contain FileHash");
         assert!(text.contains("FileSize:"), "must contain FileSize");
         assert!(text.contains("NarHash:"), "must contain NarHash");

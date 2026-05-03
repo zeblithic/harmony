@@ -82,8 +82,7 @@ impl VerifyRequest {
         if payload.len() < pos + 4 {
             return Err("truncated payload: missing context_len".into());
         }
-        let context_len =
-            u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+        let context_len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
         // Guard against overflow on 32-bit targets: context_len * 4 must not wrap.
@@ -170,10 +169,8 @@ impl VerifyResponse {
                     return Err("truncated success response".into());
                 }
                 let accepted_count = payload[1];
-                let bonus_token =
-                    u32::from_le_bytes(payload[2..6].try_into().unwrap());
-                let bonus_logprob =
-                    f32::from_le_bytes(payload[6..10].try_into().unwrap());
+                let bonus_token = u32::from_le_bytes(payload[2..6].try_into().unwrap());
+                let bonus_logprob = f32::from_le_bytes(payload[6..10].try_into().unwrap());
                 Ok(VerifyResponse {
                     accepted_count,
                     bonus_token,
@@ -350,7 +347,7 @@ mod tests {
         let mut bytes = vec![VERIFY_TAG];
         bytes.extend_from_slice(&0u32.to_le_bytes()); // context_len = 0
         bytes.push(2); // draft_count = 2
-        // Only 4 bytes (half a draft entry)
+                       // Only 4 bytes (half a draft entry)
         bytes.extend_from_slice(&42u32.to_le_bytes());
         let err = VerifyRequest::parse(&bytes).unwrap_err();
         assert!(err.contains("truncated"));

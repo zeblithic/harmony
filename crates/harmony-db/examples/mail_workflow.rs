@@ -24,18 +24,20 @@ fn main() {
         let key = format!("msg{i:04}");
         let body = format!("Message body #{i}");
         let snippet = format!("Subject {i}");
-        db.insert("inbox", key.as_bytes(), body.as_bytes(), meta(false, &snippet))
-            .unwrap();
+        db.insert(
+            "inbox",
+            key.as_bytes(),
+            body.as_bytes(),
+            meta(false, &snippet),
+        )
+        .unwrap();
     }
     println!("Inbox: {} messages", db.table_len("inbox"));
 
     // Initial commit.
     let mut store = MemoryBookStore::new();
     let root1 = db.commit(Some(&mut store)).unwrap();
-    println!(
-        "Commit 1: {}",
-        hex::encode(root1.to_bytes())
-    );
+    println!("Commit 1: {}", hex::encode(root1.to_bytes()));
 
     println!("\n=== Mark 2 as read ===");
     db.update_meta("inbox", b"msg0000", meta(true, "Subject 0"))
@@ -64,10 +66,7 @@ fn main() {
 
     // Second commit.
     let root2 = db.commit(Some(&mut store)).unwrap();
-    println!(
-        "Commit 2: {}",
-        hex::encode(root2.to_bytes())
-    );
+    println!("Commit 2: {}", hex::encode(root2.to_bytes()));
 
     println!("\n=== Diff commit 1 vs 2 ===");
     let diff = db.diff(root1, root2, None).unwrap();

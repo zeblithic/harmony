@@ -1,21 +1,21 @@
 mod compute;
 mod config;
-#[cfg(feature = "nix-cache")]
-mod narinfo;
-#[cfg(feature = "nix-cache")]
-pub(crate) mod nix_cache;
-#[cfg(feature = "nix-cache")]
-pub(crate) mod nar;
 mod did_web_gateway;
 mod discovery;
 #[allow(dead_code)]
 pub(crate) mod disk_io;
-#[allow(dead_code)]
-pub(crate) mod memo_io;
 mod event_loop;
 mod identity_file;
 #[allow(dead_code)]
 mod inference;
+#[allow(dead_code)]
+pub(crate) mod memo_io;
+#[cfg(feature = "nix-cache")]
+pub(crate) mod nar;
+#[cfg(feature = "nix-cache")]
+mod narinfo;
+#[cfg(feature = "nix-cache")]
+pub(crate) mod nix_cache;
 mod runtime;
 // Zenoh-over-tunnel, initiator, and close paths are forward-looking (Bead #3).
 #[allow(dead_code)]
@@ -882,7 +882,11 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                             .map(|r| r.len())
                             .unwrap_or(0);
                         eprintln!("Type:   Bundle (Merkle DAG, depth {})", depth);
-                        eprintln!("Size:   {} bytes ({:.1} MB)", input_size, input_size as f64 / (1024.0 * 1024.0));
+                        eprintln!(
+                            "Size:   {} bytes ({:.1} MB)",
+                            input_size,
+                            input_size as f64 / (1024.0 * 1024.0)
+                        );
                         eprintln!("Chunks: {}", chunks);
                     }
                     other => {
@@ -925,9 +929,9 @@ fn run_nar_command(action: NarAction) -> Result<(), Box<dyn std::error::Error>> 
             let identity = crate::identity_file::load_or_generate(&id_path)?;
 
             if stdin {
-                let sp_name = store_path_name.or(store_path).ok_or(
-                    "--store-path-name (or positional store_path) required with --stdin",
-                )?;
+                let sp_name = store_path_name
+                    .or(store_path)
+                    .ok_or("--store-path-name (or positional store_path) required with --stdin")?;
                 let full_path = if sp_name.starts_with("/nix/store/") {
                     sp_name
                 } else {
@@ -944,7 +948,11 @@ fn run_nar_command(action: NarAction) -> Result<(), Box<dyn std::error::Error>> 
                 }
 
                 let result = crate::nar::push_store_path(
-                    &full_path, &nar_data, &nix_key, &data_dir, &identity.pq,
+                    &full_path,
+                    &nar_data,
+                    &nix_key,
+                    &data_dir,
+                    &identity.pq,
                 )?;
                 if result.skipped {
                     eprintln!("Skipped (already cached): {}", result.store_path);
@@ -961,14 +969,22 @@ fn run_nar_command(action: NarAction) -> Result<(), Box<dyn std::error::Error>> 
                     let refs = crate::nar::get_references(path).unwrap_or_default();
                     let nar_data = crate::nar::dump_nar(path)?;
                     let result = crate::nar::push_store_path_with_refs(
-                        path, &nar_data, &refs, &nix_key, &data_dir, &identity.pq,
+                        path,
+                        &nar_data,
+                        &refs,
+                        &nix_key,
+                        &data_dir,
+                        &identity.pq,
                     )?;
                     if result.skipped {
                         eprintln!("[{}/{}] Skipped: {}", i + 1, total, result.store_path);
                     } else {
                         eprintln!(
                             "[{}/{}] Pushed: {} ({} bytes)",
-                            i + 1, total, result.store_path, result.nar_size
+                            i + 1,
+                            total,
+                            result.store_path,
+                            result.nar_size
                         );
                     }
                 }
@@ -977,7 +993,12 @@ fn run_nar_command(action: NarAction) -> Result<(), Box<dyn std::error::Error>> 
                 let refs = crate::nar::get_references(&sp).unwrap_or_default();
                 let nar_data = crate::nar::dump_nar(&sp)?;
                 let result = crate::nar::push_store_path_with_refs(
-                    &sp, &nar_data, &refs, &nix_key, &data_dir, &identity.pq,
+                    &sp,
+                    &nar_data,
+                    &refs,
+                    &nix_key,
+                    &data_dir,
+                    &identity.pq,
                 )?;
                 if result.skipped {
                     eprintln!("Skipped (already cached): {}", result.store_path);
@@ -1014,11 +1035,9 @@ async fn spawn_nix_cache_server(
     let book_store = harmony_content::book::MemoryBookStore::new();
     if let Some(ref dir) = data_dir {
         let dir_clone = dir.clone();
-        let memos = tokio::task::spawn_blocking(move || {
-            crate::memo_io::scan_memos(&dir_clone)
-        })
-        .await
-        .map_err(|e| format!("failed to load memos: {e}"))?;
+        let memos = tokio::task::spawn_blocking(move || crate::memo_io::scan_memos(&dir_clone))
+            .await
+            .map_err(|e| format!("failed to load memos: {e}"))?;
 
         let memo_count = memos.len();
         for (memo, _) in memos {
