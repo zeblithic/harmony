@@ -4848,8 +4848,8 @@ mod tests {
         // Reticulum router's path table (`Node::path_table`). The default
         // NodeRuntime registers a `udp0` interface on construction, so
         // we pre-seed a path entry pointing the target hash at `udp0`
-        // via the `path_table_mut()` test seam (added on Node alongside
-        // the existing read-only `path_table()` accessor).
+        // via the `path_table_mut_for_tests()` test seam (added on
+        // Node alongside the existing read-only `path_table()` accessor).
         //
         // Then we feed RuntimeEvent::SendUnicastToDevice and tick(),
         // expecting exactly one RuntimeAction::SendOnInterface routed
@@ -4875,7 +4875,7 @@ mod tests {
             b[5..10].copy_from_slice(&ts_bytes[3..8]);
             b
         };
-        let result = rt.router.path_table_mut().update(
+        let result = rt.router.path_table_mut_for_tests().update(
             target,
             target, // next_hop = target itself (single-hop)
             0,      // hops
@@ -5024,7 +5024,7 @@ mod tests {
         let wire_bytes = pkt.to_bytes().expect("packet should serialize");
 
         // Seed A's path table so target → udp0 (mirrors Task 4's happy
-        // path; same path_table_mut() seam).
+        // path; same path_table_mut_for_tests() seam).
         let random_blob = {
             let mut b = [0u8; 10];
             let ts: u64 = 1000;
@@ -5032,7 +5032,7 @@ mod tests {
             b[5..10].copy_from_slice(&ts_bytes[3..8]);
             b
         };
-        let result = a.router.path_table_mut().update(
+        let result = a.router.path_table_mut_for_tests().update(
             target,
             target,
             0,

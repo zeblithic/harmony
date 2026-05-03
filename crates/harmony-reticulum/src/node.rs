@@ -728,14 +728,18 @@ impl Node {
         &self.path_table
     }
 
-    /// Mutable access to the path table.
+    /// Mutable access to the path table — **test-only seam**.
     ///
-    /// Primarily intended for tests and bootstrap paths that need to seed
-    /// routing entries directly (e.g. without a full announce flow).
-    /// Production code should prefer driving updates through
-    /// `process_inbound` (real announces) so cooperation scoring,
-    /// reverse-table bookkeeping, and replay detection all stay in sync.
-    pub fn path_table_mut(&mut self) -> &mut PathTable {
+    /// Renamed from `path_table_mut` (and `#[doc(hidden)]`) to make the
+    /// test-only intent loud. The path table normally tracks state that
+    /// only `process_inbound` (announces) and the announce-rebroadcast
+    /// path know how to update consistently — direct mutation skips
+    /// cooperation scoring, reverse-table bookkeeping, and replay
+    /// detection. Use this only in tests / bootstrap paths that need
+    /// to seed routing entries without a real announce flow; production
+    /// code MUST drive updates through the inbound path.
+    #[doc(hidden)]
+    pub fn path_table_mut_for_tests(&mut self) -> &mut PathTable {
         &mut self.path_table
     }
 
