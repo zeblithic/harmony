@@ -221,6 +221,26 @@ pub enum RuntimeEvent {
     ///     latency — a defer-only tick cannot walk the entire pending
     ///     queue.
     ///
+    /// Ordering contract:
+    ///   - **Per-destination FIFO is preserved.** Multiple sends to the
+    ///     same `destination_hash` queued in the same tick remain in
+    ///     arrival order across deferrals. (Same-destination entries
+    ///     that all defer get re-queued at the front in arrival order
+    ///     and on the next tick hit the same path-exists state.)
+    ///   - **Cross-destination ordering is best-effort, routability-
+    ///     driven.** A send to a known-routable destination can leave
+    ///     the runtime ahead of an earlier-queued send to an unknown
+    ///     destination. This is intentional — strict cross-destination
+    ///     FIFO would mean a single un-resolvable destination at the
+    ///     head blocks deliverable sends behind it (e.g., a DM to an
+    ///     offline recipient blocking a DM to an online recipient).
+    ///     The CodeRabbit-suggested `break`-on-first-defer was rejected
+    ///     for this reason.
+    ///   - Callers that need cross-destination ordering MUST enforce it
+    ///     above this surface (the harmony-client outbox layer is the
+    ///     natural place — it can chain dependent sends or use a
+    ///     per-conversation queue).
+    ///
     /// Retry/expiration semantics live above this surface — harmony-client's
     /// outbox layer (ZEB-216 Sub-B Phase 3b, ZEB-227) owns retry policy,
     /// 30-day expiration, and the user-visible "couldn't deliver" surface.
