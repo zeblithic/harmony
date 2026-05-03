@@ -4895,6 +4895,162 @@ mod tests {
     }
 
     #[test]
+    fn unicast_round_trip_a_to_b_surfaces_as_unicast_received() {
+        // ZEB-216 Sub-B Phase 3a — Task 5: end-to-end plumbing smoke.
+        //
+        // Validates the full chain wired across Tasks 1-4 by running
+        // two independent NodeRuntime instances ("A" and "B") and
+        // hand-bridging A's outbound `SendOnInterface` action into B's
+        // `InboundPacket` event:
+        //
+        //   A: SendUnicastToDevice event       (Task 1: variant)
+        //     → SendOnInterface action          (Task 4: outbound dispatch)
+        //   B: InboundPacket event              (existing wiring)
+        //     → DeliverLocally NodeAction       (existing Reticulum)
+        //     → UnicastReceived action          (Task 3: inbound dispatch)
+        //
+        // Known limitation: Task 3's `source` field is the [0u8; 16]
+        // placeholder constructed by Reticulum's `process_data_packet`
+        // because terminal-link state isn't tracked in `Node`. Real
+        // source-identity binding lands in ZEB-227 / Phase 3b. So the
+        // assertion below is `source == [0u8; 16]`, NOT
+        // `source == a.local_identity_hash()`. The round-trip still
+        // proves bytes flow + the four wiring touchpoints from
+        // Tasks 1-4 remain connected — replace the assertion with a
+        // real-identity check when ZEB-227 lands.
+        use harmony_reticulum::packet::{
+            DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType,
+            PropagationType,
+        };
+        use harmony_reticulum::path_table::PathUpdateResult;
+
+        let (mut a, _a_startup) = make_runtime();
+        let (mut b, _b_startup) = make_runtime();
+
+        // Pick a target hash and register it as a local destination on B
+        // so B's `process_data_packet` resolves it to DeliverLocally.
+        // (Both A and B already have a `udp0` interface registered by
+        // `NodeRuntime::new` — the same name on both sides keeps the
+        // hand-bridge below trivial.)
+        let target = [0xb0u8; 16];
+        b.router.register_destination(target);
+
+        // Build a Type1/Single/Data Reticulum packet with destination_hash
+        // = target, then serialize to wire bytes. This is what a real
+        // harmony-client outbox would construct + hand to the runtime.
+        let payload: Vec<u8> = vec![0x68, 0x65, 0x6c, 0x6c, 0x6f]; // "hello"
+        let pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: target,
+                context: harmony_reticulum::PacketContext::None,
+            },
+            data: Arc::from(payload.clone().into_boxed_slice()),
+        };
+        let wire_bytes = pkt.to_bytes().expect("packet should serialize");
+
+        // Seed A's path table so target → udp0 (mirrors Task 4's happy
+        // path; same path_table_mut() seam).
+        let random_blob = {
+            let mut b = [0u8; 10];
+            let ts: u64 = 1000;
+            let ts_bytes = ts.to_be_bytes();
+            b[5..10].copy_from_slice(&ts_bytes[3..8]);
+            b
+        };
+        let result = a.router.path_table_mut().update(
+            target,
+            target,
+            0,
+            Arc::from("udp0"),
+            [0u8; 16],
+            random_blob,
+            harmony_reticulum::InterfaceMode::Full,
+            1000,
+        );
+        assert_eq!(
+            result,
+            PathUpdateResult::Inserted,
+            "test seed should have inserted a fresh entry"
+        );
+
+        // A: enqueue the send and tick to capture the SendOnInterface action.
+        a.push_event(RuntimeEvent::SendUnicastToDevice {
+            target,
+            packet: wire_bytes.clone(),
+        });
+        let a_actions = a.tick();
+        let send = a_actions
+            .iter()
+            .find_map(|action| match action {
+                RuntimeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                    weight,
+                } => Some((interface_name.clone(), raw.clone(), *weight)),
+                _ => None,
+            })
+            .expect("A should emit SendOnInterface for target");
+
+        assert_eq!(
+            &*send.0, "udp0",
+            "A should route to the seeded udp0 interface"
+        );
+        assert_eq!(
+            send.1, wire_bytes,
+            "wire bytes must round-trip A unchanged (udp0 has no IFAC)"
+        );
+        assert_eq!(
+            send.2, None,
+            "directed unicast send carries weight=None (not broadcast)"
+        );
+
+        // B: feed the wire bytes back in as InboundPacket on the same
+        // interface name. Tick and look for UnicastReceived.
+        b.push_event(RuntimeEvent::InboundPacket {
+            interface_name: send.0.to_string(),
+            raw: send.1.clone(),
+            now: 1000,
+        });
+        let b_actions = b.tick();
+        let received = b_actions
+            .iter()
+            .find_map(|action| match action {
+                RuntimeAction::UnicastReceived { source, packet } => {
+                    Some((*source, packet.clone()))
+                }
+                _ => None,
+            })
+            .expect("B should surface UnicastReceived");
+
+        // Source is the Phase 3a placeholder per the doc comment above —
+        // ZEB-227 (Phase 3b) wires the real link-identity binding and
+        // this assertion should flip to a real-identity check then.
+        assert_eq!(
+            received.0,
+            [0u8; 16],
+            "source is the Phase 3a placeholder; ZEB-227 (Phase 3b) \
+             wires real link-identity binding"
+        );
+        // UnicastReceived.packet carries the parsed packet's `data`
+        // field (payload only), not the full wire bytes — matches the
+        // dispatcher behavior in dispatch_router_actions.
+        assert_eq!(
+            received.1, payload,
+            "payload bytes must round-trip A → B"
+        );
+    }
+
+    #[test]
     fn runtime_event_variants_exist() {
         let _e1 = RuntimeEvent::InboundPacket {
             interface_name: "lo".into(),
