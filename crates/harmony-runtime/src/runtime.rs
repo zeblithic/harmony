@@ -203,16 +203,27 @@ pub enum RuntimeEvent {
     /// `now` is monotonic millis-since-start. `unix_now` is Unix epoch seconds.
     TimerTick { now: u64, unix_now: u64 },
     /// Tier 1: Client requests a Reticulum unicast send to a specific
-    /// device. Translated to `RuntimeAction::SendOnInterface` during the
-    /// next tick by looking up `target`'s reachable interface in peer state.
-    /// If `target` is unknown, the request is logged and dropped — retry/
-    /// expiration semantics are the client's concern (handled at the
-    /// outbox layer in harmony-client per ZEB-216 Sub-B Phase 3b).
+    /// destination. Translated to `RuntimeAction::SendOnInterface` during
+    /// the next tick by looking up `destination_hash` in the inner
+    /// router's path table. If the lookup misses, the request is logged
+    /// and dropped — retry/expiration semantics are the client's concern
+    /// (handled at the outbox layer in harmony-client per ZEB-216 Sub-B
+    /// Phase 3b).
+    ///
+    /// **`destination_hash` is a Reticulum destination hash, NOT a raw
+    /// device identity hash.** The path table is keyed by destination
+    /// hashes (`SHA256(name_hash || identity_address_hash)[:16]`) which
+    /// the runtime learns from announces. The harmony-client side
+    /// (Phase 3b, ZEB-227) is responsible for computing this from a
+    /// device identity hash + a destination name (e.g. DM inbox, voice
+    /// channel, file sync — the runtime is generic plumbing and does not
+    /// know what destination names exist).
     ///
     /// (ZEB-216 Sub-B Phase 3a — DM transport surface)
     SendUnicastToDevice {
-        /// 16-byte device identity hash (`harmony_identity::IdentityHash`).
-        target: [u8; 16],
+        /// 16-byte Reticulum destination hash. Caller-provided; see the
+        /// variant doc above for the derivation contract.
+        destination_hash: [u8; 16],
         /// Opaque packet bytes — the runtime does not parse or validate
         /// the payload. The client owns encryption + framing.
         packet: Vec<u8>,
@@ -368,15 +379,19 @@ pub enum RuntimeAction {
     /// router produces `NodeAction::DeliverLocally` for a packet
     /// addressed to a locally-registered destination.
     ///
-    /// `source` is the remote device's identity hash, resolved from
-    /// link state at receive time (the link knows its peer's identity
-    /// from the handshake). `packet` is the raw payload — the client
-    /// owns decryption + framing parsing.
+    /// `source` is the remote sender's identity hash, **when known**.
+    /// `Some(hash)` once link-identity binding lands in ZEB-227 /
+    /// Phase 3b; `None` in Phase 3a (terminal-link state isn't tracked
+    /// at the Node layer yet, so the runtime can't surface a real
+    /// source). Consumers MUST handle the `None` case — do NOT treat
+    /// absence as an authenticated identity. `packet` is the raw
+    /// payload — the client owns decryption + framing parsing.
     ///
     /// (ZEB-216 Sub-B Phase 3a — DM transport surface)
     UnicastReceived {
-        /// 16-byte device identity hash of the remote sender.
-        source: [u8; 16],
+        /// 16-byte device identity hash of the remote sender, when
+        /// known. See the variant doc for the contract.
+        source: Option<[u8; 16]>,
         /// Opaque packet bytes as received from the wire.
         packet: Vec<u8>,
     },
@@ -710,6 +725,13 @@ pub struct NodeRuntime<B: BookStore> {
     pending_workflow_actions: Vec<WorkflowAction>,
     // Direct runtime actions buffered from push_event (error replies, module fetches, etc.)
     pending_direct_actions: Vec<RuntimeAction>,
+    // Unicast send requests deferred from push_event to tick (ZEB-226).
+    // Resolved against `router.path_table()` after the router queue drains
+    // so announces enqueued in the same batch are applied to the path
+    // table BEFORE we do the lookup. Avoids a TOCTOU race where a client
+    // queues an announce + a SendUnicastToDevice for the just-announced
+    // target in the same batch and the lookup misses.
+    pending_unicast_sends: VecDeque<([u8; 16], Vec<u8>)>,
     // Maps WorkflowId -> query_ids for reply routing (multiple callers may
     // submit the same module+input; the engine deduplicates but all callers
     // need a reply).
@@ -1036,6 +1058,7 @@ impl<B: BookStore> NodeRuntime<B> {
             compute_queryable_ids,
             pending_workflow_actions: Vec::new(),
             pending_direct_actions: Vec::new(),
+            pending_unicast_sends: VecDeque::new(),
             workflow_to_query: HashMap::new(),
             cid_to_query: HashMap::new(),
             schedule: config.schedule.clone(),
@@ -2023,30 +2046,22 @@ impl<B: BookStore> NodeRuntime<B> {
                     .handle(StorageTierEvent::S3ReadFailed { cid, query_id });
                 self.dispatch_storage_actions_inline(storage_actions);
             }
-            RuntimeEvent::SendUnicastToDevice { target, packet } => {
+            RuntimeEvent::SendUnicastToDevice {
+                destination_hash,
+                packet,
+            } => {
                 // ZEB-216 Sub-B Phase 3a — Task 4 (ZEB-226): outbound wiring.
                 //
-                // Resolve the target identity hash to a reachable interface
-                // through the inner Reticulum router's path table. A hit
-                // means we have a learned route (from a prior announce);
-                // we then forward through `Node::route_packet` so IFAC
-                // masking and the existing send_on_interface plumbing run
-                // unchanged. A miss is logged at WARN and dropped — the
-                // harmony-client outbox layer (Phase 3b, ZEB-227) owns
-                // retry/expiration semantics on top of this surface.
-                if self.router.path_table().get(&target).is_some() {
-                    let node_actions = self.router.route_packet(&target, packet);
-                    let mut out = std::mem::take(&mut self.pending_direct_actions);
-                    self.dispatch_router_actions(node_actions, &mut out);
-                    self.pending_direct_actions = out;
-                } else {
-                    tracing::warn!(
-                        target_first_4 = ?&target[..4],
-                        packet_len = packet.len(),
-                        "SendUnicastToDevice target unknown — dropping. \
-                         Client (harmony-client) owns retry/expiration via outbox."
-                    );
-                }
+                // Defer resolution to tick(): queue into
+                // `pending_unicast_sends` so any inbound announces sitting
+                // in `router_queue` get applied to the path table BEFORE
+                // we attempt the path-table lookup. Resolving here would
+                // race against announces submitted in the same batch
+                // (announce + send-to-just-announced-target would miss
+                // because the announce hasn't been processed yet). The
+                // tick path drains this queue after the router queue.
+                self.pending_unicast_sends
+                    .push_back((destination_hash, packet));
             }
         }
     }
@@ -2159,6 +2174,30 @@ impl<B: BookStore> NodeRuntime<B> {
                         self.router_starved = 0;
                     } else {
                         self.router_starved = self.router_starved.saturating_add(1);
+                    }
+
+                    // ZEB-216 Sub-B Phase 3a — Task 4 (ZEB-226): drain
+                    // queued unicast sends AFTER the router queue. Any
+                    // announces in the same batch have now been applied
+                    // to the path table, so the lookup sees fresh state.
+                    // A path-table miss is logged at WARN and dropped —
+                    // harmony-client's outbox (Phase 3b, ZEB-227) owns
+                    // retry/expiration semantics on top of this surface.
+                    while let Some((destination_hash, packet)) =
+                        self.pending_unicast_sends.pop_front()
+                    {
+                        if self.router.path_table().get(&destination_hash).is_some() {
+                            let node_actions = self.router.route_packet(&destination_hash, packet);
+                            self.dispatch_router_actions(node_actions, &mut actions);
+                        } else {
+                            tracing::warn!(
+                                destination_hash_first_4 = ?&destination_hash[..4],
+                                packet_len = packet.len(),
+                                "SendUnicastToDevice destination_hash unknown — \
+                                 dropping. Client (harmony-client) owns retry/\
+                                 expiration via outbox."
+                            );
+                        }
                     }
                 }
                 1 => {
@@ -2408,8 +2447,10 @@ impl<B: BookStore> NodeRuntime<B> {
                 // unicast packets to the client. Source identity travels on
                 // `NodeAction::DeliverLocally::source` (Option A — field
                 // added to the Reticulum action). The reticulum-layer
-                // construction site populates `[0u8; 16]` as a placeholder
-                // until link/identity binding lands in Phase 3b (ZEB-227).
+                // construction site populates `None` until link/identity
+                // binding lands in Phase 3b (ZEB-227). The Option is
+                // forwarded as-is — the client must handle the `None` case
+                // and MUST NOT treat absence as an authenticated identity.
                 NodeAction::DeliverLocally {
                     destination_hash: _, // local; not surfaced to the client
                     packet,
@@ -2420,6 +2461,21 @@ impl<B: BookStore> NodeRuntime<B> {
                         source,
                         packet: packet.data.to_vec(),
                     });
+                }
+                // Top-level packet drops (e.g. unknown interface, IFAC
+                // masking failure on the outbound path). Logged here so
+                // SendUnicastToDevice misses produced by `route_packet`
+                // surface in tracing instead of falling silently through
+                // the diagnostic catch-all below.
+                NodeAction::PacketDropped {
+                    reason,
+                    interface_name,
+                } => {
+                    tracing::warn!(
+                        ?reason,
+                        %interface_name,
+                        "Reticulum packet dropped during dispatch"
+                    );
                 }
                 // Other router actions are diagnostics — drop for now.
                 _ => {}
@@ -4671,11 +4727,11 @@ mod tests {
         // existing actions — regression guard so the new variant doesn't drop
         // the derives and break test infrastructure that depends on them).
         let a = RuntimeAction::UnicastReceived {
-            source: [0xbb; 16],
+            source: Some([0xbb; 16]),
             packet: vec![0x10, 0x20],
         };
         let b = RuntimeAction::UnicastReceived {
-            source: [0xbb; 16],
+            source: Some([0xbb; 16]),
             packet: vec![0x10, 0x20],
         };
         assert_eq!(a, b);
@@ -4689,12 +4745,15 @@ mod tests {
         // and the field types match (catches accidental tuple-variant
         // shape or wrong field-name typos in future refactors).
         let e = RuntimeEvent::SendUnicastToDevice {
-            target: [0xaa; 16],
+            destination_hash: [0xaa; 16],
             packet: vec![0x01, 0x02, 0x03],
         };
         match e {
-            RuntimeEvent::SendUnicastToDevice { target, packet } => {
-                assert_eq!(target, [0xaa; 16]);
+            RuntimeEvent::SendUnicastToDevice {
+                destination_hash,
+                packet,
+            } => {
+                assert_eq!(destination_hash, [0xaa; 16]);
                 assert_eq!(packet, vec![0x01, 0x02, 0x03]);
             }
             _ => panic!("expected SendUnicastToDevice variant"),
@@ -4751,7 +4810,7 @@ mod tests {
             destination_hash: dest_hash,
             packet,
             interface_name: Arc::from("test"),
-            source,
+            source: Some(source),
         }];
 
         let mut out: Vec<RuntimeAction> = Vec::new();
@@ -4773,7 +4832,11 @@ mod tests {
             "expected exactly one UnicastReceived, got actions: {:?}",
             out
         );
-        assert_eq!(unicast[0].0, source, "source identity must round-trip");
+        assert_eq!(
+            unicast[0].0,
+            Some(source),
+            "source identity must round-trip as Some(hash) when known"
+        );
         assert_eq!(unicast[0].1, payload, "packet bytes must round-trip");
     }
 
@@ -4799,9 +4862,11 @@ mod tests {
         let target = [0xaau8; 16];
         let payload: Vec<u8> = vec![0x01, 0x02, 0x03];
 
-        // Seed the path table directly. Build a minimal random_blob
-        // (10 bytes; last 5 carry the announce timestamp). The exact
-        // values don't matter — we just need a valid entry that
+        // Seed the path table directly. The seed key here IS a destination
+        // hash by contract — the path table is only ever populated by
+        // announces, which are keyed by destination hash. Build a minimal
+        // random_blob (10 bytes; last 5 carry the announce timestamp).
+        // The exact values don't matter — we just need a valid entry that
         // route_packet() will resolve to udp0.
         let random_blob = {
             let mut b = [0u8; 10];
@@ -4827,7 +4892,7 @@ mod tests {
         );
 
         rt.push_event(RuntimeEvent::SendUnicastToDevice {
-            target,
+            destination_hash: target,
             packet: payload.clone(),
         });
         let actions = rt.tick();
@@ -4877,7 +4942,7 @@ mod tests {
         let payload: Vec<u8> = vec![0xaa, 0xbb];
 
         rt.push_event(RuntimeEvent::SendUnicastToDevice {
-            target,
+            destination_hash: target,
             packet: payload.clone(),
         });
         let actions = rt.tick();
@@ -4909,15 +4974,15 @@ mod tests {
         //     → DeliverLocally NodeAction       (existing Reticulum)
         //     → UnicastReceived action          (Task 3: inbound dispatch)
         //
-        // Known limitation: Task 3's `source` field is the [0u8; 16]
-        // placeholder constructed by Reticulum's `process_data_packet`
-        // because terminal-link state isn't tracked in `Node`. Real
-        // source-identity binding lands in ZEB-227 / Phase 3b. So the
-        // assertion below is `source == [0u8; 16]`, NOT
-        // `source == a.local_identity_hash()`. The round-trip still
-        // proves bytes flow + the four wiring touchpoints from
-        // Tasks 1-4 remain connected — replace the assertion with a
-        // real-identity check when ZEB-227 lands.
+        // Known limitation: Task 3's `source` field is `None` —
+        // Reticulum's `process_data_packet` cannot yet resolve the
+        // terminal link to an identity hash because the Node does not
+        // track terminal-link state. Real source-identity binding lands
+        // in ZEB-227 / Phase 3b. So the assertion below is
+        // `source == None`, NOT `source == Some(a.local_identity_hash())`.
+        // The round-trip still proves bytes flow + the four wiring
+        // touchpoints from Tasks 1-4 remain connected — replace the
+        // assertion with a real-identity check when ZEB-227 lands.
         use harmony_reticulum::packet::{
             DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType,
             PropagationType,
@@ -4985,7 +5050,7 @@ mod tests {
 
         // A: enqueue the send and tick to capture the SendOnInterface action.
         a.push_event(RuntimeEvent::SendUnicastToDevice {
-            target,
+            destination_hash: target,
             packet: wire_bytes.clone(),
         });
         let a_actions = a.tick();
@@ -5032,14 +5097,16 @@ mod tests {
             })
             .expect("B should surface UnicastReceived");
 
-        // Source is the Phase 3a placeholder per the doc comment above —
-        // ZEB-227 (Phase 3b) wires the real link-identity binding and
-        // this assertion should flip to a real-identity check then.
+        // Source is `None` in Phase 3a per the Option<[u8; 16]> contract
+        // on `RuntimeAction::UnicastReceived` — terminal-link state isn't
+        // tracked at the Node layer yet, so the runtime can't surface a
+        // real source. ZEB-227 (Phase 3b) wires the real link-identity
+        // binding and this assertion should flip to
+        // `Some(a.local_identity_hash())` then.
         assert_eq!(
-            received.0,
-            [0u8; 16],
-            "source is the Phase 3a placeholder; ZEB-227 (Phase 3b) \
-             wires real link-identity binding"
+            received.0, None,
+            "source is None in Phase 3a; ZEB-227 (Phase 3b) wires \
+             real link-identity binding and this becomes Some(hash)"
         );
         // UnicastReceived.packet carries the parsed packet's `data`
         // field (payload only), not the full wire bytes — matches the
