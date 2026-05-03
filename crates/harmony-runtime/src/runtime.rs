@@ -1314,6 +1314,10 @@ impl<B: BookStore> NodeRuntime<B> {
     /// crate-private (`pub(crate)`) since the consumers are all
     /// in-crate tests; `#[doc(hidden)]` only hid from rustdoc and
     /// would have left the seam callable from downstream crates.
+    /// Round-12 (clippy): `#[cfg(test)]` so the accessor doesn't fire
+    /// `dead_code` in non-test builds (it has no production callers
+    /// by design).
+    #[cfg(test)]
     pub(crate) fn pending_unicast_sends_len(&self) -> usize {
         self.pending_unicast_sends.len()
     }
