@@ -202,6 +202,68 @@ pub enum RuntimeEvent {
     /// Tier 1: Periodic timer tick for path expiry, announce scheduling.
     /// `now` is monotonic millis-since-start. `unix_now` is Unix epoch seconds.
     TimerTick { now: u64, unix_now: u64 },
+    /// Tier 1: Client requests a Reticulum unicast send to a specific
+    /// destination. Translated to `RuntimeAction::SendOnInterface` during
+    /// the next tick by looking up `destination_hash` in the inner
+    /// router's path table.
+    ///
+    /// Path-table miss semantics (round-10 race+budget fix):
+    ///   - **While the router queue still has backlog** (e.g. announces
+    ///     queued in the same batch), the request is **deferred** —
+    ///     re-queued at the front of `pending_unicast_sends` for a later
+    ///     tick after the queued router events apply to the path table.
+    ///     This avoids spurious drops when an announce that would create
+    ///     the route is sitting one event behind in the same batch.
+    ///   - **Once the router queue fully drains** without producing the
+    ///     route, the request is logged at WARN and dropped.
+    ///   - Both deferred re-queues and final drops count against
+    ///     `router_max_per_tick` (round-11 budget fix) to bound per-tick
+    ///     latency — a defer-only tick cannot walk the entire pending
+    ///     queue.
+    ///
+    /// Ordering contract:
+    ///   - **Per-destination FIFO is preserved.** Multiple sends to the
+    ///     same `destination_hash` queued in the same tick remain in
+    ///     arrival order across deferrals. (Same-destination entries
+    ///     that all defer get re-queued at the front in arrival order
+    ///     and on the next tick hit the same path-exists state.)
+    ///   - **Cross-destination ordering is best-effort, routability-
+    ///     driven.** A send to a known-routable destination can leave
+    ///     the runtime ahead of an earlier-queued send to an unknown
+    ///     destination. This is intentional — strict cross-destination
+    ///     FIFO would mean a single un-resolvable destination at the
+    ///     head blocks deliverable sends behind it (e.g., a DM to an
+    ///     offline recipient blocking a DM to an online recipient).
+    ///     The CodeRabbit-suggested `break`-on-first-defer was rejected
+    ///     for this reason.
+    ///   - Callers that need cross-destination ordering MUST enforce it
+    ///     above this surface (the harmony-client outbox layer is the
+    ///     natural place — it can chain dependent sends or use a
+    ///     per-conversation queue).
+    ///
+    /// Retry/expiration semantics live above this surface — harmony-client's
+    /// outbox layer (ZEB-216 Sub-B Phase 3b, ZEB-227) owns retry policy,
+    /// 30-day expiration, and the user-visible "couldn't deliver" surface.
+    /// Callers MUST NOT assume immediate drop on miss.
+    ///
+    /// **`destination_hash` is a Reticulum destination hash, NOT a raw
+    /// device identity hash.** The path table is keyed by destination
+    /// hashes (`SHA256(name_hash || identity_address_hash)[:16]`) which
+    /// the runtime learns from announces. The harmony-client side
+    /// (Phase 3b, ZEB-227) is responsible for computing this from a
+    /// device identity hash + a destination name (e.g. DM inbox, voice
+    /// channel, file sync — the runtime is generic plumbing and does not
+    /// know what destination names exist).
+    ///
+    /// (ZEB-216 Sub-B Phase 3a — DM transport surface)
+    SendUnicastToDevice {
+        /// 16-byte Reticulum destination hash. Caller-provided; see the
+        /// variant doc above for the derivation contract.
+        destination_hash: [u8; 16],
+        /// Opaque packet bytes — the runtime does not parse or validate
+        /// the payload. The client owns encryption + framing.
+        packet: Vec<u8>,
+    },
     /// Tier 2: Zenoh query received (content fetch or stats request).
     QueryReceived {
         query_id: u64,
@@ -347,6 +409,39 @@ pub enum RuntimeAction {
         /// `None` = directed send (always deliver).
         /// `Some(score)` = broadcast send (caller may drop if random > score).
         weight: Option<f32>,
+    },
+    /// Tier 1: Surface a received Reticulum unicast packet to the
+    /// client. Emitted from `dispatch_router_actions` when the inner
+    /// router produces `NodeAction::DeliverLocally` for a packet
+    /// addressed to a locally-registered destination.
+    ///
+    /// `destination_hash` is the 16-byte local Reticulum destination
+    /// hash the packet was addressed to. Lets the client dispatch by
+    /// destination kind (DM inbox vs voice channel vs file sync, etc.)
+    /// — the client registered the destination, so it knows the
+    /// mapping from hash to handler. (Added in round-10 review,
+    /// ZEB-226: the client registers MULTIPLE destination types per
+    /// its spec and needs the destination hash to dispatch; the
+    /// dispatch arm previously discarded it.)
+    ///
+    /// `source` is the remote sender's identity hash, **when known**.
+    /// `Some(hash)` once link-identity binding lands in ZEB-227 /
+    /// Phase 3b; `None` in Phase 3a (terminal-link state isn't tracked
+    /// at the Node layer yet, so the runtime can't surface a real
+    /// source). Consumers MUST handle the `None` case — do NOT treat
+    /// absence as an authenticated identity. `packet` is the raw
+    /// payload — the client owns decryption + framing parsing.
+    ///
+    /// (ZEB-216 Sub-B Phase 3a — DM transport surface)
+    UnicastReceived {
+        /// 16-byte local Reticulum destination hash the packet was
+        /// addressed to. See the variant doc for the contract.
+        destination_hash: [u8; 16],
+        /// 16-byte device identity hash of the remote sender, when
+        /// known. See the variant doc for the contract.
+        source: Option<[u8; 16]>,
+        /// Opaque packet bytes as received from the wire.
+        packet: Vec<u8>,
     },
     /// Tier 2: Reply to a content or stats query.
     SendReply { query_id: u64, payload: Vec<u8> },
@@ -678,6 +773,13 @@ pub struct NodeRuntime<B: BookStore> {
     pending_workflow_actions: Vec<WorkflowAction>,
     // Direct runtime actions buffered from push_event (error replies, module fetches, etc.)
     pending_direct_actions: Vec<RuntimeAction>,
+    // Unicast send requests deferred from push_event to tick (ZEB-226).
+    // Resolved against `router.path_table()` after the router queue drains
+    // so announces enqueued in the same batch are applied to the path
+    // table BEFORE we do the lookup. Avoids a TOCTOU race where a client
+    // queues an announce + a SendUnicastToDevice for the just-announced
+    // target in the same batch and the lookup misses.
+    pending_unicast_sends: VecDeque<([u8; 16], Vec<u8>)>,
     // Maps WorkflowId -> query_ids for reply routing (multiple callers may
     // submit the same module+input; the engine deduplicates but all callers
     // need a reply).
@@ -1004,6 +1106,7 @@ impl<B: BookStore> NodeRuntime<B> {
             compute_queryable_ids,
             pending_workflow_actions: Vec::new(),
             pending_direct_actions: Vec::new(),
+            pending_unicast_sends: VecDeque::new(),
             workflow_to_query: HashMap::new(),
             cid_to_query: HashMap::new(),
             schedule: config.schedule.clone(),
@@ -1222,6 +1325,21 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Number of pending Tier 1 (router) events.
     pub fn router_queue_len(&self) -> usize {
         self.router_queue.len()
+    }
+
+    /// Number of pending unicast sends (`RuntimeEvent::SendUnicastToDevice`)
+    /// awaiting drain on the next `tick()`. Test-only seam — round-10
+    /// review (ZEB-226) added budget + defer-on-miss semantics that need
+    /// queue-length introspection to assert. Round-11 (Greptile P2):
+    /// crate-private (`pub(crate)`) since the consumers are all
+    /// in-crate tests; `#[doc(hidden)]` only hid from rustdoc and
+    /// would have left the seam callable from downstream crates.
+    /// Round-12 (clippy): `#[cfg(test)]` so the accessor doesn't fire
+    /// `dead_code` in non-test builds (it has no production callers
+    /// by design).
+    #[cfg(test)]
+    pub(crate) fn pending_unicast_sends_len(&self) -> usize {
+        self.pending_unicast_sends.len()
     }
 
     /// Number of pending Tier 2 (storage) events.
@@ -1991,6 +2109,23 @@ impl<B: BookStore> NodeRuntime<B> {
                     .handle(StorageTierEvent::S3ReadFailed { cid, query_id });
                 self.dispatch_storage_actions_inline(storage_actions);
             }
+            RuntimeEvent::SendUnicastToDevice {
+                destination_hash,
+                packet,
+            } => {
+                // ZEB-216 Sub-B Phase 3a — Task 4 (ZEB-226): outbound wiring.
+                //
+                // Defer resolution to tick(): queue into
+                // `pending_unicast_sends` so any inbound announces sitting
+                // in `router_queue` get applied to the path table BEFORE
+                // we attempt the path-table lookup. Resolving here would
+                // race against announces submitted in the same batch
+                // (announce + send-to-just-announced-target would miss
+                // because the announce hasn't been processed yet). The
+                // tick path drains this queue after the router queue.
+                self.pending_unicast_sends
+                    .push_back((destination_hash, packet));
+            }
         }
     }
 
@@ -2102,6 +2237,108 @@ impl<B: BookStore> NodeRuntime<B> {
                         self.router_starved = 0;
                     } else {
                         self.router_starved = self.router_starved.saturating_add(1);
+                    }
+
+                    // ZEB-216 Sub-B Phase 3a — Task 4 (ZEB-226): drain
+                    // queued unicast sends AFTER the router queue. Any
+                    // announces drained in this tick have now been
+                    // applied to the path table, so the lookup sees
+                    // fresh state for that batch.
+                    //
+                    // Round-10 review fixes (ZEB-226):
+                    // - **Defer-on-miss when router still has work
+                    //   (Finding 1, race).** If `router_max_per_tick`
+                    //   capped the router-queue drain, an announce that
+                    //   would have created the route may still be
+                    //   queued. Treating that as "unknown" would drop
+                    //   the unicast even though next tick's announce
+                    //   drain would populate the path table. So we
+                    //   capture `router_queue_drained` BEFORE this loop
+                    //   and only log+drop when the router is fully
+                    //   drained — otherwise re-queue for the next tick.
+                    // - **Bound the unicast drain by `router_max_per_tick`
+                    //   (Finding 3, latency).** Every other Tier 1 queue
+                    //   respects this budget; an unbounded unicast burst
+                    //   would block the tick loop. Round-11 fix
+                    //   (CodeRabbit Major / Greptile P1): the budget
+                    //   counter is incremented at the TOP of the loop so
+                    //   ALL three branches (route, defer, drop) consume
+                    //   budget. The previous shape only counted route
+                    //   and drop, so a defer-only tick (router queue has
+                    //   backlog) could walk the entire pending queue in
+                    //   one tick and bypass the cap.
+                    //
+                    // Final fallback (router fully drained AND route
+                    // still missing) remains: WARN + drop. The client's
+                    // outbox (Phase 3b, ZEB-227) owns retry/expiration
+                    // semantics on top of this surface.
+                    let router_queue_drained = self.router_queue.is_empty();
+                    let unicast_limit = self.schedule.router_max_per_tick.unwrap_or(usize::MAX);
+                    let mut processed_unicasts = 0usize;
+                    let mut deferred_unicasts: VecDeque<([u8; 16], Vec<u8>)> = VecDeque::new();
+                    while processed_unicasts < unicast_limit {
+                        let Some((destination_hash, packet)) =
+                            self.pending_unicast_sends.pop_front()
+                        else {
+                            break;
+                        };
+                        // Round-11 fix: count BEFORE branching so defer
+                        // (and drop, and route) all consume one budget
+                        // slot. Without this, the defer branch can
+                        // walk the entire queue in a single tick.
+                        processed_unicasts += 1;
+                        if self.router.path_table().get(&destination_hash).is_some() {
+                            let node_actions = self.router.route_packet(&destination_hash, packet);
+                            // Round-12 (Cursor Low): log outbound
+                            // PacketDropped here at the call site where
+                            // we have full SendUnicastToDevice context.
+                            // The top-level arm in dispatch_router_actions
+                            // was removed because it also fired on
+                            // routine inbound NoLocalDestination drops
+                            // for broadcast traffic addressed to
+                            // unregistered local destinations — noisy on
+                            // non-transport nodes.
+                            for na in &node_actions {
+                                if let NodeAction::PacketDropped {
+                                    reason,
+                                    interface_name,
+                                } = na
+                                {
+                                    tracing::warn!(
+                                        ?reason,
+                                        %interface_name,
+                                        destination_hash_first_4 = ?&destination_hash[..4],
+                                        "outbound unicast SendUnicastToDevice failed at route_packet"
+                                    );
+                                }
+                            }
+                            self.dispatch_router_actions(node_actions, &mut actions);
+                        } else if !router_queue_drained {
+                            // Router queue still has unprocessed events
+                            // (possibly an announce that would create
+                            // this route). Defer rather than drop —
+                            // re-queue for the next tick when those
+                            // announces have applied to the path table.
+                            deferred_unicasts.push_back((destination_hash, packet));
+                        } else {
+                            // Router fully drained yet route still
+                            // missing — genuine miss. Log and drop;
+                            // budget already consumed at top of loop.
+                            tracing::warn!(
+                                destination_hash_first_4 = ?&destination_hash[..4],
+                                packet_len = packet.len(),
+                                "SendUnicastToDevice destination_hash unknown — \
+                                 dropping. Client (harmony-client) owns retry/\
+                                 expiration via outbox."
+                            );
+                        }
+                    }
+                    // Re-queue deferred entries at the FRONT so they
+                    // retain their arrival-order priority over any
+                    // unicasts pushed in subsequent ticks. extend() at
+                    // the back would reorder them behind newer events.
+                    for entry in deferred_unicasts.into_iter().rev() {
+                        self.pending_unicast_sends.push_front(entry);
                     }
                 }
                 1 => {
@@ -2347,7 +2584,41 @@ impl<B: BookStore> NodeRuntime<B> {
                         }
                     }
                 }
-                // Other router actions are diagnostics — drop for now.
+                // ZEB-216 Sub-B Phase 3a — Task 3 (ZEB-226): surface inbound
+                // unicast packets to the client. Source identity travels on
+                // `NodeAction::DeliverLocally::source` (Option A — field
+                // added to the Reticulum action). The reticulum-layer
+                // construction site populates `None` until link/identity
+                // binding lands in Phase 3b (ZEB-227). The Option is
+                // forwarded as-is — the client must handle the `None` case
+                // and MUST NOT treat absence as an authenticated identity.
+                //
+                // Round-10 review (ZEB-226): forward `destination_hash`
+                // too — the client registers multiple destination types
+                // (DM inbox, voice channel, file sync, ...) and needs
+                // the hash to dispatch the packet to the right handler.
+                NodeAction::DeliverLocally {
+                    destination_hash,
+                    packet,
+                    interface_name: _, // diagnostic only at this layer
+                    source,
+                } => {
+                    out.push(RuntimeAction::UnicastReceived {
+                        destination_hash,
+                        source,
+                        packet: packet.data.to_vec(),
+                    });
+                }
+                // Other router actions (including top-level
+                // `NodeAction::PacketDropped`) are diagnostics — drop
+                // for now. Round-12 (Cursor Low): outbound unicast
+                // PacketDropped is logged at the call site in the
+                // SendUnicastToDevice drain where the full context
+                // (destination_hash) is available; logging it here too
+                // would also surface routine inbound
+                // `process_data_packet` drops (e.g. NoLocalDestination
+                // for broadcast traffic addressed to unregistered local
+                // destinations) and spam WARN on non-transport nodes.
                 _ => {}
             }
         }
@@ -4588,6 +4859,713 @@ mod tests {
         config.schedule.router_max_per_tick = Some(5);
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.schedule().router_max_per_tick, Some(5));
+    }
+
+    #[test]
+    fn runtime_action_unicast_received_constructs_and_compares() {
+        // ZEB-216 Sub-B Phase 3a — Task 2: variant constructor smoke.
+        // Asserts variant is constructible, derives Clone + PartialEq (matches
+        // existing actions — regression guard so the new variant doesn't drop
+        // the derives and break test infrastructure that depends on them).
+        // Round-10 review added `destination_hash` to the variant — pin a
+        // distinct value here so a future shape change (e.g. dropping the
+        // field, or making it Option<>) trips the constructor smoke test.
+        let a = RuntimeAction::UnicastReceived {
+            destination_hash: [0xcc; 16],
+            source: Some([0xbb; 16]),
+            packet: vec![0x10, 0x20],
+        };
+        let b = RuntimeAction::UnicastReceived {
+            destination_hash: [0xcc; 16],
+            source: Some([0xbb; 16]),
+            packet: vec![0x10, 0x20],
+        };
+        assert_eq!(a, b);
+        let _cloned: RuntimeAction = a.clone();
+    }
+
+    #[test]
+    fn runtime_event_send_unicast_to_device_constructs_and_compares() {
+        // ZEB-216 Sub-B Phase 3a — Task 1: variant constructor smoke.
+        // Match-and-extract proves the variant is constructible by name
+        // and the field types match (catches accidental tuple-variant
+        // shape or wrong field-name typos in future refactors).
+        let e = RuntimeEvent::SendUnicastToDevice {
+            destination_hash: [0xaa; 16],
+            packet: vec![0x01, 0x02, 0x03],
+        };
+        match e {
+            RuntimeEvent::SendUnicastToDevice {
+                destination_hash,
+                packet,
+            } => {
+                assert_eq!(destination_hash, [0xaa; 16]);
+                assert_eq!(packet, vec![0x01, 0x02, 0x03]);
+            }
+            _ => panic!("expected SendUnicastToDevice variant"),
+        }
+    }
+
+    #[test]
+    fn dispatch_router_actions_surfaces_deliver_locally_as_unicast_received() {
+        // ZEB-216 Sub-B Phase 3a — Task 3: inbound wiring.
+        //
+        // Construct a NodeAction::DeliverLocally with a known source +
+        // packet, feed it through dispatch_router_actions, and assert
+        // that the runtime emits exactly one RuntimeAction::UnicastReceived
+        // carrying the same source + packet bytes.
+        //
+        // Source resolution approach (Option A): a `source: [u8; 16]`
+        // field is added directly to NodeAction::DeliverLocally so the
+        // identity travels with the action. The reticulum-layer
+        // construction site populates it as a placeholder for now (real
+        // link-state binding is deferred to Phase 3b in harmony-client).
+        // For this dispatch-layer test we construct the action directly
+        // and pin a non-zero source, which exercises the full wiring
+        // independent of the upstream construction-site placeholder.
+        use harmony_reticulum::packet::{
+            DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType,
+            PropagationType,
+        };
+
+        let (mut rt, _startup) = make_runtime();
+
+        let dest_hash = [0x42u8; 16];
+        let source = [0xcdu8; 16];
+        let payload: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef];
+
+        let packet = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: dest_hash,
+                context: harmony_reticulum::PacketContext::None,
+            },
+            data: Arc::from(payload.clone().into_boxed_slice()),
+        };
+
+        let node_actions = vec![NodeAction::DeliverLocally {
+            destination_hash: dest_hash,
+            packet,
+            interface_name: Arc::from("test"),
+            source: Some(source),
+        }];
+
+        let mut out: Vec<RuntimeAction> = Vec::new();
+        rt.dispatch_router_actions(node_actions, &mut out);
+
+        let unicast: Vec<_> = out
+            .iter()
+            .filter_map(|a| match a {
+                RuntimeAction::UnicastReceived {
+                    destination_hash,
+                    source,
+                    packet,
+                } => Some((*destination_hash, *source, packet.clone())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            unicast.len(),
+            1,
+            "expected exactly one UnicastReceived, got actions: {:?}",
+            out
+        );
+        assert_eq!(
+            unicast[0].0, dest_hash,
+            "destination_hash must flow through dispatch (round-10 \
+             review: was previously discarded with `_`)"
+        );
+        assert_eq!(
+            unicast[0].1,
+            Some(source),
+            "source identity must round-trip as Some(hash) when known"
+        );
+        assert_eq!(unicast[0].2, payload, "packet bytes must round-trip");
+    }
+
+    #[test]
+    fn send_unicast_to_device_emits_send_on_interface_for_known_target() {
+        // ZEB-216 Sub-B Phase 3a — Task 4: outbound wiring (happy path).
+        //
+        // Approach: target → interface lookup goes through the inner
+        // Reticulum router's path table (`Node::path_table`). The default
+        // NodeRuntime registers a `udp0` interface on construction, so
+        // we pre-seed a path entry pointing the target hash at `udp0`
+        // via the `path_table_mut_for_tests()` test seam (added on
+        // Node alongside the existing read-only `path_table()` accessor).
+        //
+        // Then we feed RuntimeEvent::SendUnicastToDevice and tick(),
+        // expecting exactly one RuntimeAction::SendOnInterface routed
+        // to `udp0` with the original packet bytes (udp0 has no IFAC,
+        // so masking is a no-op and the bytes round-trip unchanged).
+        use harmony_reticulum::path_table::PathUpdateResult;
+
+        let (mut rt, _startup) = make_runtime();
+
+        let target = [0xaau8; 16];
+        let payload: Vec<u8> = vec![0x01, 0x02, 0x03];
+
+        // Seed the path table directly. The seed key here IS a destination
+        // hash by contract — the path table is only ever populated by
+        // announces, which are keyed by destination hash. Build a minimal
+        // random_blob (10 bytes; last 5 carry the announce timestamp).
+        // The exact values don't matter — we just need a valid entry that
+        // route_packet() will resolve to udp0.
+        let random_blob = {
+            let mut b = [0u8; 10];
+            let ts: u64 = 1000;
+            let ts_bytes = ts.to_be_bytes();
+            b[5..10].copy_from_slice(&ts_bytes[3..8]);
+            b
+        };
+        let result = rt.router.path_table_mut_for_tests().update(
+            target,
+            target, // next_hop = target itself (single-hop)
+            0,      // hops
+            Arc::from("udp0"),
+            [0u8; 16], // announce_packet_hash
+            random_blob,
+            harmony_reticulum::InterfaceMode::Full,
+            1000,
+        );
+        assert_eq!(
+            result,
+            PathUpdateResult::Inserted,
+            "test seed should have inserted a fresh entry"
+        );
+
+        rt.push_event(RuntimeEvent::SendUnicastToDevice {
+            destination_hash: target,
+            packet: payload.clone(),
+        });
+        let actions = rt.tick();
+
+        let sends: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                RuntimeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                    weight,
+                } => Some((interface_name.clone(), raw.clone(), *weight)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            sends.len(),
+            1,
+            "expected exactly one SendOnInterface for the known target, \
+             got actions: {:?}",
+            actions
+        );
+        assert_eq!(
+            &*sends[0].0, "udp0",
+            "interface_name should match the seeded path-table entry"
+        );
+        assert_eq!(sends[0].1, payload, "packet bytes must round-trip");
+        assert_eq!(
+            sends[0].2, None,
+            "directed unicast send carries weight=None (not broadcast)"
+        );
+    }
+
+    #[test]
+    fn send_unicast_to_device_drops_for_unknown_target() {
+        // ZEB-216 Sub-B Phase 3a — Task 4: outbound wiring (unknown target).
+        //
+        // With an empty path table, the runtime cannot resolve the target
+        // to an interface. Phase 3a behavior: log a WARN and drop the
+        // packet — retry/expiration semantics live in harmony-client's
+        // outbox layer (ZEB-216 Sub-B Phase 3b). Here we assert that
+        // the runtime does NOT produce any SendOnInterface action.
+        let (mut rt, _startup) = make_runtime();
+
+        let target = [0x99u8; 16];
+        let payload: Vec<u8> = vec![0xaa, 0xbb];
+
+        rt.push_event(RuntimeEvent::SendUnicastToDevice {
+            destination_hash: target,
+            packet: payload.clone(),
+        });
+        let actions = rt.tick();
+
+        let sends: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .collect();
+
+        assert!(
+            sends.is_empty(),
+            "expected no SendOnInterface for unknown target, got: {:?}",
+            sends
+        );
+    }
+
+    #[test]
+    fn unicast_drain_respects_router_max_per_tick() {
+        // ZEB-226 round-10 review (Finding 3, latency budget): the
+        // pending_unicast_sends drain in tick() must respect
+        // `router_max_per_tick` like every other Tier 1 queue. A burst
+        // of unicasts must NOT block the tick loop. With limit=2 and
+        // 5 queued unicasts to a known target, the first tick should
+        // process 2 (emit 2 SendOnInterface) and leave 3 in the queue
+        // for the next tick.
+        use harmony_reticulum::path_table::PathUpdateResult;
+
+        let mut config = NodeConfig::default();
+        config.schedule.router_max_per_tick = Some(2);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        // Seed a path so all sends resolve to udp0 (avoids the
+        // unknown-target drop path; we want to exercise the budget,
+        // not the drop semantics).
+        let target = [0xa1u8; 16];
+        let random_blob = {
+            let mut b = [0u8; 10];
+            let ts: u64 = 1000;
+            let ts_bytes = ts.to_be_bytes();
+            b[5..10].copy_from_slice(&ts_bytes[3..8]);
+            b
+        };
+        let result = rt.router.path_table_mut_for_tests().update(
+            target,
+            target,
+            0,
+            Arc::from("udp0"),
+            [0u8; 16],
+            random_blob,
+            harmony_reticulum::InterfaceMode::Full,
+            1000,
+        );
+        assert_eq!(result, PathUpdateResult::Inserted);
+
+        for _ in 0..5 {
+            rt.push_event(RuntimeEvent::SendUnicastToDevice {
+                destination_hash: target,
+                packet: vec![0xde, 0xad],
+            });
+        }
+        assert_eq!(rt.pending_unicast_sends_len(), 5);
+
+        let actions = rt.tick();
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
+        assert_eq!(
+            send_count, 2,
+            "first tick must process exactly router_max_per_tick=2 unicasts, \
+             got actions: {:?}",
+            actions
+        );
+        assert_eq!(
+            rt.pending_unicast_sends_len(),
+            3,
+            "remaining 3 unicasts must stay queued for the next tick"
+        );
+
+        let actions = rt.tick();
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
+        assert_eq!(send_count, 2, "second tick processes another 2");
+        assert_eq!(rt.pending_unicast_sends_len(), 1);
+
+        let actions = rt.tick();
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
+        assert_eq!(send_count, 1, "third tick processes the final 1");
+        assert_eq!(rt.pending_unicast_sends_len(), 0);
+    }
+
+    #[test]
+    fn unicast_defers_when_router_queue_has_backlog() {
+        // ZEB-226 round-10 review (Finding 1, race): if the router queue
+        // has unprocessed events (e.g. an announce that would create the
+        // route for a queued unicast), a path-table miss must DEFER
+        // (re-queue), not drop. Otherwise an announce + send-to-just-
+        // -announced-target submitted in the same batch loses the send
+        // when `router_max_per_tick` caps the announce drain.
+        //
+        // Race-window proxy: capture `router_queue_drained` happens
+        // AFTER the router-queue drain inside tick(), so it reflects
+        // whatever's still queued post-drain. To force is_empty()=false
+        // at unicast-drain time, we need >1 router event AND a cap that
+        // can't drain them all in one tick. Two TimerTicks + cap=1 fits:
+        // one TimerTick is processed, one is left queued, the unicast
+        // sees the leftover and defers instead of dropping.
+        let mut config = NodeConfig::default();
+        config.schedule.router_max_per_tick = Some(1);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        // Two router events; cap=1 means after the router drain the
+        // queue still has 1. The unicast drain will see `router_queue`
+        // non-empty and defer the unknown-target unicast.
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 0,
+        });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1001,
+            unix_now: 0,
+        });
+        assert_eq!(rt.router_queue_len(), 2);
+
+        // Push a unicast to an unknown destination. With the round-10
+        // fix, this MUST be deferred (router queue still has backlog),
+        // NOT dropped — even though the path-table lookup misses.
+        let unknown = [0x77u8; 16];
+        rt.push_event(RuntimeEvent::SendUnicastToDevice {
+            destination_hash: unknown,
+            packet: vec![0xbe, 0xef],
+        });
+        assert_eq!(rt.pending_unicast_sends_len(), 1);
+
+        let actions = rt.tick();
+
+        // Router cap=1 means 1 TimerTick processed, 1 still queued.
+        // Critically: the unicast sees router_queue still non-empty and
+        // DEFERS (no warn-and-drop, no SendOnInterface, the unicast
+        // stays queued for next tick).
+        assert_eq!(
+            rt.router_queue_len(),
+            1,
+            "router cap=1 leaves the second TimerTick queued"
+        );
+        assert_eq!(
+            rt.pending_unicast_sends_len(),
+            1,
+            "unicast must be DEFERRED (re-queued) — not dropped — \
+             because the router queue still has backlog this tick"
+        );
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
+        assert_eq!(
+            send_count, 0,
+            "deferred unicast must NOT have produced a SendOnInterface \
+             (no real route, just a defer); got actions: {:?}",
+            actions
+        );
+
+        // Second tick: router queue drains the second TimerTick (now
+        // empty), then the unicast drain sees router_queue_drained=true
+        // AND the route is still unknown — finally the genuine drop
+        // path fires. Unicast leaves the queue, no SendOnInterface.
+        let actions = rt.tick();
+        assert_eq!(rt.router_queue_len(), 0);
+        assert_eq!(
+            rt.pending_unicast_sends_len(),
+            0,
+            "second tick: router fully drained, unknown route → \
+             genuine drop after defer attempts exhausted"
+        );
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
+        assert_eq!(send_count, 0);
+    }
+
+    #[test]
+    fn unicast_drain_defers_count_against_router_max_per_tick() {
+        // ZEB-226 round-11 fix (CodeRabbit Major / Greptile P1):
+        // deferred unicasts must consume the unicast budget, not just
+        // routed/dropped ones. Without this, a flood of unknown-target
+        // sends during any tick where the router has backlog can walk
+        // the entire pending_unicast_sends queue in a single tick,
+        // bypassing router_max_per_tick.
+        //
+        // Setup chosen to be observable in a SINGLE tick:
+        //   - router_max_per_tick = 2
+        //   - router_queue: 3 TimerTicks (post-drain has 1 left → drained=false)
+        //   - pending_unicast_sends: 3 unknown destinations FOLLOWED BY
+        //     1 known destination
+        //
+        // With the fix: budget=2 is consumed by 2 of the 3 unknown
+        // defers; the third unknown and the known target are NEVER
+        // popped this tick → 0 SendOnInterface emitted.
+        //
+        // Without the fix: defers don't count → all 3 unknowns get
+        // deferred and the loop continues to pop the known target,
+        // routing it → 1 SendOnInterface emitted. The bug bypasses
+        // the cap.
+        use harmony_reticulum::path_table::PathUpdateResult;
+
+        let mut config = NodeConfig::default();
+        config.schedule.router_max_per_tick = Some(2);
+        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
+
+        // Seed a known path so the trailing known unicast WOULD route
+        // if the loop were to reach it.
+        let known_target = [0xa1u8; 16];
+        let random_blob = {
+            let mut b = [0u8; 10];
+            let ts: u64 = 1000;
+            let ts_bytes = ts.to_be_bytes();
+            b[5..10].copy_from_slice(&ts_bytes[3..8]);
+            b
+        };
+        let result = rt.router.path_table_mut_for_tests().update(
+            known_target,
+            known_target,
+            0,
+            Arc::from("udp0"),
+            [0u8; 16],
+            random_blob,
+            harmony_reticulum::InterfaceMode::Full,
+            1000,
+        );
+        assert_eq!(result, PathUpdateResult::Inserted);
+
+        // Push 3 router events; cap=2 means 1 leftover after drain →
+        // router_queue_drained=false at unicast-drain time.
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1000,
+            unix_now: 0,
+        });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1001,
+            unix_now: 0,
+        });
+        rt.push_event(RuntimeEvent::TimerTick {
+            now: 1002,
+            unix_now: 0,
+        });
+        assert_eq!(rt.router_queue_len(), 3);
+
+        // Push 3 unknowns followed by 1 known. Order matters: the loop
+        // must hit unknowns first so the budget gets consumed by defers.
+        for i in 0..3u8 {
+            rt.push_event(RuntimeEvent::SendUnicastToDevice {
+                destination_hash: [0xb0 | i; 16],
+                packet: vec![0xde, 0xad],
+            });
+        }
+        rt.push_event(RuntimeEvent::SendUnicastToDevice {
+            destination_hash: known_target,
+            packet: vec![0xbe, 0xef],
+        });
+        assert_eq!(rt.pending_unicast_sends_len(), 4);
+
+        let actions = rt.tick();
+
+        // Router cap=2 leaves 1 TimerTick queued → router_queue_drained
+        // was false in the unicast loop.
+        assert_eq!(
+            rt.router_queue_len(),
+            1,
+            "router cap=2 with 3 events leaves 1 queued"
+        );
+
+        // CORE ASSERTION: with the fix, the 2 defers consumed the
+        // entire unicast budget. The known target was never reached,
+        // so NO SendOnInterface was emitted. Without the fix, the
+        // 3 defers wouldn't count and the loop would reach the known
+        // target → 1 SendOnInterface.
+        let send_count = actions
+            .iter()
+            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
+            .count();
+        assert_eq!(
+            send_count, 0,
+            "unicast budget=2 must be consumed by the first 2 unknown \
+             defers, leaving the known target untouched. Got actions: {:?}",
+            actions
+        );
+
+        // pending_unicast_sends total: 2 deferred (re-pushed to front) +
+        // 1 unknown still untouched + 1 known still untouched = 4.
+        assert_eq!(
+            rt.pending_unicast_sends_len(),
+            4,
+            "all 4 unicasts still pending: 2 deferred, 2 untouched (1 \
+             unknown + 1 known) — none routed, none dropped"
+        );
+    }
+
+    #[test]
+    fn unicast_round_trip_a_to_b_surfaces_as_unicast_received() {
+        // ZEB-216 Sub-B Phase 3a — Task 5: end-to-end plumbing smoke.
+        //
+        // Validates the full chain wired across Tasks 1-4 by running
+        // two independent NodeRuntime instances ("A" and "B") and
+        // hand-bridging A's outbound `SendOnInterface` action into B's
+        // `InboundPacket` event:
+        //
+        //   A: SendUnicastToDevice event       (Task 1: variant)
+        //     → SendOnInterface action          (Task 4: outbound dispatch)
+        //   B: InboundPacket event              (existing wiring)
+        //     → DeliverLocally NodeAction       (existing Reticulum)
+        //     → UnicastReceived action          (Task 3: inbound dispatch)
+        //
+        // Known limitation: Task 3's `source` field is `None` —
+        // Reticulum's `process_data_packet` cannot yet resolve the
+        // terminal link to an identity hash because the Node does not
+        // track terminal-link state. Real source-identity binding lands
+        // in ZEB-227 / Phase 3b. So the assertion below is
+        // `source == None`, NOT `source == Some(a.local_identity_hash())`.
+        // The round-trip still proves bytes flow + the four wiring
+        // touchpoints from Tasks 1-4 remain connected — replace the
+        // assertion with a real-identity check when ZEB-227 lands.
+        use harmony_reticulum::packet::{
+            DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType,
+            PropagationType,
+        };
+        use harmony_reticulum::path_table::PathUpdateResult;
+
+        let (mut a, _a_startup) = make_runtime();
+        let (mut b, _b_startup) = make_runtime();
+
+        // Pick a target hash and register it as a local destination on B
+        // so B's `process_data_packet` resolves it to DeliverLocally.
+        // (Both A and B already have a `udp0` interface registered by
+        // `NodeRuntime::new` — the same name on both sides keeps the
+        // hand-bridge below trivial.)
+        let target = [0xb0u8; 16];
+        b.router.register_destination(target);
+
+        // Build a Type1/Single/Data Reticulum packet with destination_hash
+        // = target, then serialize to wire bytes. This is what a real
+        // harmony-client outbox would construct + hand to the runtime.
+        let payload: Vec<u8> = vec![0x68, 0x65, 0x6c, 0x6c, 0x6f]; // "hello"
+        let pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: target,
+                context: harmony_reticulum::PacketContext::None,
+            },
+            data: Arc::from(payload.clone().into_boxed_slice()),
+        };
+        let wire_bytes = pkt.to_bytes().expect("packet should serialize");
+
+        // Seed A's path table so target → udp0 (mirrors Task 4's happy
+        // path; same path_table_mut_for_tests() seam).
+        let random_blob = {
+            let mut b = [0u8; 10];
+            let ts: u64 = 1000;
+            let ts_bytes = ts.to_be_bytes();
+            b[5..10].copy_from_slice(&ts_bytes[3..8]);
+            b
+        };
+        let result = a.router.path_table_mut_for_tests().update(
+            target,
+            target,
+            0,
+            Arc::from("udp0"),
+            [0u8; 16],
+            random_blob,
+            harmony_reticulum::InterfaceMode::Full,
+            1000,
+        );
+        assert_eq!(
+            result,
+            PathUpdateResult::Inserted,
+            "test seed should have inserted a fresh entry"
+        );
+
+        // A: enqueue the send and tick to capture the SendOnInterface action.
+        a.push_event(RuntimeEvent::SendUnicastToDevice {
+            destination_hash: target,
+            packet: wire_bytes.clone(),
+        });
+        let a_actions = a.tick();
+        let send = a_actions
+            .iter()
+            .find_map(|action| match action {
+                RuntimeAction::SendOnInterface {
+                    interface_name,
+                    raw,
+                    weight,
+                } => Some((interface_name.clone(), raw.clone(), *weight)),
+                _ => None,
+            })
+            .expect("A should emit SendOnInterface for target");
+
+        assert_eq!(
+            &*send.0, "udp0",
+            "A should route to the seeded udp0 interface"
+        );
+        assert_eq!(
+            send.1, wire_bytes,
+            "wire bytes must round-trip A unchanged (udp0 has no IFAC)"
+        );
+        assert_eq!(
+            send.2, None,
+            "directed unicast send carries weight=None (not broadcast)"
+        );
+
+        // B: feed the wire bytes back in as InboundPacket on the same
+        // interface name. Tick and look for UnicastReceived.
+        b.push_event(RuntimeEvent::InboundPacket {
+            interface_name: send.0.to_string(),
+            raw: send.1.clone(),
+            now: 1000,
+        });
+        let b_actions = b.tick();
+        let received = b_actions
+            .iter()
+            .find_map(|action| match action {
+                RuntimeAction::UnicastReceived {
+                    destination_hash,
+                    source,
+                    packet,
+                } => Some((*destination_hash, *source, packet.clone())),
+                _ => None,
+            })
+            .expect("B should surface UnicastReceived");
+
+        // Round-10 review: destination_hash now flows through. The
+        // packet was addressed to `target` (B's registered destination),
+        // and that's what B's UnicastReceived must surface so the client
+        // can dispatch by destination kind.
+        assert_eq!(
+            received.0, target,
+            "UnicastReceived.destination_hash must match the local \
+             destination the packet was addressed to"
+        );
+        // Source is `None` in Phase 3a per the Option<[u8; 16]> contract
+        // on `RuntimeAction::UnicastReceived` — terminal-link state isn't
+        // tracked at the Node layer yet, so the runtime can't surface a
+        // real source. ZEB-227 (Phase 3b) wires the real link-identity
+        // binding and this assertion should flip to
+        // `Some(a.local_identity_hash())` then.
+        assert_eq!(
+            received.1, None,
+            "source is None in Phase 3a; ZEB-227 (Phase 3b) wires \
+             real link-identity binding and this becomes Some(hash)"
+        );
+        // UnicastReceived.packet carries the parsed packet's `data`
+        // field (payload only), not the full wire bytes — matches the
+        // dispatcher behavior in dispatch_router_actions.
+        assert_eq!(
+            received.2, payload,
+            "payload bytes must round-trip A → B"
+        );
     }
 
     #[test]

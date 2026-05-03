@@ -55,3 +55,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
+# Round-11 (ZEB-226 Greptile P2): activate harmony-reticulum's
+# `test-seams` feature ONLY in dev/test builds so in-crate tests can
+# call `Node::path_table_mut_for_tests`. Cargo's feature unification
+# does NOT promote dev-only feature activations into the regular
+# dependency graph for normal builds (verified by running
+# `cargo check --workspace` after this change).
+harmony-reticulum = { workspace = true, features = ["std", "test-seams"] }

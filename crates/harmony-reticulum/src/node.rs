@@ -233,10 +233,27 @@ pub enum NodeAction {
         hops: u8,
     },
     /// A packet should be delivered to a locally registered destination.
+    ///
+    /// `source` is the remote sender's 16-byte identity hash, **when known**.
+    /// Reticulum data packets do not carry the sender identity in their wire
+    /// header — the source is bound at the link layer (link handshake records
+    /// the remote identity in `Link::remote_identity`). The `Node` does not
+    /// currently track terminal-link state for non-transport delivery, so this
+    /// field is populated with `None` at the construction site below until
+    /// link/identity binding is wired (ZEB-227, harmony-client Phase 3b).
+    /// Once link-identity binding lands, the construction site sets
+    /// `Some(hash)` and the runtime dispatch forwards it through to
+    /// `RuntimeAction::UnicastReceived`.
+    ///
+    /// Consumers MUST handle the `None` case explicitly — a sentinel like
+    /// `[0u8; 16]` could be misinterpreted as a real identity.
+    ///
+    /// (ZEB-216 Sub-B Phase 3a — DM transport surface; field added in ZEB-226)
     DeliverLocally {
         destination_hash: DestinationHash,
         packet: Packet,
         interface_name: Arc<str>,
+        source: Option<[u8; 16]>,
     },
     /// Expired paths were removed from the path table.
     PathsExpired { count: usize },
@@ -709,6 +726,29 @@ impl Node {
     /// Read-only access to the path table.
     pub fn path_table(&self) -> &PathTable {
         &self.path_table
+    }
+
+    /// Mutable access to the path table — **test-only seam**.
+    ///
+    /// Renamed from `path_table_mut` (and `#[doc(hidden)]`) to make the
+    /// test-only intent loud. The path table normally tracks state that
+    /// only `process_inbound` (announces) and the announce-rebroadcast
+    /// path know how to update consistently — direct mutation skips
+    /// cooperation scoring, reverse-table bookkeeping, and replay
+    /// detection. Use this only in tests / bootstrap paths that need
+    /// to seed routing entries without a real announce flow; production
+    /// code MUST drive updates through the inbound path.
+    ///
+    /// Round-11 (Greptile P2): gated behind `cfg(test)` (in-crate
+    /// tests) OR the internal `test-seams` feature (downstream test
+    /// crates that need cross-crate access — currently
+    /// harmony-runtime's tests). `#[doc(hidden)]` was insufficient on
+    /// its own because it only hides from rustdoc; downstream crates
+    /// could still call the method in production builds.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn path_table_mut_for_tests(&mut self) -> &mut PathTable {
+        &mut self.path_table
     }
 
     /// Number of registered interfaces.
@@ -1247,10 +1287,18 @@ impl Node {
 
         // 1. Local delivery takes priority
         if self.local_destinations.contains(&destination_hash) {
+            // Source identity is not present in the Reticulum wire header for
+            // generic data packets — it's bound at the link layer (handshake).
+            // Set to None until terminal-link state tracking lands in ZEB-227 /
+            // harmony-client Phase 3b. The Node currently does not track which
+            // Link handshake produced this DeliverLocally, so we cannot surface
+            // a real identity yet. The runtime's dispatch path forwards this
+            // Option as-is to `RuntimeAction::UnicastReceived { source, .. }`.
             return vec![NodeAction::DeliverLocally {
                 destination_hash,
                 packet,
                 interface_name,
+                source: None,
             }];
         }
 

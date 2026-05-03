@@ -21,6 +21,13 @@ hashbrown = { workspace = true }
 [features]
 default = ["std"]
 no-neon = ["harmony-crypto/no-neon"]
+# Round-11 (ZEB-226 Greptile P2): exposes test-only seams (e.g.,
+# `Node::path_table_mut_for_tests`) to downstream test crates.
+# NOT for production use — these seams skip invariants the public API
+# enforces (cooperation scoring, reverse-table bookkeeping, replay
+# detection). Activated only by `[dev-dependencies]` in consuming
+# crates so normal builds never see the seam.
+test-seams = []
 std = [
     "harmony-crypto/std",
     "harmony-identity/std",

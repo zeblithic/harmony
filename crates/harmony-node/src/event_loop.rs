@@ -2365,6 +2365,26 @@ async fn dispatch_action(
         RuntimeAction::RunInference { .. } => {
             tracing::error!("RunInference reached dispatch_action — should be intercepted");
         }
+        // ZEB-216 Sub-B Phase 3a: harmony-node has no client-facing IPC channel
+        // for unicast delivery yet. The harmony-client (Phase 3b, ZEB-227)
+        // consumes this variant directly via its embedded NodeRuntime — when
+        // running under harmony-node (the standalone binary), there's no
+        // consumer, so log at debug and drop. This keeps harmony-node compiling
+        // exhaustively against the new variant without inventing a delivery
+        // path that has no recipient.
+        RuntimeAction::UnicastReceived {
+            destination_hash,
+            source,
+            packet,
+        } => {
+            tracing::debug!(
+                destination_hash_first_4 = ?&destination_hash[..4],
+                source_known = source.is_some(),
+                packet_len = packet.len(),
+                "UnicastReceived in harmony-node — no client consumer; dropping. \
+                 Real consumer is harmony-client per ZEB-216 Sub-B Phase 3b."
+            );
+        }
     }
 }
 
