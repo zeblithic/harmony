@@ -363,6 +363,23 @@ pub enum RuntimeAction {
         /// `Some(score)` = broadcast send (caller may drop if random > score).
         weight: Option<f32>,
     },
+    /// Tier 1: Surface a received Reticulum unicast packet to the
+    /// client. Emitted from `dispatch_router_actions` when the inner
+    /// router produces `NodeAction::DeliverLocally` for a packet
+    /// addressed to a locally-registered destination.
+    ///
+    /// `source` is the remote device's identity hash, resolved from
+    /// link state at receive time (the link knows its peer's identity
+    /// from the handshake). `packet` is the raw payload — the client
+    /// owns decryption + framing parsing.
+    ///
+    /// (ZEB-216 Sub-B Phase 3a — DM transport surface)
+    UnicastReceived {
+        /// 16-byte device identity hash of the remote sender.
+        source: [u8; 16],
+        /// Opaque packet bytes as received from the wire.
+        packet: Vec<u8>,
+    },
     /// Tier 2: Reply to a content or stats query.
     SendReply { query_id: u64, payload: Vec<u8> },
     /// Tier 2: Publish a message (e.g., content availability announcement).
@@ -4609,6 +4626,24 @@ mod tests {
         config.schedule.router_max_per_tick = Some(5);
         let (rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
         assert_eq!(rt.schedule().router_max_per_tick, Some(5));
+    }
+
+    #[test]
+    fn runtime_action_unicast_received_constructs_and_compares() {
+        // ZEB-216 Sub-B Phase 3a — Task 2: variant constructor smoke.
+        // Asserts variant is constructible, derives Clone + PartialEq (matches
+        // existing actions — regression guard so the new variant doesn't drop
+        // the derives and break test infrastructure that depends on them).
+        let a = RuntimeAction::UnicastReceived {
+            source: [0xbb; 16],
+            packet: vec![0x10, 0x20],
+        };
+        let b = RuntimeAction::UnicastReceived {
+            source: [0xbb; 16],
+            packet: vec![0x10, 0x20],
+        };
+        assert_eq!(a, b);
+        let _cloned: RuntimeAction = a.clone();
     }
 
     #[test]
