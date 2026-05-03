@@ -4,7 +4,7 @@
 
 **Goal:** Add `RuntimeEvent::SendUnicastToDevice` and `RuntimeAction::UnicastReceived` to harmony-runtime, wired through to existing Reticulum unicast plumbing. This is the harmony-side companion PR for harmony-client's ZEB-216 Sub-B (DM transport, Phases 2/3b consume these).
 
-**Architecture:** Phase 3a is pure plumbing on existing surfaces. No new types — `IdentityHash = [u8; 16]` at `harmony-identity/src/identity.rs:37` is the target/source identifier. The inbound side activates a deliberately-stubbed handler at `runtime.rs:2350-2351` (the catch-all `_ => {}` after `SendOnInterface`/`PacketDropped` in `dispatch_router_actions`, where `NodeAction::DeliverLocally` currently falls through and is silently dropped). The outbound side adds a translation from the new `RuntimeEvent::SendUnicastToDevice` to the existing `RuntimeAction::SendOnInterface`, looking up the target's interface via existing peer-manager state.
+**Architecture:** Phase 3a is pure plumbing on existing surfaces. No new types — `[u8; 16]` (matching `IdentityHash` at `harmony-identity/src/identity.rs:37`) is the source identifier. `destination_hash` on `SendUnicastToDevice` is a Reticulum *destination* hash (not a raw device identity hash) — the client computes it from a device identity hash + a destination name. The inbound side activates a deliberately-stubbed handler at `runtime.rs:2350-2351` (the catch-all `_ => {}` after `SendOnInterface`/`PacketDropped` in `dispatch_router_actions`, where `NodeAction::DeliverLocally` currently falls through and is silently dropped). The outbound side adds a translation from the new `RuntimeEvent::SendUnicastToDevice` to the existing `RuntimeAction::SendOnInterface`, looking up the destination's interface via the inner Reticulum router's path table.
 
 **Tech Stack:** Rust 1.94, tokio (async runtime is `tracing` for logs), postcard (workspace serialization choice — but note that `RuntimeEvent`/`RuntimeAction` are NOT serde-derived; they're internal Rust enums consumed by the embedding layer directly).
 
@@ -33,16 +33,16 @@ No new files.
 
 ## Open implementation questions
 
-These are flagged for the implementer to resolve by reading the actual code (no design decision needed yet):
+These were flagged for the implementer to resolve by reading the actual code. Resolutions captured below.
 
-1. **Target → interface routing.** When the runtime processes `SendUnicastToDevice { target }`, how does it know which interface the target is reachable on? Look at `PeerManager` (referenced at line 259 in runtime.rs) or the router's path table. The existing `InitiateTunnel` action shape (line 365+) carries `relay_url` per peer — likely there's a similar lookup for Reticulum interfaces. If the target is unknown, the right behavior for Phase 3a is to log + drop (Phase 3b in harmony-client adds retry/expiration semantics on top).
+1. **`destination_hash` → interface routing.** When the runtime processes `SendUnicastToDevice { destination_hash }`, how does it know which interface the destination is reachable on? Look at `PeerManager` (referenced at line 259 in runtime.rs) or the router's path table. The existing `InitiateTunnel` action shape (line 365+) carries `relay_url` per peer — likely there's a similar lookup for Reticulum interfaces. If the destination is unknown, the right behavior for Phase 3a is to log + drop (Phase 3b in harmony-client adds retry/expiration semantics on top). **Resolved during execution:** path-table lookup via `Node::path_table()`. Round-10 review tightened the drain semantics (defer-on-miss when router queue still has backlog; bound by `router_max_per_tick`).
 
 2. **Source identity resolution on receive.** `NodeAction::DeliverLocally { destination_hash, packet, interface_name }` carries the local destination, not the remote source. The source identity needs to come from somewhere:
    - **Option A:** The packet payload (Reticulum link packets carry origin info in their header)
    - **Option B:** Link state — the router knows which link delivered the packet, and the link knows its remote identity
    - **Option C:** A new field added to `NodeAction::DeliverLocally` to carry source
 
-   Read `harmony-reticulum/src/node.rs` around line 236 (where `DeliverLocally` is emitted) to determine the source's actual provenance. Option B is most likely — link state.
+   Read `harmony-reticulum/src/node.rs` around line 236 (where `DeliverLocally` is emitted) to determine the source's actual provenance. **Resolved during execution: Option C** — added `source: Option<[u8; 16]>` to `NodeAction::DeliverLocally`. The Option type was tightened in round-9 review to make the "unknown source" Phase 3a behavior unforgeable (sentinel hashes can be misinterpreted as real identities). The construction site emits `None` until link/identity binding lands in ZEB-227 / Phase 3b.
 
 ---
 
@@ -63,15 +63,15 @@ Add to the test module in `runtime.rs`:
 fn runtime_event_send_unicast_to_device_constructs_and_compares() {
     use super::RuntimeEvent;
     let e = RuntimeEvent::SendUnicastToDevice {
-        target: [0xaa; 16],
+        destination_hash: [0xaa; 16],
         packet: vec![0x01, 0x02, 0x03],
     };
     // Match-and-extract — proves variant is constructible and the fields
     // are accessible by name (catches accidental tuple-variant or wrong
     // field-name typos).
     match e {
-        RuntimeEvent::SendUnicastToDevice { target, packet } => {
-            assert_eq!(target, [0xaa; 16]);
+        RuntimeEvent::SendUnicastToDevice { destination_hash, packet } => {
+            assert_eq!(destination_hash, [0xaa; 16]);
             assert_eq!(packet, vec![0x01, 0x02, 0x03]);
         }
         _ => panic!("expected SendUnicastToDevice variant"),
@@ -90,16 +90,26 @@ In `crates/harmony-runtime/src/runtime.rs`, find the `pub enum RuntimeEvent` blo
 
 ```rust
     /// Tier 1: Client requests a Reticulum unicast send to a specific
-    /// device. Translated to `RuntimeAction::SendOnInterface` during the
-    /// next tick by looking up `target`'s reachable interface in peer state.
-    /// If `target` is unknown, the request is logged and dropped — retry/
-    /// expiration semantics are the client's concern (handled at the
-    /// outbox layer in harmony-client per ZEB-216 Sub-B Phase 3b).
+    /// destination. Translated to `RuntimeAction::SendOnInterface` during
+    /// the next tick by looking up `destination_hash` in the inner
+    /// router's path table. If the lookup misses, the request is logged
+    /// and dropped — retry/expiration semantics are the client's concern
+    /// (handled at the outbox layer in harmony-client per ZEB-216 Sub-B
+    /// Phase 3b).
+    ///
+    /// **`destination_hash` is a Reticulum destination hash, NOT a raw
+    /// device identity hash.** The path table is keyed by destination
+    /// hashes which the runtime learns from announces. The harmony-client
+    /// side (Phase 3b, ZEB-227) is responsible for computing this from a
+    /// device identity hash + a destination name (e.g. DM inbox, voice
+    /// channel, file sync — the runtime is generic plumbing and does not
+    /// know what destination names exist).
     ///
     /// (ZEB-216 Sub-B Phase 3a — DM transport surface)
     SendUnicastToDevice {
-        /// 16-byte device identity hash (`harmony_identity::IdentityHash`).
-        target: [u8; 16],
+        /// 16-byte Reticulum destination hash. Caller-provided; see the
+        /// variant doc above for the derivation contract.
+        destination_hash: [u8; 16],
         /// Opaque packet bytes — the runtime does not parse or validate
         /// the payload. The client owns encryption + framing.
         packet: Vec<u8>,
@@ -148,11 +158,13 @@ the type addition + constructor test."
 fn runtime_action_unicast_received_constructs_and_compares() {
     use super::RuntimeAction;
     let a = RuntimeAction::UnicastReceived {
-        source: [0xbb; 16],
+        destination_hash: [0xcc; 16], // local dest the packet was addressed to (round 10)
+        source: Some([0xbb; 16]),     // Phase 3a uses None; round-9 tightened to Option
         packet: vec![0x10, 0x20],
     };
     let b = RuntimeAction::UnicastReceived {
-        source: [0xbb; 16],
+        destination_hash: [0xcc; 16],
+        source: Some([0xbb; 16]),
         packet: vec![0x10, 0x20],
     };
     // Variant must derive PartialEq + Clone (matches existing actions
@@ -178,15 +190,34 @@ In `runtime.rs`, find `pub enum RuntimeAction` at line 341. Add in the Tier 1 gr
     /// router produces `NodeAction::DeliverLocally` for a packet
     /// addressed to a locally-registered destination.
     ///
-    /// `source` is the remote device's identity hash, resolved from
-    /// link state at receive time (the link knows its peer's identity
-    /// from the handshake). `packet` is the raw payload — the client
-    /// owns decryption + framing parsing.
+    /// `destination_hash` is the local Reticulum destination hash the
+    /// packet was addressed to. (Added in round 10.) The client
+    /// registered the destination, so it knows the mapping from hash
+    /// to handler — needed because the client registers MULTIPLE
+    /// destination types (DM inbox, voice channel, file sync, ...)
+    /// and dispatches each inbound packet by destination kind.
+    ///
+    /// `source` is the remote device's identity hash, **when known**.
+    /// `Some(hash)` once link/identity binding lands in ZEB-227 /
+    /// Phase 3b; `None` in Phase 3a (the Node layer doesn't track
+    /// terminal-link state yet, so the runtime can't surface a real
+    /// source). Round 9 tightened this from `[u8; 16]` to
+    /// `Option<[u8; 16]>` to make the "unknown source" case
+    /// unforgeable — sentinel hashes can be misinterpreted as real
+    /// identities. Consumers MUST handle the `None` case explicitly.
+    ///
+    /// `packet` is the raw payload — the client owns decryption +
+    /// framing parsing.
     ///
     /// (ZEB-216 Sub-B Phase 3a — DM transport surface)
     UnicastReceived {
-        /// 16-byte device identity hash of the remote sender.
-        source: [u8; 16],
+        /// 16-byte local Reticulum destination hash the packet was
+        /// addressed to. (Round 10.)
+        destination_hash: [u8; 16],
+        /// 16-byte device identity hash of the remote sender, when
+        /// known. `None` in Phase 3a; `Some(hash)` after ZEB-227.
+        /// (Round 9 tightened from `[u8; 16]`.)
+        source: Option<[u8; 16]>,
         /// Opaque packet bytes as received from the wire.
         packet: Vec<u8>,
     },
@@ -229,9 +260,9 @@ is wired in step 3 (currently DeliverLocally is silently dropped)."
 **Investigation step (BEFORE writing the test):** Read these spots and decide on the source-resolution approach:
 1. `crates/harmony-reticulum/src/node.rs:236` — where `NodeAction::DeliverLocally` is emitted. Does the surrounding code have access to the source identity (from link state, packet header, or router state)? Capture it into the variant if needed.
 2. If `DeliverLocally` doesn't carry source, you have two options:
-   a. Add a `source: [u8; 16]` field to `NodeAction::DeliverLocally` (touches the Reticulum crate, but cleanest)
+   a. Add a `source: Option<[u8; 16]>` field to `NodeAction::DeliverLocally` (touches the Reticulum crate, but cleanest). The Option is required because Phase 3a can't resolve a real identity yet — round-9 review tightened from `[u8; 16]` to make the unknown case unforgeable (sentinels can be misinterpreted as real identities).
    b. Look up source from `self.peer_manager` or the router's link table at the dispatch site (no Reticulum-crate change)
-3. Pick whichever is cleanest given the actual code shape. Document the choice in the commit message.
+3. Pick whichever is cleanest given the actual code shape. Document the choice in the commit message. **Resolved during execution: Option (a) — see Open Questions.**
 
 If option (a) requires modifying `harmony-reticulum`, that's acceptable scope — both crates change in the same commit.
 
@@ -349,13 +380,13 @@ for the client-facing consumer — Phase 3a is that consumer."
 - Modify: `crates/harmony-runtime/src/runtime.rs` — find where `RuntimeEvent` variants are handled in the tick loop. Likely `pub fn tick` at line 2005 dispatches via a match against pending events. If events are queued elsewhere and processed during tick, find the dispatch site and add the `SendUnicastToDevice` arm.
 - Test: inline test feeding a `SendUnicastToDevice` event and observing the resulting `SendOnInterface` action
 
-**Investigation step:** Read these to figure out target → interface routing:
+**Investigation step:** Read these to figure out destination_hash → interface routing:
 1. `crates/harmony-runtime/src/runtime.rs` around `PeerManager` references (line 259+) — does the peer manager track interface-per-peer?
 2. Look at how existing `SendOnInterface` actions are emitted in the codebase (grep for `SendOnInterface {`) — what's `interface_name` typically derived from?
-3. If the peer manager doesn't track interface-per-target, look at the Reticulum router's path table or the link table for the same info.
+3. If the peer manager doesn't track interface-per-destination, look at the Reticulum router's path table or the link table for the same info.
 4. Decide: lookup function exists already → call it. Doesn't exist → add a small helper.
 
-- [ ] **Step 1: Investigate target → interface routing (read-only)**
+- [ ] **Step 1: Investigate destination_hash → interface routing (read-only)**
 
 Determine the lookup. Document the chosen approach in an implementation comment.
 
@@ -364,15 +395,15 @@ Determine the lookup. Document the chosen approach in an implementation comment.
 ```rust
 #[test]
 fn send_unicast_to_device_emits_send_on_interface_for_known_target() {
-    // Construct a NodeRuntime with one known peer at a known interface.
+    // Construct a NodeRuntime with one known destination at a known interface.
     // (Reuse existing test-harness if there's one; if not, build a minimal
     // NodeConfig + InMemoryStore setup like other tests in this file.)
     //
-    // Pre-populate peer_manager (or whatever the routing source is) so
-    // target=[0xaa; 16] resolves to interface_name="test-iface".
+    // Pre-populate the routing source (chosen during investigation) so
+    // destination_hash=[0xaa; 16] resolves to interface_name="test-iface".
     //
     // Feed RuntimeEvent::SendUnicastToDevice {
-    //     target: [0xaa; 16],
+    //     destination_hash: [0xaa; 16],
     //     packet: vec![0x01, 0x02, 0x03],
     // }
     //
@@ -388,9 +419,9 @@ fn send_unicast_to_device_emits_send_on_interface_for_known_target() {
 
 #[test]
 fn send_unicast_to_device_drops_for_unknown_target() {
-    // Same setup but with a target NOT in peer_manager.
+    // Same setup but with a destination_hash NOT in the routing source.
     // Expect the action vec to NOT contain any SendOnInterface
-    // for the unknown target. A WARN-level tracing log is acceptable.
+    // for the unknown destination. A WARN-level tracing log is acceptable.
     // Phase 3b in harmony-client owns retry/expiration semantics.
     todo!()
 }
@@ -406,9 +437,9 @@ Expected: both FAIL — the dispatch arm doesn't exist yet.
 In the runtime tick / event dispatch path, add:
 
 ```rust
-    RuntimeEvent::SendUnicastToDevice { target, packet } => {
-        // Resolve target's reachable interface via <chosen approach>.
-        match self.<lookup>(&target) {
+    RuntimeEvent::SendUnicastToDevice { destination_hash, packet } => {
+        // Resolve destination_hash's reachable interface via <chosen approach>.
+        match self.<lookup>(&destination_hash) {
             Some(interface_name) => {
                 // Wrap into Reticulum frame if needed (depends on existing
                 // SendOnInterface conventions — match what other unicast
@@ -421,9 +452,9 @@ In the runtime tick / event dispatch path, add:
             }
             None => {
                 tracing::warn!(
-                    target_hex = %hex::encode(target),
+                    destination_hash_first_4 = ?&destination_hash[..4],
                     packet_len = packet.len(),
-                    "SendUnicastToDevice target unknown — dropping. \
+                    "SendUnicastToDevice destination_hash unknown — dropping. \
                      Client (harmony-client) owns retry/expiration via outbox."
                 );
             }
@@ -431,7 +462,7 @@ In the runtime tick / event dispatch path, add:
     }
 ```
 
-(Adjust the exact match shape based on the existing dispatch pattern.)
+(Adjust the exact match shape based on the existing dispatch pattern. Round-9 / round-10 review iterated on the drain semantics — the landed code routes via `pending_unicast_sends` queued in `push_event` and drained in `tick()` after the router queue, with `router_max_per_tick` budget + defer-on-miss when the router still has backlog.)
 
 - [ ] **Step 5: Flesh out tests, run them, verify they pass**
 
@@ -456,9 +487,9 @@ git commit -am "feat(zeb-226): translate SendUnicastToDevice to SendOnInterface
 Phase 3a, step 4 of 5. Wires the outbound half of the unicast IPC
 contract: RuntimeEvent::SendUnicastToDevice (client request) is
 processed during tick() and translated to RuntimeAction::SendOnInterface
-with the target's resolved interface (via <chosen lookup>).
+with the destination_hash's resolved interface (via <chosen lookup>).
 
-Unknown targets are logged at WARN and dropped — retry/expiration
+Unknown destinations are logged at WARN and dropped — retry/expiration
 semantics live in harmony-client's outbox (ZEB-216 Sub-B Phase 3b)."
 ```
 
@@ -487,15 +518,17 @@ If a helper exists: use it. If not: build a minimal one inline in the test (two 
 #[test]
 fn unicast_round_trip_a_to_b_surfaces_as_unicast_received() {
     // Setup: two NodeRuntime instances representing devices A and B.
-    // A knows B's identity hash + interface; B knows A's.
+    // Pick a destination hash (Reticulum DM destination), register it
+    // as a local destination on B, seed A's path table to route it to
+    // a shared interface name.
     let (mut a, mut b) = make_two_node_pair();  // or inline construction
-    let a_id = a.local_identity_hash();
-    let b_id = b.local_identity_hash();
+    let dest = [0xb0u8; 16];                    // shared Reticulum dest hash
+    b.router.register_destination(dest);
     let payload = b"hello unicast".to_vec();
 
     // A: queue the send via the new event.
     a.feed_event(RuntimeEvent::SendUnicastToDevice {
-        target: b_id,
+        destination_hash: dest,
         packet: payload.clone(),
     });
 
@@ -509,7 +542,7 @@ fn unicast_round_trip_a_to_b_surfaces_as_unicast_received() {
             }
             _ => None,
         })
-        .expect("A should have emitted SendOnInterface for B");
+        .expect("A should have emitted SendOnInterface for dest");
 
     // B: feed the wire bytes as InboundPacket.
     b.feed_event(RuntimeEvent::InboundPacket {
@@ -523,15 +556,21 @@ fn unicast_round_trip_a_to_b_surfaces_as_unicast_received() {
     let received = b_actions
         .iter()
         .find_map(|action| match action {
-            RuntimeAction::UnicastReceived { source, packet } => {
-                Some((*source, packet.clone()))
-            }
+            RuntimeAction::UnicastReceived {
+                destination_hash,
+                source,
+                packet,
+            } => Some((*destination_hash, *source, packet.clone())),
             _ => None,
         })
         .expect("B should have surfaced UnicastReceived");
 
-    assert_eq!(received.0, a_id, "source must match A's identity");
-    assert_eq!(received.1, payload, "packet must round-trip unchanged");
+    // destination_hash flows through (round 10).
+    assert_eq!(received.0, dest, "destination_hash must match B's local dest");
+    // source is None in Phase 3a (Option<[u8; 16]>; round 9 tightening) —
+    // becomes Some(a.local_identity_hash()) after ZEB-227 lands.
+    assert_eq!(received.1, None, "source is None until ZEB-227");
+    assert_eq!(received.2, payload, "packet must round-trip unchanged");
 }
 ```
 
@@ -589,11 +628,11 @@ gh pr create --repo zeblithic/harmony \
 
 Adds the runtime IPC surface for ZEB-216 Sub-B Phase 3a (DM transport companion):
 
-- New `RuntimeEvent::SendUnicastToDevice { target, packet }` — client requests a Reticulum unicast send to a specific device. Translated to `RuntimeAction::SendOnInterface` during the next tick via peer-manager interface lookup.
-- New `RuntimeAction::UnicastReceived { source, packet }` — runtime surfaces a received Reticulum unicast packet to the client. Activates the previously-stubbed `// Other router actions are diagnostics — drop for now` handler at runtime.rs:2350-2351.
+- New `RuntimeEvent::SendUnicastToDevice { destination_hash, packet }` — client requests a Reticulum unicast send to a specific destination. Translated to `RuntimeAction::SendOnInterface` during the next tick via path-table interface lookup.
+- New `RuntimeAction::UnicastReceived { destination_hash, source, packet }` — runtime surfaces a received Reticulum unicast packet to the client. Activates the previously-stubbed `// Other router actions are diagnostics — drop for now` handler at runtime.rs:2350-2351. `source` is `Option<[u8; 16]>` (round-9 tightening — `None` until ZEB-227 wires link-identity binding); `destination_hash` is the local destination the packet was addressed to (round-10, lets the client dispatch by destination kind).
 - End-to-end round-trip integration test (A's send → B's receive).
 
-Pure plumbing — no new types, no new Reticulum protocol features. Uses existing `IdentityHash = [u8; 16]` for source/target.
+Pure plumbing — no new types, no new Reticulum protocol features. Uses `[u8; 16]` for both fields (matches `harmony_identity::IdentityHash` for the source).
 
 ## Linear
 
@@ -620,6 +659,6 @@ EOF
 
 2. **Placeholder scan:** Every step contains the actual code or actual command. The `todo!()` in Task 3 Step 2 and Task 4 Step 2 IS a placeholder — but it's an intentional one tied to a real investigation step (the test body depends on which lookup approach is chosen). Each `todo!()` has a "see investigation comment" pointer.
 
-3. **Type consistency:** `RuntimeEvent::SendUnicastToDevice` and `RuntimeAction::UnicastReceived` use `[u8; 16]` for target/source (matches `IdentityHash` from harmony-identity). Field names `target`/`source`/`packet` are consistent across all task references. ✓
+3. **Type consistency:** `RuntimeEvent::SendUnicastToDevice` uses `destination_hash: [u8; 16]` (Reticulum dest hash). `RuntimeAction::UnicastReceived` uses `destination_hash: [u8; 16]` (local dest, round-10) + `source: Option<[u8; 16]>` (remote sender; round-9 tightened from `[u8; 16]` so the unknown case is unforgeable). ✓
 
-4. **Open questions are flagged, not hidden:** Two real investigation steps (target→interface routing in Task 4, source resolution in Task 3) are surfaced as explicit "Investigation step" sub-steps before the failing test. The implementer is told what to read and how to choose. ✓
+4. **Open questions are flagged, not hidden:** Two real investigation steps (destination_hash→interface routing in Task 4, source resolution in Task 3) are surfaced as explicit "Investigation step" sub-steps before the failing test. The implementer is told what to read and how to choose. ✓
