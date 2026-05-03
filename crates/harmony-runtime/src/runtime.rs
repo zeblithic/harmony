@@ -2265,6 +2265,29 @@ impl<B: BookStore> NodeRuntime<B> {
                         processed_unicasts += 1;
                         if self.router.path_table().get(&destination_hash).is_some() {
                             let node_actions = self.router.route_packet(&destination_hash, packet);
+                            // Round-12 (Cursor Low): log outbound
+                            // PacketDropped here at the call site where
+                            // we have full SendUnicastToDevice context.
+                            // The top-level arm in dispatch_router_actions
+                            // was removed because it also fired on
+                            // routine inbound NoLocalDestination drops
+                            // for broadcast traffic addressed to
+                            // unregistered local destinations — noisy on
+                            // non-transport nodes.
+                            for na in &node_actions {
+                                if let NodeAction::PacketDropped {
+                                    reason,
+                                    interface_name,
+                                } = na
+                                {
+                                    tracing::warn!(
+                                        ?reason,
+                                        %interface_name,
+                                        destination_hash_first_4 = ?&destination_hash[..4],
+                                        "outbound unicast SendUnicastToDevice failed at route_packet"
+                                    );
+                                }
+                            }
                             self.dispatch_router_actions(node_actions, &mut actions);
                         } else if !router_queue_drained {
                             // Router queue still has unprocessed events
@@ -2562,22 +2585,16 @@ impl<B: BookStore> NodeRuntime<B> {
                         packet: packet.data.to_vec(),
                     });
                 }
-                // Top-level packet drops (e.g. unknown interface, IFAC
-                // masking failure on the outbound path). Logged here so
-                // SendUnicastToDevice misses produced by `route_packet`
-                // surface in tracing instead of falling silently through
-                // the diagnostic catch-all below.
-                NodeAction::PacketDropped {
-                    reason,
-                    interface_name,
-                } => {
-                    tracing::warn!(
-                        ?reason,
-                        %interface_name,
-                        "Reticulum packet dropped during dispatch"
-                    );
-                }
-                // Other router actions are diagnostics — drop for now.
+                // Other router actions (including top-level
+                // `NodeAction::PacketDropped`) are diagnostics — drop
+                // for now. Round-12 (Cursor Low): outbound unicast
+                // PacketDropped is logged at the call site in the
+                // SendUnicastToDevice drain where the full context
+                // (destination_hash) is available; logging it here too
+                // would also surface routine inbound
+                // `process_data_packet` drops (e.g. NoLocalDestination
+                // for broadcast traffic addressed to unregistered local
+                // destinations) and spam WARN on non-transport nodes.
                 _ => {}
             }
         }
