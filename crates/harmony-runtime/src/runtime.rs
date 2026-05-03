@@ -379,6 +379,15 @@ pub enum RuntimeAction {
     /// router produces `NodeAction::DeliverLocally` for a packet
     /// addressed to a locally-registered destination.
     ///
+    /// `destination_hash` is the 16-byte local Reticulum destination
+    /// hash the packet was addressed to. Lets the client dispatch by
+    /// destination kind (DM inbox vs voice channel vs file sync, etc.)
+    /// — the client registered the destination, so it knows the
+    /// mapping from hash to handler. (Added in round-10 review,
+    /// ZEB-226: the client registers MULTIPLE destination types per
+    /// its spec and needs the destination hash to dispatch; the
+    /// dispatch arm previously discarded it.)
+    ///
     /// `source` is the remote sender's identity hash, **when known**.
     /// `Some(hash)` once link-identity binding lands in ZEB-227 /
     /// Phase 3b; `None` in Phase 3a (terminal-link state isn't tracked
@@ -389,6 +398,9 @@ pub enum RuntimeAction {
     ///
     /// (ZEB-216 Sub-B Phase 3a — DM transport surface)
     UnicastReceived {
+        /// 16-byte local Reticulum destination hash the packet was
+        /// addressed to. See the variant doc for the contract.
+        destination_hash: [u8; 16],
         /// 16-byte device identity hash of the remote sender, when
         /// known. See the variant doc for the contract.
         source: Option<[u8; 16]>,
@@ -2508,13 +2520,19 @@ impl<B: BookStore> NodeRuntime<B> {
                 // binding lands in Phase 3b (ZEB-227). The Option is
                 // forwarded as-is — the client must handle the `None` case
                 // and MUST NOT treat absence as an authenticated identity.
+                //
+                // Round-10 review (ZEB-226): forward `destination_hash`
+                // too — the client registers multiple destination types
+                // (DM inbox, voice channel, file sync, ...) and needs
+                // the hash to dispatch the packet to the right handler.
                 NodeAction::DeliverLocally {
-                    destination_hash: _, // local; not surfaced to the client
+                    destination_hash,
                     packet,
                     interface_name: _, // diagnostic only at this layer
                     source,
                 } => {
                     out.push(RuntimeAction::UnicastReceived {
+                        destination_hash,
                         source,
                         packet: packet.data.to_vec(),
                     });
@@ -4783,11 +4801,16 @@ mod tests {
         // Asserts variant is constructible, derives Clone + PartialEq (matches
         // existing actions — regression guard so the new variant doesn't drop
         // the derives and break test infrastructure that depends on them).
+        // Round-10 review added `destination_hash` to the variant — pin a
+        // distinct value here so a future shape change (e.g. dropping the
+        // field, or making it Option<>) trips the constructor smoke test.
         let a = RuntimeAction::UnicastReceived {
+            destination_hash: [0xcc; 16],
             source: Some([0xbb; 16]),
             packet: vec![0x10, 0x20],
         };
         let b = RuntimeAction::UnicastReceived {
+            destination_hash: [0xcc; 16],
             source: Some([0xbb; 16]),
             packet: vec![0x10, 0x20],
         };
@@ -4876,9 +4899,11 @@ mod tests {
         let unicast: Vec<_> = out
             .iter()
             .filter_map(|a| match a {
-                RuntimeAction::UnicastReceived { source, packet } => {
-                    Some((*source, packet.clone()))
-                }
+                RuntimeAction::UnicastReceived {
+                    destination_hash,
+                    source,
+                    packet,
+                } => Some((*destination_hash, *source, packet.clone())),
                 _ => None,
             })
             .collect();
@@ -4890,11 +4915,16 @@ mod tests {
             out
         );
         assert_eq!(
-            unicast[0].0,
+            unicast[0].0, dest_hash,
+            "destination_hash must flow through dispatch (round-10 \
+             review: was previously discarded with `_`)"
+        );
+        assert_eq!(
+            unicast[0].1,
             Some(source),
             "source identity must round-trip as Some(hash) when known"
         );
-        assert_eq!(unicast[0].1, payload, "packet bytes must round-trip");
+        assert_eq!(unicast[0].2, payload, "packet bytes must round-trip");
     }
 
     #[test]
@@ -5317,13 +5347,24 @@ mod tests {
         let received = b_actions
             .iter()
             .find_map(|action| match action {
-                RuntimeAction::UnicastReceived { source, packet } => {
-                    Some((*source, packet.clone()))
-                }
+                RuntimeAction::UnicastReceived {
+                    destination_hash,
+                    source,
+                    packet,
+                } => Some((*destination_hash, *source, packet.clone())),
                 _ => None,
             })
             .expect("B should surface UnicastReceived");
 
+        // Round-10 review: destination_hash now flows through. The
+        // packet was addressed to `target` (B's registered destination),
+        // and that's what B's UnicastReceived must surface so the client
+        // can dispatch by destination kind.
+        assert_eq!(
+            received.0, target,
+            "UnicastReceived.destination_hash must match the local \
+             destination the packet was addressed to"
+        );
         // Source is `None` in Phase 3a per the Option<[u8; 16]> contract
         // on `RuntimeAction::UnicastReceived` — terminal-link state isn't
         // tracked at the Node layer yet, so the runtime can't surface a
@@ -5331,7 +5372,7 @@ mod tests {
         // binding and this assertion should flip to
         // `Some(a.local_identity_hash())` then.
         assert_eq!(
-            received.0, None,
+            received.1, None,
             "source is None in Phase 3a; ZEB-227 (Phase 3b) wires \
              real link-identity binding and this becomes Some(hash)"
         );
@@ -5339,7 +5380,7 @@ mod tests {
         // field (payload only), not the full wire bytes — matches the
         // dispatcher behavior in dispatch_router_actions.
         assert_eq!(
-            received.1, payload,
+            received.2, payload,
             "payload bytes must round-trip A → B"
         );
     }
