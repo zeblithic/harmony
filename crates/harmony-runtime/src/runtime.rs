@@ -8675,12 +8675,58 @@ mod tests {
 
     #[test]
     fn node_runtime_unregister_local_destination_returns_bool() {
+        use harmony_reticulum::packet::{
+            DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType,
+            PropagationType,
+        };
+
         let (mut runtime, _) = make_runtime();
 
         let dm_dest = [0xd1u8; 16];
         runtime.register_local_destination(dm_dest);
         assert!(runtime.unregister_local_destination(&dm_dest));
         assert!(!runtime.unregister_local_destination(&dm_dest));
+
+        // Observable verification (CodeRabbit nitpick on PR #268): after
+        // unregister, inbound packets addressed to dm_dest MUST NOT surface
+        // as `RuntimeAction::UnicastReceived`. The boolean return value alone
+        // doesn't prove the underlying state actually changed; this asserts
+        // observable behavior at the action layer. Mirrors the packet-builder
+        // shape from `node_runtime_register_local_destination_accepts_inbound_to_that_dest`
+        // (ZEB-226 Phase 3a).
+        let payload: Vec<u8> = b"after-unregister".to_vec();
+        let pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: dm_dest,
+                context: harmony_reticulum::PacketContext::None,
+            },
+            data: Arc::from(payload.into_boxed_slice()),
+        };
+        let wire_bytes = pkt.to_bytes().expect("packet should serialize");
+
+        runtime.push_event(RuntimeEvent::InboundPacket {
+            interface_name: "udp0".to_string(),
+            raw: wire_bytes,
+            now: 1000,
+        });
+        let actions = runtime.tick();
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, RuntimeAction::UnicastReceived { .. })),
+            "unregistered destination must not surface inbound packets as UnicastReceived"
+        );
     }
 
     #[test]

@@ -337,11 +337,13 @@ pub struct Node {
     /// Used to detect whether neighbors forwarded our announces.
     pending_echoes: HashMap<(Arc<str>, DestinationHash), u64>,
     /// Per-destination announced Identity material (Ed25519 verifying key +
-    /// X25519 ECDH key). Populated whenever a valid announce is processed in
-    /// `process_announce`. Neither `path_table` nor `announce_table` retain
-    /// the full Identity (path_table holds only routing info; announce_table
-    /// holds raw retransmission bytes), so this side-table is the long-lived
-    /// store consumed by `lookup_identity` for application-layer signature
+    /// X25519 ECDH key). Populated only after an announce passes ALL drop
+    /// checks in `process_announce` (validate_announce, transport-mode rate
+    /// limiting, etc.) — dropped announces MUST NOT mutate this table.
+    /// Neither `path_table` nor `announce_table` retain the full Identity
+    /// (path_table holds only routing info; announce_table holds raw
+    /// retransmission bytes), so this side-table is the long-lived store
+    /// consumed by `lookup_identity` for application-layer signature
     /// verification (ZEB-227, harmony-client Phase 3b).
     identity_table: HashMap<DestinationHash, Identity>,
 }
@@ -1203,14 +1205,6 @@ impl Node {
         let random_hash = validated.random_hash;
         let hops = packet.header.hops;
 
-        // Cache the announced Identity (Ed25519 verifying key + X25519 ECDH key)
-        // for later application-layer signature verification. Overwrites any
-        // prior entry for the same destination_hash — announces are signed by
-        // the identity owner, so a newer announce reflects the current binding.
-        // Consumed by `Node::lookup_identity` (ZEB-227, harmony-client Phase 3b).
-        self.identity_table
-            .insert(destination_hash, validated.identity.clone());
-
         // Rebroadcast detection runs BEFORE rate limiting so echoes of our
         // own rebroadcasts don't consume grace points. Echoes are expected
         // traffic, not abuse — they shouldn't count toward rate violations.
@@ -1301,6 +1295,23 @@ impl Node {
                 },
             );
         }
+
+        // Cache the announced Identity (Ed25519 verifying key + X25519 ECDH key)
+        // for later application-layer signature verification. Overwrites any
+        // prior entry for the same destination_hash — announces are signed by
+        // the identity owner, so a newer announce reflects the current binding.
+        // Consumed by `Node::lookup_identity` (ZEB-227, harmony-client Phase 3b).
+        //
+        // ORDERING: this write runs only on the happy path — after every
+        // early-return drop branch (validate_announce, transport-mode rate
+        // limiting via DropReason::AnnounceRateLimited). Dropped announces
+        // MUST NOT mutate identity_table; otherwise a transport node under
+        // announce flood would cache identities for traffic it explicitly
+        // rejected, partially bypassing the rate-limit defense (Qodo finding
+        // on PR #268). See test
+        // `process_announce_does_not_cache_identity_for_rate_limited_announces`.
+        self.identity_table
+            .insert(destination_hash, validated.identity.clone());
 
         vec![NodeAction::AnnounceReceived {
             destination_hash,
@@ -3663,6 +3674,75 @@ mod tests {
         let rate_entry = &node.announce_rate_table[&dh];
         assert_eq!(rate_entry.last_checked, 1000);
         assert_eq!(rate_entry.rate_violations, 0);
+    }
+
+    #[test]
+    fn process_announce_does_not_cache_identity_for_rate_limited_announces() {
+        // Regression for Qodo finding on PR #268: identity_table.insert
+        // must run AFTER the rate-limit check, NOT before. Otherwise a
+        // transport node under announce flood would cache identities
+        // for traffic it explicitly rejected — partially bypassing the
+        // rate-limit defense (dropped traffic should have NO observable
+        // side effects).
+        //
+        // Setup: pre-warm announce_rate_table for the destination so
+        // that the FIRST announce we send through the pipeline is the
+        // one that gets rate-limited. This way `lookup_identity(dh)`
+        // would be `Some(...)` only if the rate-limited path wrote to
+        // identity_table — directly detecting the bug without aliasing
+        // against a prior legitimate announce.
+        let (mut node, _th) = make_transport_node_with_rate(60, 0, 120);
+        let (raw, dh) = make_valid_announce();
+
+        // Pre-warm rate table at t=1000 so that subsequent announces
+        // for `dh` arriving within `target` will be rate-limited.
+        // This call mutates only `announce_rate_table`, NOT
+        // `identity_table`.
+        let config = AnnounceRateConfig {
+            target: 60,
+            grace: 0,
+            penalty: 120,
+        };
+        assert!(!node.is_rate_limited(dh, &config, 1000));
+        assert!(
+            node.lookup_identity(&dh).is_none(),
+            "pre-warming rate table must not populate identity_table"
+        );
+
+        // Now send the announce at t=1010 (elapsed=10 < target=60,
+        // grace=0 → rate-limited drop on the very first announce
+        // through `process_announce`).
+        let actions = node.handle_event(NodeEvent::InboundPacket {
+            interface_name: "eth0".into(),
+            raw,
+            now: 1010,
+        });
+
+        // Confirm the announce was indeed dropped with AnnounceRateLimited.
+        let was_rate_limited = actions.iter().any(|a| {
+            matches!(
+                a,
+                NodeAction::PacketDropped {
+                    reason: DropReason::AnnounceRateLimited,
+                    ..
+                }
+            )
+        });
+        assert!(
+            was_rate_limited,
+            "announce must drop with AnnounceRateLimited (test setup invariant)"
+        );
+
+        // The load-bearing assertion: a rate-limited announce MUST NOT
+        // write to identity_table. If this assertion ever fails, the
+        // identity_table.insert in process_announce has been moved back
+        // above the rate-limit check — restore the post-rate-limit
+        // ordering (see PR #268 commit "fix(zeb-227): identity_table
+        // insert after rate-limit check ...").
+        assert!(
+            node.lookup_identity(&dh).is_none(),
+            "rate-limited announce must NOT cache identity (Qodo PR #268 regression)"
+        );
     }
 
     // ── Test Helpers (relay) ─────────────────────────────────────────
