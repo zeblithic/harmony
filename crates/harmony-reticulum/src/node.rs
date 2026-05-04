@@ -475,6 +475,28 @@ impl Node {
         self.local_destinations.remove(dest_hash)
     }
 
+    /// Unregister a destination from local-delivery only — does NOT touch
+    /// `announcing_destinations`. Returns `true` if the destination was in
+    /// `local_destinations`, `false` if it was not.
+    ///
+    /// This is the narrow inverse of `register_destination` (which only
+    /// inserts into `local_destinations`). Use this when you want to stop
+    /// accepting inbound packets at a destination but keep announcing it
+    /// (e.g., the destination is jointly owned by an announcing destination
+    /// — see `register_announcing_destination` — and you only want to
+    /// remove the local-delivery half).
+    ///
+    /// `unregister_destination` (the cross-table version that ALSO removes
+    /// from `announcing_destinations`) is preserved for callers who want
+    /// the cleanup-everything semantics (e.g., the existing
+    /// `unregister_destination_also_removes_announcing` test path).
+    ///
+    /// Used by `NodeRuntime::unregister_local_destination` (ZEB-227,
+    /// harmony-client Phase 3b).
+    pub fn unregister_destination_local_only(&mut self, dest_hash: &DestinationHash) -> bool {
+        self.local_destinations.remove(dest_hash)
+    }
+
     /// Returns the announced `Identity` (Ed25519 verifying key + X25519 ECDH
     /// key) for `dest_hash` if a valid announce has been received. None if no
     /// announce has been observed yet for this destination.

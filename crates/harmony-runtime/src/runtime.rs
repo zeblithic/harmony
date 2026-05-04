@@ -1659,9 +1659,17 @@ impl<B: BookStore> NodeRuntime<B> {
 
     /// Unregister a previously-registered local destination. Returns
     /// `true` if the destination was registered, `false` if it was not.
-    /// Mirror of `register_local_destination`.
+    ///
+    /// Mirror of `register_local_destination` — narrow inverse that ONLY
+    /// removes the local-delivery registration. If the same destination
+    /// hash was independently registered for announcing (via
+    /// `register_announcing_destination` on the inner Node), that
+    /// announcement is preserved. This guarantees calling
+    /// `register_local_destination` then `unregister_local_destination`
+    /// is observationally equivalent to never having called the pair —
+    /// no side effects on unrelated state.
     pub fn unregister_local_destination(&mut self, dest_hash: &[u8; 16]) -> bool {
-        self.router.unregister_destination(dest_hash)
+        self.router.unregister_destination_local_only(dest_hash)
     }
 
     /// Look up the announced `Identity` (Ed25519 verifying key + X25519
@@ -8726,6 +8734,65 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, RuntimeAction::UnicastReceived { .. })),
             "unregistered destination must not surface inbound packets as UnicastReceived"
+        );
+    }
+
+    #[test]
+    fn node_runtime_unregister_local_destination_preserves_announcing_destination() {
+        // Asymmetry pin: NodeRuntime::register_local_destination only adds to
+        // local_destinations. The matching unregister_local_destination MUST
+        // also be narrow — only remove from local_destinations, NOT clear
+        // unrelated state like announcing_destinations.
+        //
+        // Concrete scenario: a node may register the same destination_hash
+        // both as a local destination (to receive inbound) and as an
+        // announcing destination (to advertise to peers). Calling the public
+        // unregister_local_destination must NOT silently tear down the
+        // announcement — that would be a surprising side effect on a public
+        // API whose name promises narrow semantics.
+        //
+        // Regression for the bot finding on PR #268.
+        use harmony_identity::PrivateIdentity;
+        use harmony_reticulum::DestinationName;
+        use rand::rngs::OsRng;
+
+        let (mut runtime, _) = make_runtime();
+
+        // Register the same dest_hash both as announcing (which ALSO inserts
+        // into local_destinations as a side effect of register_announcing_destination)
+        // and via the narrow public API.
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let name = DestinationName::from_name("test-app", &["dm"]).unwrap();
+        let dest_hash = name.destination_hash(&identity.public_identity().address_hash);
+
+        // Use the inner-router API for the announcing setup (mirrors how
+        // existing internal tests register announcing destinations).
+        runtime
+            .router
+            .register_announcing_destination(identity, name, vec![], Some(300), 0);
+        // ALSO register via the narrow public API (idempotent — local_destinations
+        // is a HashSet).
+        runtime.register_local_destination(dest_hash);
+
+        // Pre-condition: both tables have the dest_hash.
+        assert_eq!(runtime.router.destination_count(), 1);
+        assert_eq!(runtime.router.announcing_destination_count(), 1);
+
+        // Act: call the public narrow unregister.
+        assert!(runtime.unregister_local_destination(&dest_hash));
+
+        // Post-condition: local_destinations is empty (we just removed the only
+        // entry), but announcing_destinations is PRESERVED.
+        assert_eq!(
+            runtime.router.destination_count(),
+            0,
+            "local_destinations should be empty after unregister_local_destination"
+        );
+        assert_eq!(
+            runtime.router.announcing_destination_count(),
+            1,
+            "announcing_destinations MUST be preserved by narrow unregister — \
+             tearing it down would be a surprising side effect"
         );
     }
 
