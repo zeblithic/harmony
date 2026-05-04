@@ -1640,6 +1640,47 @@ impl<B: BookStore> NodeRuntime<B> {
         self.local_full_announce = Some(data);
     }
 
+    /// Register a 16-byte Reticulum destination hash for local delivery.
+    /// Inbound packets addressed to this destination will surface from
+    /// `tick()` as `RuntimeAction::UnicastReceived { destination_hash, .. }`
+    /// instead of being dropped with `DropReason::NoLocalDestination`.
+    ///
+    /// The `dest_hash` is computed by the caller from
+    /// `SHA256(name_hash || identity_address_hash)[:16]` per Reticulum
+    /// destination naming. Idempotent — calling twice with the same hash
+    /// is a no-op.
+    ///
+    /// Used by harmony-client (ZEB-216 Sub-B Phase 3b, ZEB-227) to
+    /// register its DM destination so inbound DmInvite/DmCidNotify/DmAck
+    /// packets surface to the application layer.
+    pub fn register_local_destination(&mut self, dest_hash: [u8; 16]) {
+        self.router.register_destination(dest_hash);
+    }
+
+    /// Unregister a previously-registered local destination. Returns
+    /// `true` if the destination was registered, `false` if it was not.
+    /// Mirror of `register_local_destination`.
+    pub fn unregister_local_destination(&mut self, dest_hash: &[u8; 16]) -> bool {
+        self.router.unregister_destination(dest_hash)
+    }
+
+    /// Look up the announced `Identity` (Ed25519 verifying key + X25519
+    /// ECDH key) for `dest_hash`. Returns `Some` when an announce has
+    /// been received for this destination and the identity material is
+    /// available locally, `None` otherwise.
+    ///
+    /// Used by harmony-client (ZEB-216 Sub-B Phase 3b, ZEB-227) to
+    /// resolve `DmCidNotify.signing_device_hash` (and similar) to a
+    /// public key for application-layer Ed25519 signature verification
+    /// on inbound DM packets — the spec's "Application-signature
+    /// binding rule" (Path B per spec ea38132).
+    pub fn lookup_destination_identity(
+        &self,
+        dest_hash: &[u8; 16],
+    ) -> Option<&harmony_identity::Identity> {
+        self.router.lookup_identity(dest_hash)
+    }
+
     /// Read-only access to the page index.
     pub fn page_index(&self) -> &crate::page_index::PageIndex {
         &self.page_index
@@ -8542,5 +8583,156 @@ mod tests {
         assert!(runtime.storage_tier().cache().is_pinned(&cid));
         runtime.unpin_content(&cid);
         assert!(!runtime.storage_tier().cache().is_pinned(&cid));
+    }
+
+    // ── ZEB-227: NodeRuntime destination + identity-lookup APIs ─────────
+    //
+    // Three thin accessors on NodeRuntime that delegate to the inner
+    // Reticulum Node:
+    //   - register_local_destination(dest_hash)
+    //   - unregister_local_destination(dest_hash) -> bool
+    //   - lookup_destination_identity(dest_hash) -> Option<&Identity>
+    //
+    // Identity-lookup investigation findings (recorded here so the next
+    // implementer doesn't have to re-discover):
+    //   - `Identity` (Ed25519 verifying key + X25519 ECDH key) is
+    //     produced by `validate_announce` and surfaces transiently in
+    //     `NodeAction::AnnounceReceived { validated_announce, .. }`.
+    //   - It was NOT persisted in any Node state before this PR:
+    //     `path_table::PathEntry` only carries routing info (next_hop,
+    //     hops, expiry, random_blobs); `announce_table::AnnounceTableEntry`
+    //     only carries raw retransmission bytes for transport mode.
+    //   - This PR adds a side-table `Node.identity_table:
+    //     HashMap<DestinationHash, Identity>` populated in
+    //     `process_announce` and queried by `Node::lookup_identity`.
+
+    #[test]
+    fn node_runtime_register_local_destination_accepts_inbound_to_that_dest() {
+        use harmony_reticulum::packet::{
+            DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType,
+            PropagationType,
+        };
+
+        let (mut runtime, _startup) = make_runtime();
+
+        let dm_dest = [0xd1u8; 16];
+        runtime.register_local_destination(dm_dest);
+
+        // Build a Type1/Single/Data Reticulum packet addressed to dm_dest
+        // (mirrors the construction in
+        // `unicast_round_trip_a_to_b_surfaces_as_unicast_received` —
+        // ZEB-226 Phase 3a, commit b721148).
+        let payload: Vec<u8> = b"hello".to_vec();
+        let pkt = Packet {
+            header: PacketHeader {
+                flags: PacketFlags {
+                    ifac: false,
+                    header_type: HeaderType::Type1,
+                    context_flag: false,
+                    propagation: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: dm_dest,
+                context: harmony_reticulum::PacketContext::None,
+            },
+            data: Arc::from(payload.clone().into_boxed_slice()),
+        };
+        let wire_bytes = pkt.to_bytes().expect("packet should serialize");
+
+        runtime.push_event(RuntimeEvent::InboundPacket {
+            interface_name: "udp0".to_string(),
+            raw: wire_bytes,
+            now: 1000,
+        });
+        let actions = runtime.tick();
+
+        let mut found = false;
+        for action in &actions {
+            if let RuntimeAction::UnicastReceived {
+                destination_hash, ..
+            } = action
+            {
+                assert_eq!(*destination_hash, dm_dest);
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "registering dm_dest must cause inbound packets to surface as UnicastReceived"
+        );
+    }
+
+    #[test]
+    fn node_runtime_unregister_local_destination_returns_bool() {
+        let (mut runtime, _) = make_runtime();
+
+        let dm_dest = [0xd1u8; 16];
+        runtime.register_local_destination(dm_dest);
+        assert!(runtime.unregister_local_destination(&dm_dest));
+        assert!(!runtime.unregister_local_destination(&dm_dest));
+    }
+
+    #[test]
+    fn node_runtime_lookup_destination_identity_returns_announced_identity() {
+        // After the runtime processes a valid announce on its `udp0`
+        // interface (registered by default by NodeRuntime::new), the
+        // announced Identity must be retrievable via
+        // lookup_destination_identity(dest_hash).
+        use harmony_identity::PrivateIdentity;
+        use harmony_reticulum::DestinationName;
+        use rand::rngs::OsRng;
+
+        let (mut runtime, _) = make_runtime();
+
+        // Build a real announce from a fresh identity. The runtime's
+        // `udp0` interface accepts and processes it through the
+        // existing `InboundPacket → process_announce` pipeline, which
+        // populates `Node.identity_table` (the side-table this PR adds).
+        let identity = PrivateIdentity::generate(&mut OsRng);
+        let dest_name = DestinationName::from_name("lxmf", &["delivery"]).unwrap();
+        let expected_dest_hash =
+            dest_name.destination_hash(&identity.public_identity().address_hash);
+        let announce_packet = harmony_reticulum::build_announce(
+            &identity,
+            &dest_name,
+            &mut OsRng,
+            1_700_000_000,
+            &[],
+            None,
+        )
+        .expect("build_announce must succeed");
+        let wire_bytes = announce_packet
+            .to_bytes()
+            .expect("announce packet should serialize");
+
+        runtime.push_event(RuntimeEvent::InboundPacket {
+            interface_name: "udp0".to_string(),
+            raw: wire_bytes,
+            now: 1_700_000_000,
+        });
+        let _actions = runtime.tick();
+
+        let looked_up = runtime.lookup_destination_identity(&expected_dest_hash);
+        assert!(
+            looked_up.is_some(),
+            "after announce, lookup must return Some(Identity)"
+        );
+        // Identity has a public field `address_hash`, not a method.
+        assert_eq!(
+            looked_up.unwrap().address_hash,
+            identity.public_identity().address_hash,
+            "looked-up identity must match the one that signed the announce"
+        );
+    }
+
+    #[test]
+    fn node_runtime_lookup_destination_identity_unknown_returns_none() {
+        let (runtime, _) = make_runtime();
+
+        let unknown = [0xff; 16];
+        assert!(runtime.lookup_destination_identity(&unknown).is_none());
     }
 }

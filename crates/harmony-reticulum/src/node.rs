@@ -6,7 +6,7 @@ use hashbrown::{HashMap, HashSet};
 use std::collections::{HashMap, HashSet};
 
 use harmony_crypto::hash;
-use harmony_identity::identity::PrivateIdentity;
+use harmony_identity::identity::{Identity, PrivateIdentity};
 use rand_core::CryptoRngCore;
 
 use crate::announce::{build_announce, validate_announce, ValidatedAnnounce};
@@ -336,6 +336,14 @@ pub struct Node {
     /// Tracks announce echoes: (interface, dest_hash) -> tick when announce was sent.
     /// Used to detect whether neighbors forwarded our announces.
     pending_echoes: HashMap<(Arc<str>, DestinationHash), u64>,
+    /// Per-destination announced Identity material (Ed25519 verifying key +
+    /// X25519 ECDH key). Populated whenever a valid announce is processed in
+    /// `process_announce`. Neither `path_table` nor `announce_table` retain
+    /// the full Identity (path_table holds only routing info; announce_table
+    /// holds raw retransmission bytes), so this side-table is the long-lived
+    /// store consumed by `lookup_identity` for application-layer signature
+    /// verification (ZEB-227, harmony-client Phase 3b).
+    identity_table: HashMap<DestinationHash, Identity>,
 }
 
 impl Node {
@@ -354,6 +362,7 @@ impl Node {
             link_table: HashMap::new(),
             cooperation: CooperationTable::default(),
             pending_echoes: HashMap::new(),
+            identity_table: HashMap::new(),
         }
     }
 
@@ -372,6 +381,7 @@ impl Node {
             link_table: HashMap::new(),
             cooperation: CooperationTable::default(),
             pending_echoes: HashMap::new(),
+            identity_table: HashMap::new(),
         }
     }
 
@@ -461,6 +471,18 @@ impl Node {
     pub fn unregister_destination(&mut self, dest_hash: &DestinationHash) -> bool {
         self.announcing_destinations.remove(dest_hash);
         self.local_destinations.remove(dest_hash)
+    }
+
+    /// Returns the announced `Identity` (Ed25519 verifying key + X25519 ECDH
+    /// key) for `dest_hash` if a valid announce has been received. None if no
+    /// announce has been observed yet for this destination.
+    ///
+    /// Populated as a side effect of `process_announce` — see
+    /// `identity_table` field documentation. Consumed by `NodeRuntime::
+    /// lookup_destination_identity` for application-layer Ed25519 signature
+    /// verification on inbound DM packets (ZEB-227, harmony-client Phase 3b).
+    pub fn lookup_identity(&self, dest_hash: &DestinationHash) -> Option<&Identity> {
+        self.identity_table.get(dest_hash)
     }
 
     /// Register a destination that can generate announces and receive packets.
@@ -1180,6 +1202,14 @@ impl Node {
         let destination_hash = validated.destination_hash;
         let random_hash = validated.random_hash;
         let hops = packet.header.hops;
+
+        // Cache the announced Identity (Ed25519 verifying key + X25519 ECDH key)
+        // for later application-layer signature verification. Overwrites any
+        // prior entry for the same destination_hash — announces are signed by
+        // the identity owner, so a newer announce reflects the current binding.
+        // Consumed by `Node::lookup_identity` (ZEB-227, harmony-client Phase 3b).
+        self.identity_table
+            .insert(destination_hash, validated.identity.clone());
 
         // Rebroadcast detection runs BEFORE rate limiting so echoes of our
         // own rebroadcasts don't consume grace points. Echoes are expected
