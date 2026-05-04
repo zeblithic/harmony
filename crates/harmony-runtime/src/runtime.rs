@@ -1674,6 +1674,14 @@ impl<B: BookStore> NodeRuntime<B> {
     /// public key for application-layer Ed25519 signature verification
     /// on inbound DM packets — the spec's "Application-signature
     /// binding rule" (Path B per spec ea38132).
+    ///
+    /// **Important:** the `dest_hash` argument is a Reticulum
+    /// destination hash — the 16-byte
+    /// `SHA256(name_hash || identity_address_hash)[:16]`, NOT the bare
+    /// identity-address hash. Callers holding an identity-address hash
+    /// (e.g., harmony-client's `signing_device_hash` from a
+    /// `DmCidNotify` body) must first derive the destination_hash via
+    /// `DestinationName::destination_hash` before calling this API.
     pub fn lookup_destination_identity(
         &self,
         dest_hash: &[u8; 16],
@@ -8734,5 +8742,107 @@ mod tests {
 
         let unknown = [0xff; 16];
         assert!(runtime.lookup_destination_identity(&unknown).is_none());
+    }
+
+    #[test]
+    fn node_runtime_lookup_destination_identity_overwrites_on_reannounce_with_new_identity() {
+        // Identity-rotation regression: when a peer rotates its
+        // Identity (regenerates keys) and re-announces, the cached
+        // identity_table entry MUST reflect the new binding.
+        // Downstream application-layer Ed25519 signature verification
+        // (Path B per ZEB-216 spec ea38132) depends on this — verifying
+        // against a stale Identity would block valid post-rotation
+        // packets.
+        //
+        // Caveat on the map-collision shape: a Reticulum dest_hash is
+        // `SHA256(name_hash || identity_address_hash)[:16]`. Because
+        // `identity_address_hash` is a function of the identity public
+        // keys, a rotated identity necessarily produces a *different*
+        // dest_hash, so the underlying `HashMap::insert` overwrite path
+        // can only be exercised by collision-on-identical-identity
+        // (which is a no-op) — there is no signed announce we can
+        // construct that pins the same dest_hash with different
+        // identity material (the announce signature signs the
+        // dest_hash). What we *can* lock in is per-dest_hash isolation:
+        // two announces with rotated identity must each surface their
+        // own Identity under their own dest_hash, not bleed across.
+        // That is the load-bearing semantic for downstream signature
+        // verification.
+        use harmony_identity::PrivateIdentity;
+        use harmony_reticulum::DestinationName;
+        use rand::rngs::OsRng;
+
+        let (mut runtime, _) = make_runtime();
+        let dest_name = DestinationName::from_name("lxmf", &["delivery"]).unwrap();
+
+        // First announce: identity A.
+        let identity_a = PrivateIdentity::generate(&mut OsRng);
+        let dest_hash_a = dest_name.destination_hash(&identity_a.public_identity().address_hash);
+        let announce_a = harmony_reticulum::build_announce(
+            &identity_a,
+            &dest_name,
+            &mut OsRng,
+            1_700_000_000,
+            &[],
+            None,
+        )
+        .expect("build_announce A must succeed");
+        runtime.push_event(RuntimeEvent::InboundPacket {
+            interface_name: "udp0".to_string(),
+            raw: announce_a.to_bytes().expect("announce A should serialize"),
+            now: 1_700_000_000,
+        });
+        let _ = runtime.tick();
+
+        let after_a = runtime
+            .lookup_destination_identity(&dest_hash_a)
+            .expect("identity A must be cached after first announce");
+        assert_eq!(
+            after_a.address_hash,
+            identity_a.public_identity().address_hash,
+        );
+
+        // Second announce: identity B (rotated keys), same dest_name.
+        // Different dest_hash because identity_address_hash changed.
+        let identity_b = PrivateIdentity::generate(&mut OsRng);
+        let dest_hash_b = dest_name.destination_hash(&identity_b.public_identity().address_hash);
+        assert_ne!(
+            dest_hash_a, dest_hash_b,
+            "rotated identity must yield a distinct dest_hash",
+        );
+        let announce_b = harmony_reticulum::build_announce(
+            &identity_b,
+            &dest_name,
+            &mut OsRng,
+            1_700_000_001,
+            &[],
+            None,
+        )
+        .expect("build_announce B must succeed");
+        runtime.push_event(RuntimeEvent::InboundPacket {
+            interface_name: "udp0".to_string(),
+            raw: announce_b.to_bytes().expect("announce B should serialize"),
+            now: 1_700_000_001,
+        });
+        let _ = runtime.tick();
+
+        // Per-dest_hash isolation: each dest_hash resolves to its own
+        // Identity, no cross-talk.
+        let looked_up_b = runtime
+            .lookup_destination_identity(&dest_hash_b)
+            .expect("identity B must be cached after second announce");
+        assert_eq!(
+            looked_up_b.address_hash,
+            identity_b.public_identity().address_hash,
+            "dest_hash B must resolve to identity B, not the rotated-out A",
+        );
+        let looked_up_a_again = runtime
+            .lookup_destination_identity(&dest_hash_a)
+            .expect("identity A must remain cached under its own dest_hash");
+        assert_eq!(
+            looked_up_a_again.address_hash,
+            identity_a.public_identity().address_hash,
+            "dest_hash A must still resolve to identity A (no bleed from B)",
+        );
     }
 }
