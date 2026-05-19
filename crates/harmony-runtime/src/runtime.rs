@@ -1325,6 +1325,22 @@ impl<B: BookStore> NodeRuntime<B> {
         self.storage.unpin(cid);
     }
 
+    /// Immediately drop a CID's bytes from the storage-tier cache.
+    ///
+    /// Narrow delegate to [`StorageTier::remove`] for the "burn" semantic
+    /// (ZEB-156) — caller has unpinned the CID AND wants to free its
+    /// bytes now, not on the next eviction cycle. See that method's docs
+    /// for the W-TinyLFU bypass discussion. Returns the bytes that were
+    /// stored, or `None` if the CID was not present.
+    ///
+    /// Exposed alongside [`pin_content`]/[`unpin_content`] for the same
+    /// reason: direct `&mut StorageTier` access would let callers reach
+    /// the eviction-buffer and broadcast machinery this delegate
+    /// intentionally bypasses.
+    pub fn remove_content(&mut self, cid: &ContentId) -> Option<Vec<u8>> {
+        self.storage.remove(cid)
+    }
+
     /// Number of pending Tier 1 (router) events.
     pub fn router_queue_len(&self) -> usize {
         self.router_queue.len()

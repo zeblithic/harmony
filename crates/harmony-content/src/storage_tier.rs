@@ -393,6 +393,38 @@ impl<B: BookStore> StorageTier<B> {
         self.cache.unpin(cid);
     }
 
+    /// Immediately drop a CID's bytes from the W-TinyLFU cache.
+    ///
+    /// Narrow delegate for the "burn" semantic (ZEB-156) — caller has
+    /// explicitly destroyed the content and wants the bytes gone now,
+    /// not on the next eviction cycle. This bypasses W-TinyLFU pressure,
+    /// so it should NOT be used for routine eviction (that path runs
+    /// through the normal admission/probation/protected dance and emits
+    /// `EvictionPush` actions; this one is silent on purpose).
+    ///
+    /// **Refuses to remove pinned CIDs.** The underlying
+    /// `BookStore::remove` impl on `ContentStore` clears every cache
+    /// metadata slot — including the pinned set — so an unguarded burn
+    /// of a pinned CID would silently violate the pin-retention contract
+    /// and drop user-protected data. Callers must unpin first; this
+    /// guard catches the bug if they forget, by returning `None` (safe
+    /// no-op) rather than dropping the bytes.
+    ///
+    /// Returns the bytes that were stored, or `None` if the CID was not
+    /// present **or was pinned** (treat pinned as a refusal: caller bug).
+    pub fn remove(&mut self, cid: &ContentId) -> Option<Vec<u8>> {
+        if self.cache.is_pinned(cid) {
+            return None;
+        }
+        // BookStore::remove on ContentStore<B> already cleans up every
+        // cache metadata slot (window/probation/protected) — see
+        // `impl<S: BookStore> BookStore for ContentStore<S>` in
+        // `cache.rs`. No tier-side accounting (disk_index/archive_index
+        // here in StorageTier) needs touching: the burn path is for the
+        // in-RAM cache layer that client builds use.
+        <ContentStore<B> as BookStore>::remove(&mut self.cache, cid)
+    }
+
     /// Mutable access to the underlying content store (crate-internal).
     #[allow(dead_code)]
     pub(crate) fn cache_mut(&mut self) -> &mut ContentStore<B> {
