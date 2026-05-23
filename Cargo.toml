@@ -97,7 +97,6 @@ hex = "0.4"
 half = { version = "2", default-features = false }
 safetensors = "0.4"
 libm = "0.2"
-pkarr = "6"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh64"] }
 ciborium = { version = "0.2", default-features = false }
