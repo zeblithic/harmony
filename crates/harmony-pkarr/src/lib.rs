@@ -17,6 +17,8 @@
 
 extern crate alloc;
 
+pub mod epoch;
 pub mod error;
 
+pub use epoch::{current_epoch_id, epoch_start_ms, epoch_tolerance_window, EPOCH_DURATION_MS};
 pub use error::PkarrError;
