@@ -11,7 +11,7 @@
 **Spec:** `harmony-client/docs/specs/2026-05-23-zeb-321-phase2-discovery-bootstrap-design.md` (commit `cb5cca5`), Sections 4.1, 5, 6, 7, 9, 13.1/13.3/13.4. **Linear:** ZEB-322 (parent: ZEB-321). **Branch:** `zeb-322-harmony-pkarr-crate` (already created off `origin/main` `04449d6`).
 
 **HARD RULES from user memory (every implementer subagent prompt must enforce):**
-- Quality gates from harmony root: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace --all-targets --features test-fixtures` (or `cargo test --workspace --no-fail-fast` if nextest not installed)
+- **Gate scope (post-Task-0 amendment):** Task 0 baseline (2026-05-23) found pre-existing fmt + clippy breakage on `origin/main` (filed as [ZEB-324](https://linear.app/zeblith/issue/ZEB-324)) — 3 mechanical fixes in unrelated crates. To keep this PR's review surface clean per `feedback_unrelated_test_failures`, all Task gates are scoped to `-p harmony-pkarr` (NOT `--workspace`). Workspace-wide gates remain Jake's call via the separate ZEB-324 cleanup PR. Per-crate gates: `cargo fmt -- --check` (workspace-level fmt is fine on harmony-pkarr code; the broken file is elsewhere), `cargo clippy -p harmony-pkarr --all-targets --features test-fixtures -- -D warnings`, `cargo nextest run -p harmony-pkarr --all-targets --features test-fixtures`.
 - Pipe exit codes: `set -o pipefail` or `${PIPESTATUS[0]}` when piping cargo output through `tail`/`grep`
 - Implementer subagent gates per `feedback_implementer_gate_time_budget`: commit-before-gate + 10-min Bash wall-clock kill switch + DONE_WITH_CONCERNS escape hatch
 - Long-running background per `feedback_long_running_background_supervision`: any cargo command potentially > 10 min MUST use foreground timeout (`timeout 600 cargo ...`) or ScheduleWakeup heartbeat
@@ -2005,16 +2005,22 @@ git commit -m "feat(zeb-322): PkarrResolver with LRU cache + parallel epoch-wind
 
 **Purpose:** Run the full workspace quality gates one last time, push the branch, and create the PR with proper cross-repo coordination notes.
 
-- [ ] **Step 1: Workspace-wide gates (clean run)**
+- [ ] **Step 1: Per-crate gates (clean run) + workspace test-only baseline check**
 
+Per-crate gates (these are the load-bearing ones for this PR):
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony
-timeout 120 cargo fmt --all -- --check
-timeout 900 cargo clippy --workspace --all-targets --features test-fixtures -- -D warnings 2>&1 | tail -50
-timeout 1200 cargo nextest run --workspace --all-targets --features test-fixtures 2>&1 | tail -50
+timeout 120 cargo fmt -- --check --files-with-diff  # crate-scoped fmt; workspace fmt blocked by ZEB-324
+timeout 600 cargo clippy -p harmony-pkarr --all-targets --features test-fixtures -- -D warnings 2>&1 | tail -50
+timeout 600 cargo nextest run -p harmony-pkarr --all-targets --features test-fixtures 2>&1 | tail -50
 ```
 
-All three must pass. Compare nextest failure list to `/tmp/zeb-322-baseline-failures.txt` from Task 0 — any NEW failure not in the baseline is a regression and must be fixed before PR creation.
+Plus the broader test regression check (skip clippy/fmt at workspace level, just verify NO new test failures vs Task 0 baseline of 0):
+```bash
+timeout 1200 cargo nextest run --workspace --no-fail-fast 2>&1 | tail -50
+```
+
+Confirm tail shows `0 failed` (matching Task 0 baseline). Any new failure not in `/tmp/zeb-322-baseline-failures.txt` is a regression and must be fixed before PR creation.
 
 - [ ] **Step 2: Confirm branch is up to date with origin/main**
 
