@@ -28,6 +28,8 @@ tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 tracing = { workspace = true }
 # hex is used in publisher (z32_encode_public) and dev/test code.
 hex = { workspace = true }
+lru = { workspace = true }
+futures = { workspace = true }
 
 # test-fixtures-only (optional):
 axum = { workspace = true, optional = true, default-features = false, features = ["tokio", "http1"] }

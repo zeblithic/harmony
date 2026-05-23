@@ -23,6 +23,7 @@ pub mod error;
 pub mod publisher;
 pub mod record;
 pub mod relay;
+pub mod resolver;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod testing;
 
@@ -32,3 +33,4 @@ pub use error::PkarrError;
 pub use publisher::{PkarrPublisher, RecordBuilder};
 pub use record::{PkarrRoutingRecord, SKEW_TOLERANCE_MS};
 pub use relay::{RelayClient, RelayPool};
+pub use resolver::PkarrResolver;
