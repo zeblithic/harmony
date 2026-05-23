@@ -3717,6 +3717,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-pkarr"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "hyper 1.8.1",
+ "tokio",
+]
+
+[[package]]
 name = "harmony-platform"
 version = "0.1.0"
 dependencies = [

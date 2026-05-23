@@ -27,6 +27,7 @@ members = [
     "crates/harmony-memo",
     "crates/harmony-node",
     "crates/harmony-peers",
+    "crates/harmony-pkarr",
     "crates/harmony-profile",
     "crates/harmony-platform",
     "crates/harmony-reticulum",
@@ -96,6 +97,7 @@ hex = "0.4"
 half = { version = "2", default-features = false }
 safetensors = "0.4"
 libm = "0.2"
+pkarr = "6"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh64"] }
 ciborium = { version = "0.2", default-features = false }
@@ -127,6 +129,7 @@ aws-sdk-s3 = "1"
 
 # Networking
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+hyper = { version = "1", default-features = false }
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "signal"] }
 tower-http = { version = "0.6", default-features = false }
 zenoh = "1"
