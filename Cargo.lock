@@ -3721,8 +3721,14 @@ name = "harmony-pkarr"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
  "hyper 1.8.1",
+ "rand 0.8.5",
+ "sha2",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

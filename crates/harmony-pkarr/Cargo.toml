@@ -14,8 +14,10 @@ std = []
 test-fixtures = ["dep:axum", "dep:tokio", "dep:hyper"]
 
 [dependencies]
-# Add later as tasks pull them in:
-# pkarr, hkdf, sha2, ed25519-dalek, serde, ciborium, tracing, lru, reqwest
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+zeroize = { workspace = true }
 
 # test-fixtures-only:
 axum = { workspace = true, optional = true }
@@ -23,4 +25,5 @@ tokio = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Add later as tasks pull them in.
+hex = { workspace = true }
+rand = { workspace = true }
