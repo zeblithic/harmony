@@ -11,7 +11,7 @@ rust-version.workspace = true
 default = ["std"]
 std = []
 # Exposes the mock pkarr-relay axum server for downstream integration tests.
-test-fixtures = ["dep:axum", "dep:tokio", "dep:hyper"]
+test-fixtures = ["dep:axum", "dep:hyper"]
 
 [dependencies]
 hkdf = { workspace = true }
@@ -23,10 +23,14 @@ serde_bytes = { workspace = true }
 ciborium = { workspace = true }
 # reqwest is always required — the production relay client needs it.
 reqwest = { workspace = true, default-features = false }
+# tokio is always required — the publisher background task needs it.
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+tracing = { workspace = true }
+# hex is used in publisher (z32_encode_public) and dev/test code.
+hex = { workspace = true }
 
 # test-fixtures-only (optional):
 axum = { workspace = true, optional = true, default-features = false, features = ["tokio", "http1"] }
-tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros", "net", "sync"] }
 hyper = { workspace = true, optional = true }
 
 [dev-dependencies]
