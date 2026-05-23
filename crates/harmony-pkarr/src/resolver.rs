@@ -59,7 +59,29 @@ impl PkarrResolver {
                 Ok(None)
             }
             Some(envelope) => {
-                let record = parse_and_verify(&envelope, pk)?;
+                // RPK1: outer sig failure → silent-drop (cache negative).
+                let record = match parse_and_verify(&envelope, pk) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(
+                            key = %key_z32,
+                            error = ?e,
+                            "pkarr envelope failed outer verification — dropping (RPK1)"
+                        );
+                        self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
+                        return Ok(None);
+                    }
+                };
+                // RPK2: inner sig failure → silent-drop (cache negative).
+                if let Err(e) = record.verify_inner_sig() {
+                    tracing::warn!(
+                        key = %key_z32,
+                        error = ?e,
+                        "pkarr record failed inner sig verification — dropping (RPK2)"
+                    );
+                    self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
+                    return Ok(None);
+                }
                 self.cache_put(pk_bytes, Some(record.clone()), POSITIVE_CACHE_TTL);
                 Ok(Some(record))
             }
@@ -127,17 +149,19 @@ impl PkarrResolver {
 /// Parse the BEP44 envelope, verify the outer Ed25519 sig under `expected_pk`,
 /// then parse + return the inner `PkarrRoutingRecord` (does NOT verify the
 /// inner sig — caller does that with the expected identity).
+///
+/// Envelope = 64 sig + 8 seq (LE u64) + payload (matching publisher.rs format).
 fn parse_and_verify(
     envelope: &[u8],
     expected_pk: &VerifyingKey,
 ) -> Result<PkarrRoutingRecord, PkarrError> {
-    // Envelope = 64 sig + 4 seq (LE) + payload (matching publisher.rs format).
-    if envelope.len() < 64 + 4 {
+    // Envelope = 64 sig + 8 seq (LE u64) + payload (matching publisher.rs format).
+    if envelope.len() < 64 + 8 {
         return Err(PkarrError::RelayResponseInvalid);
     }
     let sig_bytes: [u8; 64] = envelope[..64].try_into().expect("64 == 64");
-    let seq = u32::from_le_bytes(envelope[64..68].try_into().expect("4 == 4"));
-    let payload = &envelope[68..];
+    let seq = u64::from_le_bytes(envelope[64..72].try_into().expect("8 == 8"));
+    let payload = &envelope[72..];
 
     let mut to_verify = alloc::vec::Vec::new();
     to_verify.extend_from_slice(format!("3:seqi{}e1:v{}:", seq, payload.len()).as_bytes());

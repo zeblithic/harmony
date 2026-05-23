@@ -39,12 +39,27 @@ impl PkarrRoutingRecord {
     /// Build + inner-sign a record. `identity_signing_key` is the harmony
     /// identity Ed25519 key (NOT the ephemeral pkarr key — that one wraps
     /// this struct in the BEP44 envelope).
+    ///
+    /// Returns `Err(PkarrError::IdentityMismatch)` if the verifying key
+    /// derived from `identity_signing_key` does not match the Ed25519 portion
+    /// of `harmony_identity_pub` (bytes [32..64]).  This guards against a
+    /// mis-matched key pair being passed by the caller, which would produce a
+    /// record that fails `verify_inner_sig` for every recipient.
     pub fn sign_new(
         routing_blob: alloc::vec::Vec<u8>,
         harmony_identity_pub: [u8; 64],
         announced_at_ms: u64,
         identity_signing_key: &SigningKey,
     ) -> Result<Self, PkarrError> {
+        // Key-match guard: verifying key from signing key must match the Ed25519
+        // public key embedded in harmony_identity_pub[32..64].
+        let derived_vk = identity_signing_key.verifying_key();
+        let expected_ed_bytes: &[u8; 32] = harmony_identity_pub[32..]
+            .try_into()
+            .map_err(|_| PkarrError::IdentityMismatch)?;
+        if derived_vk.as_bytes() != expected_ed_bytes {
+            return Err(PkarrError::IdentityMismatch);
+        }
         let to_sign =
             canonical_signed_bytes(&routing_blob, &harmony_identity_pub, announced_at_ms)?;
         let sig = identity_signing_key.sign(&to_sign);
@@ -223,6 +238,17 @@ mod tests {
             rec.verify_skew(10_000_000 - SKEW_TOLERANCE_MS - 1),
             Err(PkarrError::StaleOrSkewed)
         );
+    }
+
+    #[test]
+    fn sign_new_rejects_mismatched_key() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let other_sk = SigningKey::generate(&mut OsRng);
+        // identity_pub encodes `sk`'s verifying key, but we pass `other_sk` as signer.
+        let identity_pub = fixture_identity_pubkey(&sk);
+        let result =
+            PkarrRoutingRecord::sign_new(b"blob".to_vec(), identity_pub, 1_000_000, &other_sk);
+        assert_eq!(result, Err(PkarrError::IdentityMismatch));
     }
 
     #[test]

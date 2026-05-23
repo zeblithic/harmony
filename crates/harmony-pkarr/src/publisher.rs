@@ -107,25 +107,41 @@ impl PkarrPublisher {
     }
 
     /// Publish all publications whose `next_publish_at` has passed.
+    ///
+    /// Schedule is updated AFTER each publish attempt so that a failure does
+    /// not silently delay the next attempt by a full epoch window:
+    /// - success → next scheduled epoch slot (`compute_next_publish_at`)
+    /// - failure → 60 s retry backoff
     async fn drive_pending(&self) {
         let now = Instant::now();
-        let mut due: Vec<ActivePublication> = Vec::new();
-        {
-            let mut state = self.state.lock().await;
-            for pub_state in state.values_mut() {
-                if pub_state.next_publish_at <= now {
-                    due.push(pub_state.clone());
-                    pub_state.next_publish_at = compute_next_publish_at(now_ms());
-                }
-            }
-        }
+        // Collect due publications without advancing their schedule yet.
+        let due: Vec<ActivePublication> = {
+            let state = self.state.lock().await;
+            state
+                .values()
+                .filter(|p| p.next_publish_at <= now)
+                .cloned()
+                .collect()
+        };
         for pub_state in due {
-            if let Err(e) = self.publish_one(&pub_state).await {
-                tracing::warn!(
-                    handle = %pub_state.handle,
-                    error = ?e,
-                    "pkarr publish failed"
-                );
+            match self.publish_one(&pub_state).await {
+                Ok(()) => {
+                    let mut state = self.state.lock().await;
+                    if let Some(entry) = state.get_mut(&pub_state.handle) {
+                        entry.next_publish_at = compute_next_publish_at(now_ms());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        handle = %pub_state.handle,
+                        error = ?e,
+                        "pkarr publish failed — retrying in 60s"
+                    );
+                    let mut state = self.state.lock().await;
+                    if let Some(entry) = state.get_mut(&pub_state.handle) {
+                        entry.next_publish_at = Instant::now() + Duration::from_secs(60);
+                    }
+                }
             }
         }
     }
@@ -134,7 +150,7 @@ impl PkarrPublisher {
         let now = now_ms();
         let record = (pub_state.builder)(now);
         let cbor = record.to_canonical_cbor()?;
-        let envelope = wrap_bep44_envelope(&pub_state.ephemeral_key, &cbor, now as u32)?;
+        let envelope = wrap_bep44_envelope(&pub_state.ephemeral_key, &cbor, now)?;
         let key_z32 = z32_encode_public(&pub_state.ephemeral_key.verifying_key().to_bytes());
         self.relay.put(&key_z32, &envelope).await
     }
@@ -187,18 +203,21 @@ fn now_ms() -> u64 {
 /// mock-relay testing:
 ///
 /// ```text
-/// envelope = sig(64 bytes) ‖ seq(4 bytes, LE) ‖ payload(N bytes)
+/// envelope = sig(64 bytes) ‖ seq(8 bytes, LE u64) ‖ payload(N bytes)
 /// ```
 ///
 /// The signature covers the BEP44 v=0 salt:
 /// `"3:seqi{seq}e1:v{len}:{payload}"`.
 ///
-/// This is the format the companion `PkarrResolver` (Task 8) decodes.
+/// `seq` is milliseconds since Unix epoch as `u64` — avoids the ~49.7-day
+/// wrap that a `u32` cast would introduce.
+///
+/// This is the format the companion `PkarrResolver` decodes.
 /// Real pkarr-relay bencoded compatibility is Phase 3 hardening.
 fn wrap_bep44_envelope(
     ephemeral_key: &SigningKey,
     payload: &[u8],
-    seq: u32,
+    seq: u64,
 ) -> Result<Vec<u8>, PkarrError> {
     use ed25519_dalek::Signer;
     // BEP44 v=0 sign material (same as real pkarr relays expect).
@@ -207,8 +226,8 @@ fn wrap_bep44_envelope(
     to_sign.extend_from_slice(payload);
     let sig = ephemeral_key.sign(&to_sign);
 
-    // Envelope: sig(64) ‖ seq(4 LE) ‖ payload.
-    let mut envelope = Vec::with_capacity(64 + 4 + payload.len());
+    // Envelope: sig(64) ‖ seq(8 LE u64) ‖ payload.
+    let mut envelope = Vec::with_capacity(64 + 8 + payload.len());
     envelope.extend_from_slice(&sig.to_bytes());
     envelope.extend_from_slice(&seq.to_le_bytes());
     envelope.extend_from_slice(payload);
@@ -269,9 +288,9 @@ mod tests {
                 .expect("http get");
             if resp.status() == 200 {
                 let body = resp.bytes().await.expect("body");
-                // Envelope = 64-byte sig + 4-byte seq + CBOR payload (>= ~70 bytes).
+                // Envelope = 64-byte sig + 8-byte seq (u64 LE) + CBOR payload (>= ~70 bytes).
                 assert!(
-                    body.len() > 64 + 4,
+                    body.len() > 64 + 8,
                     "envelope too short: {} bytes",
                     body.len()
                 );

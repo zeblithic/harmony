@@ -109,8 +109,10 @@ impl RelayClient {
     /// hit transport errors / 429 (none had the key, but we can't be sure
     /// it doesn't exist).
     pub async fn get(&self, key_z32: &str) -> Result<Option<Vec<u8>>, PkarrError> {
+        let mut polled_any = false;
         let mut all_404 = true;
         for base in self.available_relays() {
+            polled_any = true;
             let url = format!("{}/{}", base, key_z32);
             match self.http.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -122,6 +124,7 @@ impl RelayClient {
                 }
                 Ok(resp) if resp.status().as_u16() == 404 => {
                     // 404 is a definitive "not here" answer; keep going.
+                    // all_404 remains true.
                     continue;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
@@ -143,7 +146,7 @@ impl RelayClient {
                 }
             }
         }
-        if all_404 {
+        if polled_any && all_404 {
             Ok(None)
         } else {
             Err(PkarrError::NoRelaysAvailable)

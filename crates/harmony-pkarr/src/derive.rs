@@ -17,6 +17,18 @@ pub enum PkarrCase {
     /// Case A: invite-redemption. `ikm` = `invite_token.sig` (64 bytes).
     Invite,
     /// Case B: opt-in identity-keyed. `ikm` = `owner_identity_pub` (64 bytes).
+    ///
+    /// # Security note — intentional public-key derivation
+    ///
+    /// For case B, `ikm = owner_identity_pub` is the **public** identity key.
+    /// This is intentional: the pkarr slot is deterministically discoverable by
+    /// anyone who holds the owner's public identity — that is the whole point of
+    /// opt-in identity routing (the owner makes themselves discoverable).
+    ///
+    /// The derived ephemeral key signs BEP44 envelopes only.  It has **no
+    /// relationship** to any private identity material: the owner's Ed25519
+    /// private key is never used as, or mixed into, `ikm`.  The derivation
+    /// does not leak any secret.
     Identity,
     /// Case C: in-community fallback. `ikm` = `EpochKey` (32 bytes).
     Community,
