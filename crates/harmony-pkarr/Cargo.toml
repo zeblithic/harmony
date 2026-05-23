@@ -18,6 +18,9 @@ hkdf = { workspace = true }
 sha2 = { workspace = true }
 ed25519-dalek = { workspace = true }
 zeroize = { workspace = true }
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+serde_bytes = { workspace = true }
+ciborium = { workspace = true }
 
 # test-fixtures-only:
 axum = { workspace = true, optional = true }

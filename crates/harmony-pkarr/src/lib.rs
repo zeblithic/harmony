@@ -20,7 +20,9 @@ extern crate alloc;
 pub mod derive;
 pub mod epoch;
 pub mod error;
+pub mod record;
 
 pub use derive::{derive_ephemeral_key, PkarrCase};
 pub use epoch::{current_epoch_id, epoch_start_ms, epoch_tolerance_window, EPOCH_DURATION_MS};
 pub use error::PkarrError;
+pub use record::{PkarrRoutingRecord, SKEW_TOLERANCE_MS};

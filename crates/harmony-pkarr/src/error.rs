@@ -27,6 +27,8 @@ pub enum PkarrError {
     /// CBOR serialize/deserialize failure on PkarrRoutingRecord payload.
     SerializeError(&'static str),
     DeserializeError(&'static str),
+    /// Record structurally invalid (e.g., identity_pub wrong length).
+    InvalidRecord,
 }
 
 impl core::fmt::Display for PkarrError {
@@ -46,6 +48,7 @@ impl core::fmt::Display for PkarrError {
             Self::RelayResponseInvalid => write!(f, "relay returned malformed response"),
             Self::SerializeError(msg) => write!(f, "serialize error: {msg}"),
             Self::DeserializeError(msg) => write!(f, "deserialize error: {msg}"),
+            Self::InvalidRecord => write!(f, "record structurally invalid"),
         }
     }
 }
