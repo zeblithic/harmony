@@ -11,7 +11,7 @@ rust-version.workspace = true
 default = ["std"]
 std = []
 # Exposes the mock pkarr-relay axum server for downstream integration tests.
-test-fixtures = ["dep:axum", "dep:tokio", "dep:hyper"]
+test-fixtures = ["dep:axum", "dep:tokio", "dep:hyper", "dep:reqwest"]
 
 [dependencies]
 hkdf = { workspace = true }
@@ -22,11 +22,14 @@ serde = { workspace = true, default-features = false, features = ["derive", "all
 serde_bytes = { workspace = true }
 ciborium = { workspace = true }
 
-# test-fixtures-only:
-axum = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+# test-fixtures-only (optional):
+axum = { workspace = true, optional = true, default-features = false, features = ["tokio", "http1"] }
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros", "net", "sync"] }
 hyper = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, default-features = false }
 
 [dev-dependencies]
 hex = { workspace = true }
 rand = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { workspace = true, default-features = false }

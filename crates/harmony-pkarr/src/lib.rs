@@ -21,6 +21,8 @@ pub mod derive;
 pub mod epoch;
 pub mod error;
 pub mod record;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod testing;
 
 pub use derive::{derive_ephemeral_key, PkarrCase};
 pub use epoch::{current_epoch_id, epoch_start_ms, epoch_tolerance_window, EPOCH_DURATION_MS};
