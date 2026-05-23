@@ -73,12 +73,15 @@ impl RelayClient {
 
     /// PUT the BEP44 envelope to the first available relay.
     ///
-    /// Returns `Ok(())` when a relay accepts the record.
-    /// Returns `Err(PkarrError::RelayHttpError(status))` on any explicit
-    /// non-success, non-429 HTTP status code (e.g. 400, 500).
+    /// Returns `Ok(())` when any relay accepts the record.
+    /// Returns `Err(PkarrError::RelayHttpError(status))` if every relay in the
+    /// pool was tried and the last attempted relay returned a non-success,
+    /// non-429 HTTP status (e.g. 500/503). A 5xx from one relay does NOT abort
+    /// the pool — rotation continues to the next relay.
     /// Returns `Err(PkarrError::NoRelaysAvailable)` when every relay is on
-    /// cooldown or failed with a transport error.
+    /// cooldown, or all tried relays failed with transport errors.
     pub async fn put(&self, key_z32: &str, envelope: &[u8]) -> Result<(), PkarrError> {
+        let mut last_http_error: Option<u16> = None;
         for base in self.available_relays() {
             let url = format!("{}/{}", base, key_z32);
             match self.http.put(&url).body(envelope.to_vec()).send().await {
@@ -88,8 +91,12 @@ impl RelayClient {
                     continue;
                 }
                 Ok(resp) => {
-                    // Explicit non-success, non-429 status: surface the error.
-                    return Err(PkarrError::RelayHttpError(resp.status().as_u16()));
+                    // Non-success, non-429 (e.g. 500/503): record the status,
+                    // put the relay on cooldown, and rotate to the next one.
+                    let status = resp.status().as_u16();
+                    self.mark_cooldown(&base);
+                    last_http_error = Some(status);
+                    continue;
                 }
                 Err(_) => {
                     // Transport error (timeout, connection refused, DNS, etc.)
@@ -98,20 +105,32 @@ impl RelayClient {
                 }
             }
         }
-        Err(PkarrError::NoRelaysAvailable)
+        // If at least one relay returned an explicit HTTP error status, surface
+        // it; otherwise all failures were transport-level or cooldown.
+        if let Some(status) = last_http_error {
+            Err(PkarrError::RelayHttpError(status))
+        } else {
+            Err(PkarrError::NoRelaysAvailable)
+        }
     }
 
     /// GET the BEP44 envelope for `key_z32`.
     ///
     /// Returns `Ok(Some(bytes))` when any relay returns the record.
     /// Returns `Ok(None)` only when ALL polled relays returned 404.
-    /// Returns `Err(PkarrError::NoRelaysAvailable)` when all relays either
-    /// hit transport errors / 429 (none had the key, but we can't be sure
-    /// it doesn't exist).
+    /// Returns `Err(PkarrError::NoRelaysAvailable)` when all relays are on
+    /// cooldown (none were tried), or when all tried relays failed with
+    /// transport errors / 429 / 5xx (none confirmed the key is absent).
     pub async fn get(&self, key_z32: &str) -> Result<Option<Vec<u8>>, PkarrError> {
+        let relays = self.available_relays();
+        // If every relay is on cooldown we have no information — return an
+        // error rather than a false Ok(None) that would negative-cache the key.
+        if relays.is_empty() {
+            return Err(PkarrError::NoRelaysAvailable);
+        }
         let mut polled_any = false;
         let mut all_404 = true;
-        for base in self.available_relays() {
+        for base in relays {
             polled_any = true;
             let url = format!("{}/{}", base, key_z32);
             match self.http.get(&url).send().await {

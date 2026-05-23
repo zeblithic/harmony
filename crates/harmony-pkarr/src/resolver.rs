@@ -163,7 +163,7 @@ fn parse_and_verify(
     let seq = u64::from_le_bytes(envelope[64..72].try_into().expect("8 == 8"));
     let payload = &envelope[72..];
 
-    let mut to_verify = alloc::vec::Vec::new();
+    let mut to_verify = Vec::new();
     to_verify.extend_from_slice(format!("3:seqi{}e1:v{}:", seq, payload.len()).as_bytes());
     to_verify.extend_from_slice(payload);
 

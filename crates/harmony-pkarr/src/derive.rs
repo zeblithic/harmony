@@ -38,6 +38,9 @@ impl PkarrCase {
     pub fn salt(self) -> &'static [u8] {
         match self {
             Self::Invite => b"harmony.pkarr.v1.invite",
+            // Case B derives from a *public* identity key by design — see the
+            // `Identity` variant doc comment and spec §5.3 for the security
+            // rationale (opt-in discoverability; authenticity via inner sig).
             Self::Identity => b"harmony.pkarr.v1.identity",
             Self::Community => b"harmony.pkarr.v1.community",
         }
