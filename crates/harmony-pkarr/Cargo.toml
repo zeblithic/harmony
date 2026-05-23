@@ -40,3 +40,7 @@ hex = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 reqwest = { workspace = true, default-features = false }
+# testing.rs is compiled under cfg(test); axum + hyper must be available
+# as dev-deps so `cargo nextest run --workspace` builds without test-fixtures.
+axum = { workspace = true, default-features = false, features = ["tokio", "http1"] }
+hyper = { workspace = true, default-features = false }
