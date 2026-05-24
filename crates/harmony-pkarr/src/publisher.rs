@@ -8,6 +8,7 @@
 //! is case-agnostic — case-specific lifecycle logic lives in harmony-client.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,15 @@ struct ActivePublication {
     ephemeral_key: SigningKey,
     builder: RecordBuilder,
     next_publish_at: Instant,
+    /// Set to `true` when the publication is unregistered or replaced.
+    ///
+    /// `publish_one` checks this flag before executing the PUT so that
+    /// in-flight publishes cloned before the lock was released are
+    /// short-circuited rather than racing with the updated state.
+    ///
+    /// Fix 2 (unregister allows in-flight publish) and Fix 3
+    /// (mid-flight register skips new publish) both rely on this flag.
+    cancelled: Arc<AtomicBool>,
 }
 
 /// Background task that holds a set of active publications and republishes
@@ -63,25 +73,44 @@ impl PkarrPublisher {
     /// Add or replace an active publication. Schedules an immediate publish
     /// on the next loop tick by setting `next_publish_at` to `Instant::now()`
     /// and notifying the background loop.
+    ///
+    /// If the handle was already registered, the prior entry's `cancelled` flag
+    /// is set so any in-flight publish cloned from the old entry short-circuits
+    /// before executing its PUT (Fix 3).
     pub async fn register(
         &self,
         handle: String,
         ephemeral_key: SigningKey,
         builder: RecordBuilder,
     ) {
+        let cancelled = Arc::new(AtomicBool::new(false));
         let pub_state = ActivePublication {
             handle: handle.clone(),
             ephemeral_key,
             builder,
             next_publish_at: Instant::now(),
+            cancelled: Arc::clone(&cancelled),
         };
-        self.state.lock().await.insert(handle, pub_state);
+        let mut state = self.state.lock().await;
+        // Cancel the old entry before replacing it so that any clone already
+        // in-flight from drive_pending doesn't overwrite the new entry's
+        // next_publish_at after we insert the replacement.
+        if let Some(old) = state.get(&handle) {
+            old.cancelled.store(true, Ordering::Release);
+        }
+        state.insert(handle, pub_state);
+        drop(state);
         self.wakeup.notify_one();
     }
 
     /// Remove an active publication. Future publish ticks will skip this key.
+    ///
+    /// The removed entry's `cancelled` flag is set so any in-flight publish
+    /// clone short-circuits before executing its PUT (Fix 2).
     pub async fn unregister(&self, handle: &str) {
-        self.state.lock().await.remove(handle);
+        if let Some(old) = self.state.lock().await.remove(handle) {
+            old.cancelled.store(true, Ordering::Release);
+        }
     }
 
     /// Returns the handles of all currently-registered publications.
@@ -127,8 +156,14 @@ impl PkarrPublisher {
             match self.publish_one(&pub_state).await {
                 Ok(()) => {
                     let mut state = self.state.lock().await;
+                    // Only update next_publish_at if this entry has not been
+                    // cancelled (replaced or unregistered). If it was cancelled,
+                    // the new entry's next_publish_at (set to Instant::now() in
+                    // register()) must not be overwritten (Fix 3).
                     if let Some(entry) = state.get_mut(&pub_state.handle) {
-                        entry.next_publish_at = compute_next_publish_at(now_ms());
+                        if !pub_state.cancelled.load(Ordering::Acquire) {
+                            entry.next_publish_at = compute_next_publish_at(now_ms());
+                        }
                     }
                 }
                 Err(e) => {
@@ -139,7 +174,9 @@ impl PkarrPublisher {
                     );
                     let mut state = self.state.lock().await;
                     if let Some(entry) = state.get_mut(&pub_state.handle) {
-                        entry.next_publish_at = Instant::now() + Duration::from_secs(60);
+                        if !pub_state.cancelled.load(Ordering::Acquire) {
+                            entry.next_publish_at = Instant::now() + Duration::from_secs(60);
+                        }
                     }
                 }
             }
@@ -147,6 +184,13 @@ impl PkarrPublisher {
     }
 
     async fn publish_one(&self, pub_state: &ActivePublication) -> Result<(), PkarrError> {
+        // Short-circuit if this entry was cancelled (unregistered or replaced
+        // by a new register() call) between when drive_pending cloned it and
+        // now. This prevents in-flight publishes from hitting the relay after
+        // the caller has already called unregister() (Fix 2 + Fix 3).
+        if pub_state.cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let now = now_ms();
         let record = (pub_state.builder)(now);
         let cbor = record.to_canonical_cbor()?;

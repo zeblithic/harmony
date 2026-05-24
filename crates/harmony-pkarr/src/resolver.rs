@@ -120,6 +120,7 @@ impl PkarrResolver {
         let results = join_all(futures).await;
 
         let mut best: Option<PkarrRoutingRecord> = None;
+        let mut any_ok_none = false;
         let mut any_err: Option<PkarrError> = None;
         for r in results {
             match r {
@@ -131,15 +132,21 @@ impl PkarrResolver {
                         best = Some(rec);
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => any_ok_none = true,
                 Err(e) => any_err = Some(e),
             }
         }
 
-        match (best, any_err) {
-            (Some(rec), _) => Ok(Some(rec)),
-            (None, Some(e)) => Err(e),
-            (None, None) => Ok(None),
+        // Prefer definitive answers over transient network errors:
+        //   - A valid record always wins.
+        //   - At least one key returned Ok(None) (confirmed absent) → surface
+        //     Ok(None) even if sibling keys errored transiently.
+        //   - Only return Err when every key errored (no Ok(_) at all).
+        match (best, any_ok_none, any_err) {
+            (Some(rec), _, _) => Ok(Some(rec)),
+            (None, true, _) => Ok(None),
+            (None, false, Some(e)) => Err(e),
+            (None, false, None) => Ok(None),
         }
     }
 
