@@ -72,6 +72,17 @@ impl MockPkarrRelay {
     }
 }
 
+impl Drop for MockPkarrRelay {
+    /// Explicit Drop so the spawned axum task stops promptly when the test
+    /// finishes. `_shutdown` (oneshot::Sender) being dropped would already
+    /// cause axum's `with_graceful_shutdown` future to resolve via
+    /// `RecvError`, but `JoinHandle::abort()` is the belt-and-suspenders
+    /// guarantee that no leftover task lingers across test boundaries.
+    fn drop(&mut self) {
+        self._server_task.abort();
+    }
+}
+
 async fn put_record(
     Path(key): Path<String>,
     State(store): State<Store>,

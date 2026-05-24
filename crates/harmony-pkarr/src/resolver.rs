@@ -153,12 +153,27 @@ impl PkarrResolver {
     fn cache_get(&self, pk: &[u8; 32]) -> Option<CachedResolution> {
         let mut cache = self.cache.lock().expect("cache poisoned");
         let entry = cache.get(pk)?;
-        if entry.fetched_at.elapsed() < entry.ttl {
-            Some(entry.clone())
-        } else {
+        if entry.fetched_at.elapsed() >= entry.ttl {
             cache.pop(pk);
-            None
+            return None;
         }
+        // RPK4 re-verification on cache hit: a record cached near the +30min
+        // skew edge could otherwise be served from the 15min positive cache
+        // up to 14min after it falls outside the skew window. Re-check on
+        // every lookup; on skew failure, evict + treat as miss (the next
+        // resolve will go to the relay and either negative-cache or refetch
+        // a fresh record).
+        if let Some(rec) = entry.record.as_ref() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock < UNIX epoch is unsupported")
+                .as_millis() as u64;
+            if rec.verify_skew(now_ms).is_err() {
+                cache.pop(pk);
+                return None;
+            }
+        }
+        Some(entry.clone())
     }
 
     fn cache_put(&self, pk: [u8; 32], record: Option<PkarrRoutingRecord>, ttl: Duration) {
