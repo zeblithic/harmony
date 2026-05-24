@@ -244,6 +244,7 @@ mod tests {
 
         let ephemeral = SigningKey::generate(&mut OsRng);
         let vk = ephemeral.verifying_key();
+        let key_builder: crate::EphemeralKeyBuilder = Arc::new(move |_| ephemeral.clone());
         let identity_sk = SigningKey::generate(&mut OsRng);
         let identity_pub = fixture_identity_pubkey(&identity_sk);
         let identity_sk_clone = identity_sk.clone();
@@ -258,7 +259,7 @@ mod tests {
         });
 
         publisher
-            .register("round-trip".to_string(), ephemeral, builder)
+            .register("round-trip".to_string(), key_builder, builder)
             .await;
 
         // Wait for publish to land + then resolve.
@@ -299,6 +300,7 @@ mod tests {
 
         let ephemeral = SigningKey::generate(&mut OsRng);
         let vk = ephemeral.verifying_key();
+        let key_builder: crate::EphemeralKeyBuilder = Arc::new(move |_| ephemeral.clone());
         let identity_sk = SigningKey::generate(&mut OsRng);
         let identity_pub = fixture_identity_pubkey(&identity_sk);
         let identity_sk_clone = identity_sk.clone();
@@ -312,7 +314,7 @@ mod tests {
             .expect("sign")
         });
         publisher
-            .register("cache-test".to_string(), ephemeral, builder)
+            .register("cache-test".to_string(), key_builder, builder)
             .await;
 
         // Wait for publish.

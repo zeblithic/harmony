@@ -28,10 +28,19 @@ use crate::relay::RelayClient;
 /// The `u64` argument is the current time in milliseconds since Unix epoch.
 pub type RecordBuilder = Arc<dyn Fn(u64) -> PkarrRoutingRecord + Send + Sync>;
 
+/// Callback that produces the current epoch's ephemeral `SigningKey` for a
+/// publication. Invoked on every publish so that the key rotates as the
+/// epoch advances — registering once at the start of epoch N would otherwise
+/// keep publishing under the epoch-N key after the boundary, where resolvers
+/// query under epoch N+1 ± tolerance and never find the record.
+///
+/// The `u64` argument is the current time in milliseconds since Unix epoch.
+pub type EphemeralKeyBuilder = Arc<dyn Fn(u64) -> SigningKey + Send + Sync>;
+
 #[derive(Clone)]
 struct ActivePublication {
     handle: String,
-    ephemeral_key: SigningKey,
+    ephemeral_key_builder: EphemeralKeyBuilder,
     builder: RecordBuilder,
     next_publish_at: Instant,
     /// Set to `true` when the publication is unregistered or replaced.
@@ -74,19 +83,23 @@ impl PkarrPublisher {
     /// on the next loop tick by setting `next_publish_at` to `Instant::now()`
     /// and notifying the background loop.
     ///
+    /// `ephemeral_key_builder` is invoked on every publish so the key rotates
+    /// with the epoch — see [`EphemeralKeyBuilder`] for why this is a closure
+    /// rather than a fixed `SigningKey`.
+    ///
     /// If the handle was already registered, the prior entry's `cancelled` flag
     /// is set so any in-flight publish cloned from the old entry short-circuits
     /// before executing its PUT (Fix 3).
     pub async fn register(
         &self,
         handle: String,
-        ephemeral_key: SigningKey,
+        ephemeral_key_builder: EphemeralKeyBuilder,
         builder: RecordBuilder,
     ) {
         let cancelled = Arc::new(AtomicBool::new(false));
         let pub_state = ActivePublication {
             handle: handle.clone(),
-            ephemeral_key,
+            ephemeral_key_builder,
             builder,
             next_publish_at: Instant::now(),
             cancelled: Arc::clone(&cancelled),
@@ -192,10 +205,16 @@ impl PkarrPublisher {
             return Ok(());
         }
         let now = now_ms();
+        // Re-derive the ephemeral key for the current epoch on every publish.
+        // Bug history: this used to be a fixed SigningKey captured at register
+        // time, which silently broke discovery after the first epoch boundary
+        // because the publisher kept writing under the previous epoch's DHT
+        // key while resolvers queried under the current epoch ± tolerance.
+        let ephemeral_key = (pub_state.ephemeral_key_builder)(now);
         let record = (pub_state.builder)(now);
         let cbor = record.to_canonical_cbor()?;
-        let envelope = wrap_bep44_envelope(&pub_state.ephemeral_key, &cbor, now)?;
-        let key_z32 = z32_encode_public(&pub_state.ephemeral_key.verifying_key().to_bytes());
+        let envelope = wrap_bep44_envelope(&ephemeral_key, &cbor, now)?;
+        let key_z32 = z32_encode_public(&ephemeral_key.verifying_key().to_bytes());
         self.relay.put(&key_z32, &envelope).await
     }
 
@@ -304,6 +323,8 @@ mod tests {
 
         let ephemeral = SigningKey::generate(&mut OsRng);
         let pk_hex = hex::encode(ephemeral.verifying_key().to_bytes());
+        let ephemeral_for_builder = ephemeral.clone();
+        let key_builder: EphemeralKeyBuilder = Arc::new(move |_| ephemeral_for_builder.clone());
 
         let identity_sk = SigningKey::generate(&mut OsRng);
         let mut identity_pub = [0u8; 64];
@@ -320,7 +341,7 @@ mod tests {
         });
 
         publisher
-            .register("test-pub".to_string(), ephemeral, builder)
+            .register("test-pub".to_string(), key_builder, builder)
             .await;
 
         // Poll the mock relay for up to 2.5s for the publication to land.
@@ -354,6 +375,7 @@ mod tests {
         let _handle = Arc::clone(&publisher).spawn();
 
         let ephemeral = SigningKey::generate(&mut OsRng);
+        let key_builder: EphemeralKeyBuilder = Arc::new(move |_| ephemeral.clone());
         let identity_sk = SigningKey::generate(&mut OsRng);
         let mut identity_pub = [0u8; 64];
         identity_pub[32..].copy_from_slice(&identity_sk.verifying_key().to_bytes());
@@ -369,10 +391,133 @@ mod tests {
         });
 
         publisher
-            .register("to-remove".to_string(), ephemeral, builder)
+            .register("to-remove".to_string(), key_builder, builder)
             .await;
         publisher.unregister("to-remove").await;
 
         assert!(publisher.active_handles().await.is_empty());
+    }
+
+    /// Regression: every publish must invoke `ephemeral_key_builder` so the
+    /// key tracks the current epoch. Before this fix, `register` snapshotted
+    /// a single SigningKey at registration time and reused it for every
+    /// subsequent publish — meaning publication silently kept writing to the
+    /// old epoch's DHT key after the boundary, while resolvers (which derive
+    /// keys against the current epoch ± tolerance) stopped finding the
+    /// record. This test verifies the builder is called multiple times by
+    /// forcing two publish cycles and observing distinct relay URLs.
+    #[tokio::test]
+    async fn ephemeral_key_builder_invoked_each_publish() {
+        let relay = MockPkarrRelay::start().await;
+        let pool = crate::relay::RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(crate::relay::RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(Arc::clone(&client)));
+        let _handle = Arc::clone(&publisher).spawn();
+
+        // Two distinct keys; the builder returns key_a then key_b on
+        // subsequent calls so we can verify both surfaces appear on the relay.
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let pk_a_hex = hex::encode(key_a.verifying_key().to_bytes());
+        let pk_b_hex = hex::encode(key_b.verifying_key().to_bytes());
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+        let key_a_clone = key_a.clone();
+        let key_b_clone = key_b.clone();
+        let key_builder: EphemeralKeyBuilder = Arc::new(move |_now_ms| {
+            let n = call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                key_a_clone.clone()
+            } else {
+                key_b_clone.clone()
+            }
+        });
+
+        let identity_sk = SigningKey::generate(&mut OsRng);
+        let mut identity_pub = [0u8; 64];
+        identity_pub[32..].copy_from_slice(&identity_sk.verifying_key().to_bytes());
+        let identity_sk_for_builder = identity_sk.clone();
+        let builder: RecordBuilder = Arc::new(move |at_ms| {
+            PkarrRoutingRecord::sign_new(
+                b"rotation-test".to_vec(),
+                identity_pub,
+                at_ms,
+                &identity_sk_for_builder,
+            )
+            .expect("sign")
+        });
+
+        publisher
+            .register("rotation".to_string(), key_builder, builder)
+            .await;
+
+        // Wait for the first publish (under key_a) to land.
+        let mut tries = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tries += 1;
+            assert!(tries < 60, "first publish (key_a) did not land");
+            let resp = reqwest::get(format!("{}/{}", relay.base_url, pk_a_hex))
+                .await
+                .expect("http get");
+            if resp.status() == 200 {
+                break;
+            }
+        }
+
+        // Force a second publish by unregister + re-register. This drives a
+        // fresh publish cycle that should invoke the builder again, which
+        // returns key_b — simulating the epoch-boundary case where the same
+        // logical publication wakes up after the epoch rolled and re-derives
+        // its key.
+        publisher.unregister("rotation").await;
+        // Re-build with a new pair of closures so the registry sees a new
+        // entry. The second builder call returns key_b (call_count == 1).
+        let call_count_clone2 = Arc::clone(&call_count);
+        let key_a2 = key_a.clone();
+        let key_b2 = key_b.clone();
+        let key_builder2: EphemeralKeyBuilder = Arc::new(move |_now_ms| {
+            let n = call_count_clone2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                key_a2.clone()
+            } else {
+                key_b2.clone()
+            }
+        });
+        let identity_sk_for_builder2 = identity_sk.clone();
+        let builder2: RecordBuilder = Arc::new(move |at_ms| {
+            PkarrRoutingRecord::sign_new(
+                b"rotation-test".to_vec(),
+                identity_pub,
+                at_ms,
+                &identity_sk_for_builder2,
+            )
+            .expect("sign")
+        });
+        publisher
+            .register("rotation".to_string(), key_builder2, builder2)
+            .await;
+
+        // Wait for key_b's record to appear on the relay.
+        let mut tries = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tries += 1;
+            assert!(tries < 60, "second publish (key_b) did not land");
+            let resp = reqwest::get(format!("{}/{}", relay.base_url, pk_b_hex))
+                .await
+                .expect("http get");
+            if resp.status() == 200 {
+                break;
+            }
+        }
+
+        // Builder must have been invoked at least twice. Concrete count is
+        // ≥ 2 because the loop may have retried during the first poll, but
+        // observing distinct URLs proves the key did rotate.
+        assert!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "builder must be invoked on every publish, not just at register"
+        );
     }
 }

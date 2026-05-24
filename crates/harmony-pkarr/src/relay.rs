@@ -128,10 +128,13 @@ impl RelayClient {
         if relays.is_empty() {
             return Err(PkarrError::NoRelaysAvailable);
         }
-        let mut polled_any = false;
+        // The empty-relays guard above guarantees we enter the loop, so we
+        // only need to track whether every polled relay returned a definitive
+        // 404 ("not here"). Any other outcome (transient error, 429, 5xx)
+        // flips this to false so we surface NoRelaysAvailable instead of
+        // falsely confirming absence.
         let mut all_404 = true;
         for base in relays {
-            polled_any = true;
             let url = format!("{}/{}", base, key_z32);
             match self.http.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -168,7 +171,7 @@ impl RelayClient {
                 }
             }
         }
-        if polled_any && all_404 {
+        if all_404 {
             Ok(None)
         } else {
             Err(PkarrError::NoRelaysAvailable)
