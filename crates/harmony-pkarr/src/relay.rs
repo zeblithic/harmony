@@ -153,7 +153,10 @@ impl RelayClient {
                 }
                 Ok(_) => {
                     // Other non-success status (e.g. 500): treat as transport
-                    // error — we can't confirm the key is absent.
+                    // error — we can't confirm the key is absent. Mirror the
+                    // PUT path: mark cooldown so a misbehaving relay doesn't
+                    // get hammered with every GET.
+                    self.mark_cooldown(&base);
                     all_404 = false;
                     continue;
                 }

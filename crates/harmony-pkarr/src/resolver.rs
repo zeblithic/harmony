@@ -82,6 +82,27 @@ impl PkarrResolver {
                     self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
                     return Ok(None);
                 }
+                // RPK4: skew check (±30 min) — silent-drop (cache negative).
+                // Don't cache positively: a record outside the skew window
+                // is invalid, and could become valid if the local clock
+                // corrects, but the publisher's next republish will land
+                // a fresh record anyway. Negative-cache so we don't spam
+                // the relay during the 60s window.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock < UNIX epoch is unsupported")
+                    .as_millis() as u64;
+                if let Err(e) = record.verify_skew(now_ms) {
+                    tracing::warn!(
+                        key = %key_z32,
+                        announced_at_ms = record.announced_at_ms,
+                        now_ms,
+                        error = ?e,
+                        "pkarr record outside ±30min skew window — dropping (RPK4)"
+                    );
+                    self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
+                    return Ok(None);
+                }
                 self.cache_put(pk_bytes, Some(record.clone()), POSITIVE_CACHE_TTL);
                 Ok(Some(record))
             }
