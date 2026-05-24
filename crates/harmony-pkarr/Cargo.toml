@@ -1,0 +1,46 @@
+[package]
+name = "harmony-pkarr"
+description = "BEP44 pkarr publish + resolve over Mainline DHT via HTTP-relay; transport-agnostic value layer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = []
+# Exposes the mock pkarr-relay axum server for downstream integration tests.
+test-fixtures = ["dep:axum", "dep:hyper"]
+
+[dependencies]
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+zeroize = { workspace = true }
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+serde_bytes = { workspace = true }
+ciborium = { workspace = true }
+# reqwest is always required — the production relay client needs it.
+reqwest = { workspace = true, default-features = false }
+# tokio is always required — the publisher background task needs it.
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+tracing = { workspace = true }
+# hex is used in publisher (z32_encode_public) and dev/test code.
+hex = { workspace = true }
+lru = { workspace = true }
+futures = { workspace = true }
+
+# test-fixtures-only (optional):
+axum = { workspace = true, optional = true, default-features = false, features = ["tokio", "http1"] }
+hyper = { workspace = true, optional = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { workspace = true, default-features = false }
+# testing.rs is compiled under cfg(test); axum + hyper must be available
+# as dev-deps so `cargo nextest run --workspace` builds without test-fixtures.
+axum = { workspace = true, default-features = false, features = ["tokio", "http1"] }
+hyper = { workspace = true, default-features = false }
