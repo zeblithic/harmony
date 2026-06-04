@@ -32,6 +32,14 @@ pub enum PkarrCase {
     Identity,
     /// Case C: in-community fallback. `ikm` = `EpochKey` (32 bytes).
     Community,
+    /// Case D: friend-scoped rendezvous. `ikm` = 32-byte per-friendship
+    /// shared secret; `info` = `epoch_be ‖ publisher_owner_id`.
+    ///
+    /// Unlike Case B (`Identity`), this case derives from a **shared secret**
+    /// (negotiated pairwise between the two friends), NOT from any public key.
+    /// Only the two parties holding the per-friendship secret can compute the
+    /// slot, so the friend rendezvous is private to that friendship.
+    Friend,
 }
 
 impl PkarrCase {
@@ -43,6 +51,7 @@ impl PkarrCase {
             // rationale (opt-in discoverability; authenticity via inner sig).
             Self::Identity => b"harmony.pkarr.v1.identity",
             Self::Community => b"harmony.pkarr.v1.community",
+            Self::Friend => b"harmony.pkarr.v1.friend",
         }
     }
 }
@@ -110,6 +119,23 @@ mod tests {
         assert_eq!(vk_hex, expected, "case-community v1 keying must not drift");
     }
 
+    /// Reference vector — pins the Case-D (friend-scoped) keying scheme.
+    /// Same DO-NOT-REGENERATE warning as the other reference vectors applies.
+    #[test]
+    fn reference_vector_case_friend() {
+        // ikm = 32-byte per-friendship shared secret (placeholder all-zero)
+        // info = epoch 12345 (big-endian) ‖ 16-byte publisher_owner_id
+        let ikm = [0u8; 32];
+        let mut info = Vec::with_capacity(8 + 16);
+        info.extend_from_slice(&12345u64.to_be_bytes());
+        info.extend_from_slice(&[0x11u8; 16]);
+        let key = derive_ephemeral_key(PkarrCase::Friend, &ikm, &info);
+        let vk_hex = hex::encode(key.verifying_key().to_bytes());
+        // Pin: compute once, paste here. Regenerating breaks v1 records.
+        let expected = "cd972d4f9b4dc0b3eb8abac165b18fbdb91ad67d88a34c490e23689c835f49a9";
+        assert_eq!(vk_hex, expected, "case-friend v1 keying must not drift");
+    }
+
     #[test]
     fn different_cases_produce_different_keys() {
         let ikm = [1u8; 64];
@@ -117,9 +143,13 @@ mod tests {
         let k1 = derive_ephemeral_key(PkarrCase::Invite, &ikm, &info);
         let k2 = derive_ephemeral_key(PkarrCase::Identity, &ikm, &info);
         let k3 = derive_ephemeral_key(PkarrCase::Community, &ikm, &info);
+        let k4 = derive_ephemeral_key(PkarrCase::Friend, &ikm, &info);
         assert_ne!(k1.verifying_key(), k2.verifying_key());
         assert_ne!(k1.verifying_key(), k3.verifying_key());
         assert_ne!(k2.verifying_key(), k3.verifying_key());
+        assert_ne!(k4.verifying_key(), k1.verifying_key());
+        assert_ne!(k4.verifying_key(), k2.verifying_key());
+        assert_ne!(k4.verifying_key(), k3.verifying_key());
     }
 
     #[test]
