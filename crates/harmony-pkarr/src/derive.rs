@@ -1,7 +1,7 @@
 //! HKDF-SHA256 derivation of ephemeral Ed25519 keys per case.
 //!
 //! Domain separation: each case uses a distinct salt
-//! (`harmony.pkarr.v1.{invite|identity|community}`) so reusing the same
+//! (`harmony.pkarr.v1.{invite|identity|community|friend}`) so reusing the same
 //! `ikm` across cases does NOT produce the same derived key.
 //!
 //! Spec Section 5.3.
@@ -138,6 +138,12 @@ mod tests {
 
     #[test]
     fn different_cases_produce_different_keys() {
+        // Uniform `ikm`/`info` across every case is intentional: holding the
+        // inputs constant isolates the *salt* as the only variable, which is
+        // precisely what proves per-case domain separation. Case-appropriate
+        // sizes (e.g. Friend's 32-byte secret + 24-byte info) are exercised by
+        // the `reference_vector_case_*` tests above; HKDF accepts any input
+        // length, so these uniform sizes are valid for a separation check.
         let ikm = [1u8; 64];
         let info = [2u8; 8];
         let k1 = derive_ephemeral_key(PkarrCase::Invite, &ikm, &info);
