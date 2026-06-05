@@ -307,14 +307,21 @@ impl RelayClient {
 
     /// Replace the relay pool live. Takes effect on the next `put`/`get`.
     ///
-    /// Prunes cooldown + records entries for relays no longer in the new pool.
-    /// Without this, removing a relay that is on cooldown and then re-adding it
-    /// (the settings-UI "fix a misconfigured relay and re-add" flow) would leave
-    /// it silently skipped for up to `config.cooldown` after re-add. Each lock is
-    /// acquired and released sequentially (never two at once), so this introduces
-    /// no lock-ordering hazard with `relay_health`.
+    /// Swaps the pool **first**, then prunes cooldown + records entries for relays
+    /// no longer present. Swap-first eliminates the "old pool still active but its
+    /// cooldown already pruned" intermediate window a concurrent `available_relays`
+    /// could otherwise observe (Qodo). Pruning then gives the settings-UI
+    /// remove-then-re-add flow a fresh relay rather than one silently skipped for
+    /// up to `config.cooldown`. In-flight requests that finish after the swap are
+    /// handled by the pool-membership guard in `mark_cooldown` / `record_outcome`,
+    /// which drop writes for relays no longer in the pool (so they cannot resurrect
+    /// a pruned entry — Cursor). Each lock is taken and released sequentially
+    /// (never two at once), so this adds no lock-ordering hazard.
     pub fn set_relays(&self, relays: Vec<String>) {
-        let live: std::collections::HashSet<&str> = relays.iter().map(String::as_str).collect();
+        // Owned set so it outlives the `relays` move into the pool below (≤8
+        // short strings — negligible clone).
+        let live: std::collections::HashSet<String> = relays.iter().cloned().collect();
+        *self.pool.write().expect("relay pool poisoned") = RelayPool::new(relays);
         self.cooldown
             .lock()
             .expect("cooldown poisoned")
@@ -323,18 +330,39 @@ impl RelayClient {
             .lock()
             .expect("records poisoned")
             .retain(|k, _| live.contains(k.as_str()));
-        *self.pool.write().expect("relay pool poisoned") = RelayPool::new(relays);
     }
 
-    /// Put `base` into a cooldown for the configured duration.
+    /// True if `base` is in the current pool. Acquires the pool read-lock; callers
+    /// must NOT already hold it — `pool` is always acquired LAST so the global lock
+    /// order (cooldown → records → pool) stays acyclic.
+    fn pool_contains(&self, base: &str) -> bool {
+        self.pool
+            .read()
+            .expect("relay pool poisoned")
+            .relays
+            .iter()
+            .any(|r| r == base)
+    }
+
+    /// Put `base` into a cooldown for the configured duration. No-op if `base` is
+    /// no longer in the pool: an in-flight request can finish after a `set_relays`
+    /// dropped its relay, and must not resurrect a cooldown entry that re-add would
+    /// then inherit.
     fn mark_cooldown(&self, base: &str) {
         let mut cd = self.cooldown.lock().expect("cooldown poisoned");
+        if !self.pool_contains(base) {
+            return;
+        }
         cd.insert(base.to_string(), Instant::now() + self.config.cooldown);
     }
 
-    /// Record the latest outcome for `base` (health observability).
+    /// Record the latest outcome for `base` (health observability). No-op if `base`
+    /// is no longer in the pool (same in-flight-after-swap guard as `mark_cooldown`).
     fn record_outcome(&self, base: &str, outcome: RelayOutcome) {
         let mut recs = self.records.lock().expect("records poisoned");
+        if !self.pool_contains(base) {
+            return;
+        }
         let rec = recs.entry(base.to_string()).or_default();
         rec.last_outcome = Some(outcome);
         if outcome == RelayOutcome::Success {
