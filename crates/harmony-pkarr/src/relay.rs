@@ -13,11 +13,26 @@ use std::time::{Duration, Instant};
 
 use crate::error::PkarrError;
 
-/// Per-request timeout for relay HTTP calls.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Tunable timeouts for [`RelayClient`]. **Not user-facing** — multi-relay
+/// redundancy (ZEB-380) already removes the "5 s timeout is terminal" failure
+/// mode, so these stay code-level defaults. The struct exists so tests can use
+/// short values and a future ticket can wire knobs if needed.
+#[derive(Debug, Clone, Copy)]
+pub struct RelayConfig {
+    /// Per-request HTTP timeout. Default 5 s.
+    pub request_timeout: Duration,
+    /// How long a relay stays on cooldown after a timeout / 429 / 5xx. Default 30 s.
+    pub cooldown: Duration,
+}
 
-/// How long a relay stays on cooldown after a timeout or 429 response.
-const COOLDOWN: Duration = Duration::from_secs(30);
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout: Duration::from_secs(5),
+            cooldown: Duration::from_secs(30),
+        }
+    }
+}
 
 /// An ordered list of relay base URLs (e.g. `"https://relay.example.com"`).
 ///
@@ -52,16 +67,21 @@ impl RelayPool {
 pub struct RelayClient {
     pool: RelayPool,
     http: reqwest::Client,
+    config: RelayConfig,
     /// Maps relay base URL → `Instant` at which the cooldown expires.
     cooldown: Mutex<HashMap<String, Instant>>,
 }
 
 impl RelayClient {
-    /// Build a client. A `reqwest::Client` with [`REQUEST_TIMEOUT`] is created
-    /// internally; callers do not supply one.
+    /// Build a client with default [`RelayConfig`].
     pub fn new(pool: RelayPool) -> Self {
+        Self::with_config(pool, RelayConfig::default())
+    }
+
+    /// Build a client with an explicit [`RelayConfig`] (test/forward-compat hook).
+    pub fn with_config(pool: RelayPool, config: RelayConfig) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(config.request_timeout)
             // ZEB-381: trust Mozilla's webpki root bundle in addition to OS-native
             // roots. `rustls-tls-native-roots` alone failed to anchor relay.pkarr.org's
             // Let's Encrypt chain — InvalidCertificate(UnknownIssuer) — on BOTH macOS
@@ -74,6 +94,7 @@ impl RelayClient {
         Self {
             pool,
             http,
+            config,
             cooldown: Mutex::new(HashMap::new()),
         }
     }
@@ -198,10 +219,10 @@ impl RelayClient {
             .collect()
     }
 
-    /// Put `base` into a 30-second cooldown.
+    /// Put `base` into a cooldown for the configured duration.
     fn mark_cooldown(&self, base: &str) {
         let mut cd = self.cooldown.lock().expect("cooldown poisoned");
-        cd.insert(base.to_string(), Instant::now() + COOLDOWN);
+        cd.insert(base.to_string(), Instant::now() + self.config.cooldown);
     }
 }
 
@@ -251,5 +272,12 @@ mod tests {
             client.get("k").await,
             Err(PkarrError::NoRelaysAvailable)
         ));
+    }
+
+    #[test]
+    fn relay_config_default_is_5s_30s() {
+        let cfg = RelayConfig::default();
+        assert_eq!(cfg.request_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.cooldown, Duration::from_secs(30));
     }
 }
