@@ -33,5 +33,5 @@ pub use epoch::{current_epoch_id, epoch_start_ms, epoch_tolerance_window, EPOCH_
 pub use error::PkarrError;
 pub use publisher::{EphemeralKeyBuilder, PkarrPublisher, RecordBuilder};
 pub use record::{PkarrRoutingRecord, SKEW_TOLERANCE_MS};
-pub use relay::{RelayClient, RelayPool};
+pub use relay::{RelayClient, RelayConfig, RelayHealth, RelayOutcome, RelayPool, RelayState};
 pub use resolver::PkarrResolver;
