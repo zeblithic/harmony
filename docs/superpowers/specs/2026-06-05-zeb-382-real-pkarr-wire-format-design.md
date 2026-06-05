@@ -120,8 +120,8 @@ Wire-format fixtures: the existing `PkarrRoutingRecord` canonical-CBOR fixtures 
 
 ## 7. Dependencies
 
-- Add to the workspace: `pkarr = { version = "6.0.1", default-features = false, features = ["signed_packet"] }` — a **no-network** dependency providing `Keypair`, `SignedPacket`, the builder, and `to_relay_payload`/`from_relay_payload`. **No `reqwest`, no `mainline`, no `url`.** MSRV 1.85 ≤ our 1.88 floor.
-- **Implementation Task 1 confirms the exact minimal feature set** via `cargo tree`: verify `["signed_packet"]` exposes `to_relay_payload`/`from_relay_payload` and pulls no network crates; if not, widen to the smallest feature set that does while still excluding `reqwest`/`mainline`/`url`. Confirm the exact builder method names (`SignedPacket::builder()` vs `SignedPacketBuilder`, `.sign()` vs `.build()`) against docs.rs at implementation time; they are not load-bearing for this design.
+- Add to the workspace: `pkarr = { version = "3.10.0", default-features = false, features = ["signed_packet"] }` — a **no-network** dependency providing `Keypair`, `SignedPacket`, the builder, and `to_relay_payload`/`from_relay_payload`. The `signed_packet` feature pulls **no `reqwest`, no `mainline`, no `url`**. We use **3.10.0 specifically because the workspace already locks it transitively (via iroh)** — reusing the already-compiled crate and avoiding a second pkarr major version in the tree (which bot reviewers reliably flag). pkarr 3.10.0 declares no `rust-version`; edition 2021, no conflict with our 1.88 floor. `pkarr` and `harmony-pkarr` resolve to the same single `ed25519-dalek` 2.x, so `Keypair::from_secret_key` and our `SigningKey::from_bytes` share a code path — the key-consistency invariant (§4.2) is exact, not approximate.
+- **Verified (2026-06-05) against pkarr 3.10.0:** `SignedPacket::to_relay_payload(&self) -> Bytes` and `SignedPacket::from_relay_payload(&PublicKey, &Bytes) -> Result<SignedPacket, SignedPacketVerifyError>` are public; plus `Keypair::from_secret_key(&[u8;32])`, `Keypair::to_z32()`, `PublicKey::try_from(&[u8;32])`, `SignedPacket::builder().txt(Name, TXT, ttl).sign(&keypair)`, `resource_records(name)`, and `SignedPacket::MAX_BYTES = 1104` — all under `signed_packet`. Implementation Task 1 re-confirms with a compiling in-memory round-trip + `cargo tree` (single pkarr 3.10.0).
 - `harmony-pkarr` keeps `reqwest` (relay.rs), `ciborium`, `ed25519-dalek`, `serde_bytes`, `hkdf`, `sha2` (record/derive).
 
 ### 7.1 Error mapping
@@ -154,6 +154,6 @@ Wire-format fixtures: the existing `PkarrRoutingRecord` canonical-CBOR fixtures 
 
 ## 11. Open items (resolved at implementation time, not blockers)
 
-- Exact minimal pkarr feature set (`cargo tree` confirmation) — §7.
-- Exact pkarr builder method spelling (`.sign()` vs `.build()`, builder type name) — §7.
-- Whether `MockPkarrRelay` should fully `from_relay_payload`-verify on PUT or merely parse the z32 key and round-trip bytes; the spec mandates at least z32-key parsing + real-byte round-trip, with full verification preferred if it does not over-couple the mock to pkarr internals — §6.1.
+- (Resolved, §7) pkarr **3.10.0** with `features=["signed_packet"]`; builder is `SignedPacket::builder().txt(Name, TXT, ttl).sign(&keypair)`.
+- Exact `simple_dns` (re-exported as `pkarr::dns`) TXT multi-character-string construction for base64 payloads > 255 bytes — confirmed by the Task 1 codec spike before the encode/decode helpers are written.
+- `MockPkarrRelay` is upgraded by adding a **strict** validating constructor (parses the z32 key + runs `from_relay_payload` on PUT, returning 400 on failure) used by the wire-conformance + publisher/resolver tests, while the existing **lax** constructor is retained for the relay-pool/cooldown mechanics tests that intentionally PUT arbitrary bytes — §6.1.
