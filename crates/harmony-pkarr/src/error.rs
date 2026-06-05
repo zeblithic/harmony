@@ -29,6 +29,8 @@ pub enum PkarrError {
     DeserializeError(&'static str),
     /// Record structurally invalid (e.g., identity_pub wrong length).
     InvalidRecord,
+    /// Record exceeds the pkarr SignedPacket size budget (MAX_BYTES = 1104).
+    RecordTooLarge,
 }
 
 impl core::fmt::Display for PkarrError {
@@ -49,6 +51,7 @@ impl core::fmt::Display for PkarrError {
             Self::SerializeError(msg) => write!(f, "serialize error: {msg}"),
             Self::DeserializeError(msg) => write!(f, "deserialize error: {msg}"),
             Self::InvalidRecord => write!(f, "record structurally invalid"),
+            Self::RecordTooLarge => write!(f, "record too large for pkarr packet"),
         }
     }
 }
@@ -79,5 +82,11 @@ mod tests {
             PkarrError::OuterSignatureInvalid,
             PkarrError::InnerSignatureInvalid
         );
+    }
+
+    #[test]
+    fn record_too_large_displays() {
+        let s = format!("{}", PkarrError::RecordTooLarge);
+        assert!(s.contains("too large"));
     }
 }
