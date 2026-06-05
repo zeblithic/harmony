@@ -8,6 +8,7 @@
 //! (failure-modes table).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -129,6 +130,12 @@ pub struct RelayClient {
     cooldown: Mutex<HashMap<String, Instant>>,
     /// Per-URL last-outcome / last-success record (health observability).
     records: Mutex<HashMap<String, RelayRecord>>,
+    /// Bumped on every `set_relays`. A put/get captures the generation when it
+    /// snapshots `available_relays`; outcome writes are dropped if the generation
+    /// changed mid-attempt, so a request that started before a pool reconfiguration
+    /// can't write cooldown/health for the new pool (a removed-then-re-added relay
+    /// stays fresh). Lock-free — no bearing on the cooldown→records→pool lock order.
+    generation: AtomicU64,
 }
 
 impl RelayClient {
@@ -156,6 +163,7 @@ impl RelayClient {
             config,
             cooldown: Mutex::new(HashMap::new()),
             records: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -170,31 +178,33 @@ impl RelayClient {
     /// cooldown, or all tried relays failed with transport errors.
     pub async fn put(&self, key_z32: &str, envelope: &[u8]) -> Result<(), PkarrError> {
         let mut last_http_error: Option<u16> = None;
-        for base in self.available_relays() {
+        let (gen, relays) = self.available_relays();
+        for base in relays {
             let url = format!("{}/{}", base, key_z32);
             match self.http.put(&url).body(envelope.to_vec()).send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    self.record_outcome(&base, RelayOutcome::Success);
+                    self.record_outcome(gen, &base, RelayOutcome::Success);
                     return Ok(());
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
-                    self.mark_cooldown(&base);
-                    self.record_outcome(&base, RelayOutcome::Http(429));
+                    self.mark_cooldown(gen, &base);
+                    self.record_outcome(gen, &base, RelayOutcome::Http(429));
                     continue;
                 }
                 Ok(resp) => {
                     // Non-success, non-429 (e.g. 500/503): record the status,
                     // put the relay on cooldown, and rotate to the next one.
                     let status = resp.status().as_u16();
-                    self.mark_cooldown(&base);
-                    self.record_outcome(&base, RelayOutcome::Http(status));
+                    self.mark_cooldown(gen, &base);
+                    self.record_outcome(gen, &base, RelayOutcome::Http(status));
                     last_http_error = Some(status);
                     continue;
                 }
                 Err(e) => {
                     // Transport error (timeout, connection refused, DNS, etc.)
-                    self.mark_cooldown(&base);
+                    self.mark_cooldown(gen, &base);
                     self.record_outcome(
+                        gen,
                         &base,
                         if e.is_timeout() {
                             RelayOutcome::Timeout
@@ -223,7 +233,7 @@ impl RelayClient {
     /// cooldown (none were tried), or when all tried relays failed with
     /// transport errors / 429 / 5xx (none confirmed the key is absent).
     pub async fn get(&self, key_z32: &str) -> Result<Option<Vec<u8>>, PkarrError> {
-        let relays = self.available_relays();
+        let (gen, relays) = self.available_relays();
         // If every relay is on cooldown we have no information — return an
         // error rather than a false Ok(None) that would negative-cache the key.
         if relays.is_empty() {
@@ -243,7 +253,7 @@ impl RelayClient {
                         .bytes()
                         .await
                         .map_err(|_| PkarrError::RelayResponseInvalid)?;
-                    self.record_outcome(&base, RelayOutcome::Success);
+                    self.record_outcome(gen, &base, RelayOutcome::Success);
                     return Ok(Some(bytes.to_vec()));
                 }
                 Ok(resp) if resp.status().as_u16() == 404 => {
@@ -254,8 +264,8 @@ impl RelayClient {
                     continue;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
-                    self.mark_cooldown(&base);
-                    self.record_outcome(&base, RelayOutcome::Http(429));
+                    self.mark_cooldown(gen, &base);
+                    self.record_outcome(gen, &base, RelayOutcome::Http(429));
                     all_404 = false;
                     continue;
                 }
@@ -264,15 +274,16 @@ impl RelayClient {
                     // key is absent. Mirror the PUT path's cooldown/skip handling
                     // so a misbehaving relay isn't hammered with every GET — but
                     // record the precise outcome as RelayOutcome::Http(status).
-                    self.mark_cooldown(&base);
-                    self.record_outcome(&base, RelayOutcome::Http(resp.status().as_u16()));
+                    self.mark_cooldown(gen, &base);
+                    self.record_outcome(gen, &base, RelayOutcome::Http(resp.status().as_u16()));
                     all_404 = false;
                     continue;
                 }
                 Err(e) => {
                     // Timeout / connection refused / DNS failure.
-                    self.mark_cooldown(&base);
+                    self.mark_cooldown(gen, &base);
                     self.record_outcome(
+                        gen,
                         &base,
                         if e.is_timeout() {
                             RelayOutcome::Timeout
@@ -292,31 +303,38 @@ impl RelayClient {
         }
     }
 
-    /// Returns the subset of pool relays whose cooldown has expired (or never
-    /// started). Order is preserved so the caller iterates in pool order.
-    fn available_relays(&self) -> Vec<String> {
+    /// Returns the current pool generation plus the subset of pool relays whose
+    /// cooldown has expired (or never started). Order is preserved so the caller
+    /// iterates in pool order. The generation is captured under the same critical
+    /// section so a put/get can detect a mid-attempt `set_relays` and drop stale
+    /// outcome writes (see `mark_cooldown` / `record_outcome`).
+    fn available_relays(&self) -> (u64, Vec<String>) {
         let now = Instant::now();
         let cd = self.cooldown.lock().expect("cooldown poisoned");
         let pool = self.pool.read().expect("relay pool poisoned");
-        pool.relays
+        let gen = self.generation.load(Ordering::Acquire);
+        let relays = pool
+            .relays
             .iter()
             .filter(|r| cd.get(r.as_str()).is_none_or(|expiry| *expiry <= now))
             .cloned()
-            .collect()
+            .collect();
+        (gen, relays)
     }
 
     /// Replace the relay pool live. Takes effect on the next `put`/`get`.
     ///
     /// Swaps the pool **first**, then prunes cooldown + records entries for relays
-    /// no longer present. Swap-first eliminates the "old pool still active but its
-    /// cooldown already pruned" intermediate window a concurrent `available_relays`
-    /// could otherwise observe (Qodo). Pruning then gives the settings-UI
-    /// remove-then-re-add flow a fresh relay rather than one silently skipped for
-    /// up to `config.cooldown`. In-flight requests that finish after the swap are
-    /// handled by the pool-membership guard in `mark_cooldown` / `record_outcome`,
-    /// which drop writes for relays no longer in the pool (so they cannot resurrect
-    /// a pruned entry — Cursor). Each lock is taken and released sequentially
-    /// (never two at once), so this adds no lock-ordering hazard.
+    /// no longer present, then bumps the generation. Swap-first eliminates the "old
+    /// pool still active but its cooldown already pruned" intermediate window a
+    /// concurrent `available_relays` could otherwise observe (Qodo). Pruning gives
+    /// the settings-UI remove-then-re-add flow a fresh relay rather than one silently
+    /// skipped for up to `config.cooldown`. The generation bump makes that airtight
+    /// under concurrency: a put/get that snapshotted the old pool will, on completion,
+    /// see the generation has changed and drop its cooldown/health writes, so an
+    /// in-flight request started before a remove→re-add can't resurrect the
+    /// re-added relay's state (Cursor, CodeRabbit). Each lock is taken and released
+    /// sequentially (never two at once), so this adds no lock-ordering hazard.
     pub fn set_relays(&self, relays: Vec<String>) {
         // Owned set so it outlives the `relays` move into the pool below (≤8
         // short strings — negligible clone).
@@ -330,39 +348,37 @@ impl RelayClient {
             .lock()
             .expect("records poisoned")
             .retain(|k, _| live.contains(k.as_str()));
+        // Invalidate any in-flight attempt that snapshotted the pre-swap pool.
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
-    /// True if `base` is in the current pool. Acquires the pool read-lock; callers
-    /// must NOT already hold it — `pool` is always acquired LAST so the global lock
-    /// order (cooldown → records → pool) stays acyclic.
-    fn pool_contains(&self, base: &str) -> bool {
-        self.pool
-            .read()
-            .expect("relay pool poisoned")
-            .relays
-            .iter()
-            .any(|r| r == base)
+    /// True if the pool has not been reconfigured since `gen` was captured. A put/get
+    /// passes the generation it snapshotted in `available_relays`; a mismatch means a
+    /// `set_relays` ran mid-attempt, so this attempt's outcome is stale and must be
+    /// dropped (else it could pollute a removed-then-re-added relay).
+    fn generation_current(&self, gen: u64) -> bool {
+        self.generation.load(Ordering::Acquire) == gen
     }
 
-    /// Put `base` into a cooldown for the configured duration. No-op if `base` is
-    /// no longer in the pool: an in-flight request can finish after a `set_relays`
-    /// dropped its relay, and must not resurrect a cooldown entry that re-add would
-    /// then inherit.
-    fn mark_cooldown(&self, base: &str) {
-        let mut cd = self.cooldown.lock().expect("cooldown poisoned");
-        if !self.pool_contains(base) {
+    /// Put `base` into a cooldown for the configured duration. No-op if the pool was
+    /// reconfigured since this attempt snapshotted it (`gen` stale) — an in-flight
+    /// request must not resurrect a cooldown entry that a remove→re-add would inherit.
+    fn mark_cooldown(&self, gen: u64, base: &str) {
+        if !self.generation_current(gen) {
             return;
         }
+        let mut cd = self.cooldown.lock().expect("cooldown poisoned");
         cd.insert(base.to_string(), Instant::now() + self.config.cooldown);
     }
 
-    /// Record the latest outcome for `base` (health observability). No-op if `base`
-    /// is no longer in the pool (same in-flight-after-swap guard as `mark_cooldown`).
-    fn record_outcome(&self, base: &str, outcome: RelayOutcome) {
-        let mut recs = self.records.lock().expect("records poisoned");
-        if !self.pool_contains(base) {
+    /// Record the latest outcome for `base` (health observability). No-op if the pool
+    /// was reconfigured since this attempt snapshotted it (same stale-attempt guard as
+    /// `mark_cooldown`).
+    fn record_outcome(&self, gen: u64, base: &str, outcome: RelayOutcome) {
+        if !self.generation_current(gen) {
             return;
         }
+        let mut recs = self.records.lock().expect("records poisoned");
         let rec = recs.entry(base.to_string()).or_default();
         rec.last_outcome = Some(outcome);
         if outcome == RelayOutcome::Success {
@@ -583,6 +599,63 @@ mod tests {
             bad_health.state,
             RelayState::Healthy,
             "re-added relay must be fresh, not inherit the stale cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_in_flight_outcome_dropped_after_pool_reconfig() {
+        // CodeRabbit (PR #274): an attempt that snapshotted the pool BEFORE a
+        // remove→re-add must not write its (now-stale) outcome onto the re-added
+        // relay. Bind a server that accepts but never responds, so a get() blocks
+        // until its 300ms timeout. While it's blocked, bump the generation by
+        // removing then re-adding the same url. When the get finally times out,
+        // its mark_cooldown/record_outcome must be dropped (generation mismatch),
+        // leaving the re-added relay Healthy with no recorded outcome.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let url = format!("http://127.0.0.1:{port}");
+        // Accept connections and hold them open without ever responding.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let cfg = RelayConfig {
+            request_timeout: Duration::from_millis(300),
+            cooldown: Duration::from_secs(30),
+        };
+        let client = std::sync::Arc::new(RelayClient::with_config(
+            RelayPool::new(vec![url.clone()]),
+            cfg,
+        ));
+
+        // Start a get; it snapshots generation 0, sends the request, and blocks.
+        let c2 = std::sync::Arc::clone(&client);
+        let handle = tokio::spawn(async move {
+            let _ = c2.get("k").await;
+        });
+
+        // Let the get capture its generation + send the request, then reconfigure
+        // the pool (remove → re-add the same url) so the generation moves on.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.set_relays(vec![]); // generation++
+        client.set_relays(vec![url.clone()]); // generation++, url back, fresh
+
+        let _ = handle.await; // get times out (~300ms) and tries to record — dropped
+
+        let h = &client.relay_health()[0];
+        assert_eq!(
+            h.state,
+            RelayState::Healthy,
+            "re-added relay must stay fresh — stale in-flight cooldown dropped"
+        );
+        assert_eq!(
+            h.last_outcome, None,
+            "stale in-flight outcome must not be recorded after pool reconfig"
         );
     }
 
