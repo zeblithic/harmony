@@ -260,10 +260,10 @@ impl RelayClient {
                     continue;
                 }
                 Ok(resp) => {
-                    // Other non-success status (e.g. 500): treat as transport
-                    // error — we can't confirm the key is absent. Mirror the
-                    // PUT path: mark cooldown so a misbehaving relay doesn't
-                    // get hammered with every GET.
+                    // Other non-success status (e.g. 500): we can't confirm the
+                    // key is absent. Mirror the PUT path's cooldown/skip handling
+                    // so a misbehaving relay isn't hammered with every GET — but
+                    // record the precise outcome as RelayOutcome::Http(status).
                     self.mark_cooldown(&base);
                     self.record_outcome(&base, RelayOutcome::Http(resp.status().as_u16()));
                     all_404 = false;
