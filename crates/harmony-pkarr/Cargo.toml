@@ -30,6 +30,9 @@ tracing = { workspace = true }
 hex = { workspace = true }
 lru = { workspace = true }
 futures = { workspace = true }
+pkarr = { workspace = true }
+base64 = { workspace = true, default-features = false, features = ["alloc"] }
+bytes = { workspace = true }
 
 # test-fixtures-only (optional):
 axum = { workspace = true, optional = true, default-features = false, features = ["tokio", "http1"] }
