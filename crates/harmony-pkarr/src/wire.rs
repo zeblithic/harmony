@@ -35,6 +35,40 @@ pub(crate) fn txt_string_to_routing_record(
     PkarrRoutingRecord::from_canonical_cbor(&cbor)
 }
 
+use ed25519_dalek::SigningKey;
+use pkarr::dns::rdata::TXT;
+use pkarr::dns::{CharacterString, Name};
+use pkarr::{Keypair, SignedPacket};
+
+/// Build the `(z-base-32 key, relay PUT payload)` for `record` signed under
+/// the ephemeral `signing_key`. Returns `RecordTooLarge` if the packet would
+/// exceed `SignedPacket::MAX_BYTES`.
+pub(crate) fn build_relay_payload(
+    signing_key: &SigningKey,
+    record: &PkarrRoutingRecord,
+) -> Result<(String, Vec<u8>), PkarrError> {
+    let keypair = Keypair::from_secret_key(&signing_key.to_bytes());
+    let b64 = routing_record_to_txt_string(record)?;
+
+    // Split the base64 payload into <=255-byte DNS character-strings.
+    let mut txt = TXT::new();
+    for chunk in b64.as_bytes().chunks(255) {
+        let cs = CharacterString::new(chunk)
+            .map_err(|_| PkarrError::SerializeError("txt char-string"))?;
+        txt.add_char_string(cs);
+    }
+
+    let name = Name::new(RECORD_LABEL).map_err(|_| PkarrError::SerializeError("txt name"))?;
+    // The only realistic failure for this fixed, valid single-TXT packet is
+    // exceeding SignedPacket::MAX_BYTES — map it to RecordTooLarge.
+    let signed = SignedPacket::builder()
+        .txt(name, txt, RECORD_TTL)
+        .sign(&keypair)
+        .map_err(|_| PkarrError::RecordTooLarge)?;
+
+    Ok((keypair.to_z32(), signed.to_relay_payload().to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +100,35 @@ mod tests {
     #[test]
     fn txt_string_rejects_garbage() {
         assert!(txt_string_to_routing_record("!!!not-base64!!!").is_err());
+    }
+
+    #[test]
+    fn build_produces_z32_and_payload() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let rec = sample_record();
+        let (z32, payload) = build_relay_payload(&sk, &rec).expect("build");
+        assert_eq!(z32.len(), 52, "z-base-32 ed25519 key is 52 chars");
+        assert!(!payload.is_empty());
+        assert!((payload.len() as u64) < pkarr::SignedPacket::MAX_BYTES);
+    }
+
+    #[test]
+    fn build_rejects_oversize_record() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&sk.verifying_key().to_bytes());
+        // routing_blob far over the ~1000-byte v budget once base64'd.
+        let big = crate::record::PkarrRoutingRecord::sign_new(
+            vec![0u8; 3000],
+            id_pub,
+            1_000_000,
+            &sk,
+        )
+        .expect("sign");
+        assert_eq!(
+            build_relay_payload(&sk, &big),
+            Err(PkarrError::RecordTooLarge)
+        );
     }
 }
 
