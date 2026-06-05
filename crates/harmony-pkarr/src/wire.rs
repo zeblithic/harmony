@@ -13,6 +13,7 @@ use crate::record::PkarrRoutingRecord;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use pkarr::dns::rdata::{RData, TXT};
 use pkarr::dns::{CharacterString, Name};
+use pkarr::errors::SignedPacketBuildError;
 use pkarr::{Keypair, PublicKey, SignedPacket};
 
 /// DNS label carrying the routing record's base64url payload.
@@ -56,12 +57,19 @@ pub(crate) fn build_relay_payload(
     }
 
     let name = Name::new(RECORD_LABEL).map_err(|_| PkarrError::SerializeError("txt name"))?;
-    // The only realistic failure for this fixed, valid single-TXT packet is
-    // exceeding SignedPacket::MAX_BYTES — map it to RecordTooLarge.
+    // Classify the build error honestly: an oversized routing_blob trips the
+    // 1000-byte DNS-packet budget (PacketTooLarge → RecordTooLarge); any other
+    // failure is a genuine encode bug, surfaced as SerializeError rather than
+    // masquerading as a size problem.
     let signed = SignedPacket::builder()
         .txt(name, txt, RECORD_TTL)
         .sign(&keypair)
-        .map_err(|_| PkarrError::RecordTooLarge)?;
+        .map_err(|e| match e {
+            SignedPacketBuildError::PacketTooLarge(_) => PkarrError::RecordTooLarge,
+            SignedPacketBuildError::FailedToWrite(_) => {
+                PkarrError::SerializeError("pkarr signed-packet build")
+            }
+        })?;
 
     Ok((keypair.to_z32(), signed.to_relay_payload().to_vec()))
 }

@@ -59,14 +59,16 @@ impl PkarrResolver {
                 Ok(None)
             }
             Some(envelope) => {
-                // RPK1: outer sig failure → silent-drop (cache negative).
+                // Outer-sig failure (RPK1) OR malformed record (bad TXT/base64/
+                // CBOR) → silent-drop (cache negative). The error field carries
+                // the specific cause.
                 let record = match crate::wire::parse_relay_payload(&pk_bytes, &envelope) {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(
                             key = %key_z32,
                             error = ?e,
-                            "pkarr envelope failed outer verification — dropping (RPK1)"
+                            "pkarr relay payload rejected — bad outer signature (RPK1) or malformed record; see error field — dropping"
                         );
                         self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
                         return Ok(None);

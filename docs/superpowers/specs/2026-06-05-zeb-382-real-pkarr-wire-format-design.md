@@ -32,7 +32,7 @@ Both gates produce the identical user-facing symptom: `RelayClient::get()` maps 
 
 ## 3. Approach
 
-**Adopt the upstream `pkarr` crate (v6.0.1) as a no-network wire-format codec, and keep our own relay HTTP client.**
+**Adopt the upstream `pkarr` crate (3.10.0) as a no-network wire-format codec, and keep our own relay HTTP client.**
 
 We use `pkarr` *only* for: deriving the z-base-32 key, building/signing the BEP44 `SignedPacket` (correct big-endian seq + DNS-packet `v`), and serializing/parsing the relay payload. We keep `harmony-pkarr::relay::RelayClient` (our reqwest client carrying the ZEB-381 webpki fix, the relay pool, and the 30 s cooldown) to perform the actual HTTP PUT/GET.
 
@@ -42,7 +42,7 @@ The root cause is a pure **serialization** defect. The minimal correct fix repla
 
 ### 3.2 Alternatives rejected
 
-- **B — adopt pkarr's full relay `Client`.** Rejected. `pkarr::ClientBuilder` (v6.0.1) exposes **no** way to inject a custom `reqwest::Client`, TLS config, or extra roots (verified: the full builder method set has no such hook). It would therefore **discard the ZEB-381 webpki fix** with no override, re-inheriting the same platform-verifier TLS family that blocked us — and would demand a fresh cross-platform TLS spike plus a second `reqwest`/`url`/`futures-buffered` in the tree, for less control.
+- **B — adopt pkarr's full relay `Client`.** Rejected. `pkarr::ClientBuilder` (3.10.0) exposes **no** way to inject a custom `reqwest::Client`, TLS config, or extra roots (verified: the full builder method set has no such hook). It would therefore **discard the ZEB-381 webpki fix** with no override, re-inheriting the same platform-verifier TLS family that blocked us — and would demand a fresh cross-platform TLS spike plus a second `reqwest`/`url`/`futures-buffered` in the tree, for less control.
 - **C — hand-roll real pkarr (no crate).** Rejected. Re-implements audited, security-sensitive wire code (z-base-32, BEP44, DNS-packet encode/decode) for zero benefit now that the codec is a public one-liner.
 
 ### 3.3 Decentralization posture (scope boundary)
@@ -53,7 +53,7 @@ ZEB-382 stays **relay-only**, matching the current architecture. The single-rela
 
 The public API of `harmony-pkarr` is unchanged. Only the bytes on the wire change.
 
-```
+```text
 PUBLISH:
   derive_ephemeral_key(case, ikm, info)         // derive.rs — UNCHANGED → ed25519_dalek::SigningKey
     -> Keypair::from_secret_key(&signing.to_bytes())   // pkarr; same ed25519 pubkey
