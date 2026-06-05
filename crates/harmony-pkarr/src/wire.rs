@@ -95,14 +95,22 @@ pub(crate) fn z32_for_verifying_key(pk: &VerifyingKey) -> Result<String, PkarrEr
     Ok(pk.to_z32())
 }
 
-/// Read the concatenated base64 string from the `_r` TXT record.
+/// Read the concatenated base64 string from the single `_r` TXT record.
+///
+/// The wire format defines exactly one `_r` record; a packet carrying more
+/// than one is rejected as malformed rather than silently resolving to the
+/// first (which would make payload interpretation order-dependent).
 fn read_record_txt(signed: &SignedPacket) -> Result<String, PkarrError> {
+    let mut found: Option<String> = None;
     for rr in signed.resource_records(RECORD_LABEL) {
         if let RData::TXT(txt) = &rr.rdata {
-            return String::try_from(txt.clone()).map_err(|_| PkarrError::InvalidRecord);
+            let value = String::try_from(txt.clone()).map_err(|_| PkarrError::InvalidRecord)?;
+            if found.replace(value).is_some() {
+                return Err(PkarrError::InvalidRecord);
+            }
         }
     }
-    Err(PkarrError::InvalidRecord)
+    found.ok_or(PkarrError::InvalidRecord)
 }
 
 #[cfg(test)]
@@ -122,6 +130,30 @@ mod tests {
             &sk,
         )
         .expect("sign record")
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_r_txt() {
+        use pkarr::dns::rdata::TXT;
+        use pkarr::dns::{CharacterString, Name};
+        use pkarr::{Keypair, SignedPacket};
+
+        // A packet carrying TWO `_r` TXT records is malformed for this format.
+        let kp = Keypair::from_secret_key(&[8u8; 32]);
+        let mut txt1 = TXT::new();
+        txt1.add_char_string(CharacterString::new(b"AAAA").unwrap());
+        let mut txt2 = TXT::new();
+        txt2.add_char_string(CharacterString::new(b"BBBB").unwrap());
+        let signed = SignedPacket::builder()
+            .txt(Name::new("_r").unwrap(), txt1, 300)
+            .txt(Name::new("_r").unwrap(), txt2, 300)
+            .sign(&kp)
+            .expect("sign");
+        let payload = signed.to_relay_payload().to_vec();
+        assert_eq!(
+            parse_relay_payload(&kp.public_key().to_bytes(), &payload),
+            Err(PkarrError::InvalidRecord)
+        );
     }
 
     #[test]
