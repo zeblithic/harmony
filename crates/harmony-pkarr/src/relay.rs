@@ -307,9 +307,22 @@ impl RelayClient {
 
     /// Replace the relay pool live. Takes effect on the next `put`/`get`.
     ///
-    /// Cooldown entries keyed on a now-removed relay simply never match a live
-    /// relay again and age out — harmless, no explicit pruning needed.
+    /// Prunes cooldown + records entries for relays no longer in the new pool.
+    /// Without this, removing a relay that is on cooldown and then re-adding it
+    /// (the settings-UI "fix a misconfigured relay and re-add" flow) would leave
+    /// it silently skipped for up to `config.cooldown` after re-add. Each lock is
+    /// acquired and released sequentially (never two at once), so this introduces
+    /// no lock-ordering hazard with `relay_health`.
     pub fn set_relays(&self, relays: Vec<String>) {
+        let live: std::collections::HashSet<&str> = relays.iter().map(String::as_str).collect();
+        self.cooldown
+            .lock()
+            .expect("cooldown poisoned")
+            .retain(|k, _| live.contains(k.as_str()));
+        self.records
+            .lock()
+            .expect("records poisoned")
+            .retain(|k, _| live.contains(k.as_str()));
         *self.pool.write().expect("relay pool poisoned") = RelayPool::new(relays);
     }
 
@@ -460,20 +473,13 @@ mod tests {
 
     #[tokio::test]
     async fn relay_health_reflects_cooldown_after_transport_failure() {
-        // A closed loopback port yields an immediate connection-refused — a
-        // non-timeout transport failure. (TEST-NET-1 192.0.2.1 is unrouted, so
-        // packets are silently dropped and the attempt times out instead — that
-        // path is `Timeout`, exercised separately below.) Bind a listener to grab
-        // a free port, then drop it so the port is closed before we connect.
-        let port = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind ephemeral");
-            listener.local_addr().expect("local_addr").port()
-            // listener dropped here → port closed → connect() gets ECONNREFUSED
-        };
-        let client = RelayClient::new(RelayPool::new(vec![format!("http://127.0.0.1:{port}")]));
-        let _ = client.get("k").await; // trips cooldown on the unreachable relay
+        // 127.0.0.1:1 — nothing listens on port 1, so a loopback connect gets an
+        // immediate RST (ECONNREFUSED): a non-timeout transport failure. Race-free
+        // (we never bind the port, so there's no bind-then-drop reuse window).
+        // (TEST-NET-1 192.0.2.1 is unrouted → packets dropped → the attempt times
+        // out instead; that `Timeout` path is exercised separately below.)
+        let client = RelayClient::new(RelayPool::new(vec!["http://127.0.0.1:1".to_string()]));
+        let _ = client.get("k").await; // connection refused → cooldown
         let h = &client.relay_health()[0];
         match h.state {
             RelayState::CoolingDown { until_ms } => assert!(until_ms > 0),
@@ -513,6 +519,43 @@ mod tests {
         let health = client.relay_health();
         assert_eq!(health.len(), 1);
         assert_eq!(health[0].url, relay_b.base_url);
+    }
+
+    #[tokio::test]
+    async fn set_relays_prunes_cooldown_for_removed_relay_so_readd_is_fresh() {
+        // Settings-UI flow: a relay is cooling down; the user removes it (a
+        // set_relays call that drops it from the pool), then re-adds it (a second
+        // set_relays call). Removal must prune the stale cooldown so the re-added
+        // relay is immediately Healthy rather than silently skipped for ~cooldown.
+        let healthy = MockPkarrRelay::start().await;
+        let bad = "http://127.0.0.1:1".to_string(); // refused → cooldown
+        let client = RelayClient::new(RelayPool::new(vec![bad.clone(), healthy.base_url.clone()]));
+        let _ = client.get("k").await; // bad tried first → cooldown; healthy 404s
+        let bad_health = client
+            .relay_health()
+            .into_iter()
+            .find(|r| r.url == bad)
+            .expect("bad relay present");
+        assert!(
+            matches!(bad_health.state, RelayState::CoolingDown { .. }),
+            "bad relay should be cooling down after a refused connection"
+        );
+
+        // Remove `bad` (pool = just the healthy relay) → prunes bad's cooldown.
+        client.set_relays(vec![healthy.base_url.clone()]);
+        // Re-add `bad`.
+        client.set_relays(vec![healthy.base_url.clone(), bad.clone()]);
+
+        let bad_health = client
+            .relay_health()
+            .into_iter()
+            .find(|r| r.url == bad)
+            .expect("bad relay re-added");
+        assert_eq!(
+            bad_health.state,
+            RelayState::Healthy,
+            "re-added relay must be fresh, not inherit the stale cooldown"
+        );
     }
 
     #[tokio::test]
