@@ -27,10 +27,16 @@ use axum::{
     Router,
 };
 
-/// In-memory BEP44 store. Key is the z-base-32-encoded public key string
-/// (as it appears in the URL path). Value is the raw envelope bytes
-/// (whatever the client PUT).
+/// In-memory store keyed by the URL path key (z-base-32 in strict mode).
 type Store = Arc<RwLock<HashMap<String, Vec<u8>>>>;
+
+#[derive(Clone)]
+struct MockState {
+    store: Store,
+    /// When true, PUT validates the z32 key + BEP44 signature and returns 400
+    /// for anything that is not a real pkarr relay payload.
+    strict: bool,
+}
 
 /// Handle to a running mock relay. Drop to stop the server.
 pub struct MockPkarrRelay {
@@ -41,12 +47,26 @@ pub struct MockPkarrRelay {
 }
 
 impl MockPkarrRelay {
-    /// Start a fresh mock relay on a random localhost port.
+    /// Start a lax mock (stores whatever is PUT). For relay-pool/cooldown tests.
     pub async fn start() -> Self {
-        let store: Store = Arc::new(RwLock::new(HashMap::new()));
+        Self::start_inner(false).await
+    }
+
+    /// Start a strict mock that validates the real pkarr relay format on PUT
+    /// (z-base-32 key + `from_relay_payload` signature check). Rejects the old
+    /// in-house dialect with 400.
+    pub async fn start_strict() -> Self {
+        Self::start_inner(true).await
+    }
+
+    async fn start_inner(strict: bool) -> Self {
+        let state = MockState {
+            store: Arc::new(RwLock::new(HashMap::new())),
+            strict,
+        };
         let app = Router::new()
             .route("/{key}", put(put_record).get(get_record))
-            .with_state(store);
+            .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
@@ -85,15 +105,27 @@ impl Drop for MockPkarrRelay {
 
 async fn put_record(
     Path(key): Path<String>,
-    State(store): State<Store>,
+    State(state): State<MockState>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    store.write().await.insert(key, body.to_vec());
+    if state.strict {
+        let Ok(pk) = pkarr::PublicKey::try_from(key.as_str()) else {
+            return StatusCode::BAD_REQUEST;
+        };
+        let payload = bytes::Bytes::copy_from_slice(&body);
+        if pkarr::SignedPacket::from_relay_payload(&pk, &payload).is_err() {
+            return StatusCode::BAD_REQUEST;
+        }
+    }
+    state.store.write().await.insert(key, body.to_vec());
     StatusCode::OK
 }
 
-async fn get_record(Path(key): Path<String>, State(store): State<Store>) -> impl IntoResponse {
-    match store.read().await.get(&key) {
+async fn get_record(
+    Path(key): Path<String>,
+    State(state): State<MockState>,
+) -> impl IntoResponse {
+    match state.store.read().await.get(&key) {
         Some(bytes) => (StatusCode::OK, bytes.clone()).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -137,5 +169,19 @@ mod tests {
             .await
             .expect("get request");
         assert_eq!(get_resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn strict_relay_rejects_non_pkarr_bytes() {
+        let relay = MockPkarrRelay::start_strict().await;
+        let client = reqwest::Client::new();
+        // Non-z32 key + garbage body → 400.
+        let resp = client
+            .put(format!("{}/not-a-real-key", relay.base_url))
+            .body(b"in-house-bytes".to_vec())
+            .send()
+            .await
+            .expect("put");
+        assert_eq!(resp.status(), 400);
     }
 }
