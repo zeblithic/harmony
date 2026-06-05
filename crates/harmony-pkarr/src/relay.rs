@@ -8,7 +8,7 @@
 //! (failure-modes table).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::error::PkarrError;
@@ -65,7 +65,10 @@ impl RelayPool {
 /// Construct with [`RelayClient::new`] and call [`put`][RelayClient::put] /
 /// [`get`][RelayClient::get] from async contexts.
 pub struct RelayClient {
-    pool: RelayPool,
+    /// Hot-swappable relay pool. Read-mostly (every put/get takes a short read
+    /// lock); replaced wholesale by `set_relays`. `std::sync::RwLock` keeps the
+    /// crate dependency-free (no `arc-swap`).
+    pool: RwLock<RelayPool>,
     http: reqwest::Client,
     config: RelayConfig,
     /// Maps relay base URL → `Instant` at which the cooldown expires.
@@ -92,7 +95,7 @@ impl RelayClient {
             .build()
             .expect("reqwest client build should never fail with default settings");
         Self {
-            pool,
+            pool: RwLock::new(pool),
             http,
             config,
             cooldown: Mutex::new(HashMap::new()),
@@ -211,12 +214,20 @@ impl RelayClient {
     fn available_relays(&self) -> Vec<String> {
         let now = Instant::now();
         let cd = self.cooldown.lock().expect("cooldown poisoned");
-        self.pool
-            .relays
+        let pool = self.pool.read().expect("relay pool poisoned");
+        pool.relays
             .iter()
             .filter(|r| cd.get(r.as_str()).is_none_or(|expiry| *expiry <= now))
             .cloned()
             .collect()
+    }
+
+    /// Replace the relay pool live. Takes effect on the next `put`/`get`.
+    ///
+    /// Cooldown entries keyed on a now-removed relay simply never match a live
+    /// relay again and age out — harmless, no explicit pruning needed.
+    pub fn set_relays(&self, relays: Vec<String>) {
+        *self.pool.write().expect("relay pool poisoned") = RelayPool::new(relays);
     }
 
     /// Put `base` into a cooldown for the configured duration.
@@ -279,5 +290,27 @@ mod tests {
         let cfg = RelayConfig::default();
         assert_eq!(cfg.request_timeout, Duration::from_secs(5));
         assert_eq!(cfg.cooldown, Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn set_relays_takes_effect_mid_flight() {
+        // Publish to pool A (relay_a), then swap the pool to relay_b and confirm
+        // the next get hits relay_b (which has the record) — proving the swap is live.
+        let relay_a = MockPkarrRelay::start().await;
+        let relay_b = MockPkarrRelay::start().await;
+
+        let client = RelayClient::new(RelayPool::new(vec![relay_a.base_url.clone()]));
+        client.put("k1", b"in-a").await.expect("put to A");
+
+        // Swap pool to B (which does NOT have k1 yet).
+        client.set_relays(vec![relay_b.base_url.clone()]);
+        assert_eq!(client.get("k1").await.expect("get from B"), None); // B has no k1
+
+        // Publish to B via the swapped pool, then read it back from B.
+        client.put("k1", b"in-b").await.expect("put to B");
+        assert_eq!(
+            client.get("k1").await.expect("get from B"),
+            Some(b"in-b".to_vec())
+        );
     }
 }
