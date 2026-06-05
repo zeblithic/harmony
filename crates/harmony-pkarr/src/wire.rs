@@ -198,6 +198,37 @@ mod tests {
         let (z32, _payload) = build_relay_payload(&sk, &rec).expect("build");
         assert_eq!(z32_for_verifying_key(&sk.verifying_key()).unwrap(), z32);
     }
+
+    /// Live round-trip against the public relay. Ignored by default; run with:
+    ///   HARMONY_PKARR_LIVE_RELAY=1 cargo nextest run -p harmony-pkarr \
+    ///     --run-ignored all wire::tests::live_relay_round_trip
+    #[tokio::test]
+    #[ignore = "hits relay.pkarr.org; set HARMONY_PKARR_LIVE_RELAY=1 to run"]
+    async fn live_relay_round_trip() {
+        if std::env::var("HARMONY_PKARR_LIVE_RELAY").is_err() {
+            return;
+        }
+        use crate::relay::{RelayClient, RelayPool};
+
+        let relay = RelayClient::new(RelayPool::new(vec![
+            "https://relay.pkarr.org".to_string(),
+        ]));
+        let ephemeral = SigningKey::generate(&mut OsRng);
+        let rec = sample_record();
+        let (z32, payload) = build_relay_payload(&ephemeral, &rec).expect("build");
+
+        relay.put(&z32, &payload).await.expect("publish to live relay");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let got = relay
+            .get(&z32)
+            .await
+            .expect("get from live relay")
+            .expect("record present on relay");
+        let parsed =
+            parse_relay_payload(&ephemeral.verifying_key().to_bytes(), &got).expect("parse");
+        assert_eq!(parsed, rec);
+    }
 }
 
 #[cfg(test)]
