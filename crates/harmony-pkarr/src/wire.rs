@@ -69,6 +69,41 @@ pub(crate) fn build_relay_payload(
     Ok((keypair.to_z32(), signed.to_relay_payload().to_vec()))
 }
 
+use ed25519_dalek::VerifyingKey;
+use pkarr::dns::rdata::RData;
+use pkarr::PublicKey;
+
+/// Parse + outer-verify a relay GET payload back into a routing record.
+/// Verifies the BEP44 (ephemeral-key) signature against `expected_pk`; does
+/// NOT verify the inner identity signature — the caller does that.
+pub(crate) fn parse_relay_payload(
+    expected_pk: &[u8; 32],
+    payload: &[u8],
+) -> Result<PkarrRoutingRecord, PkarrError> {
+    let pk = PublicKey::try_from(expected_pk).map_err(|_| PkarrError::InvalidRecord)?;
+    let bytes = bytes::Bytes::copy_from_slice(payload);
+    let signed = SignedPacket::from_relay_payload(&pk, &bytes)
+        .map_err(|_| PkarrError::OuterSignatureInvalid)?;
+    let txt = read_record_txt(&signed)?;
+    txt_string_to_routing_record(&txt)
+}
+
+/// z-base-32 string for an ed25519 verifying key (the relay GET URL key).
+pub(crate) fn z32_for_verifying_key(pk: &VerifyingKey) -> Result<String, PkarrError> {
+    let pk = PublicKey::try_from(&pk.to_bytes()).map_err(|_| PkarrError::InvalidRecord)?;
+    Ok(pk.to_z32())
+}
+
+/// Read the concatenated base64 string from the `_r` TXT record.
+fn read_record_txt(signed: &SignedPacket) -> Result<String, PkarrError> {
+    for rr in signed.resource_records(RECORD_LABEL) {
+        if let RData::TXT(txt) = &rr.rdata {
+            return String::try_from(txt.clone()).map_err(|_| PkarrError::InvalidRecord);
+        }
+    }
+    Err(PkarrError::InvalidRecord)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +164,48 @@ mod tests {
             build_relay_payload(&sk, &big),
             Err(PkarrError::RecordTooLarge)
         );
+    }
+
+    #[test]
+    fn build_then_parse_round_trips() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let rec = sample_record();
+        let (_z32, payload) = build_relay_payload(&sk, &rec).expect("build");
+        let parsed =
+            parse_relay_payload(&sk.verifying_key().to_bytes(), &payload).expect("parse");
+        assert_eq!(parsed, rec);
+    }
+
+    #[test]
+    fn parse_rejects_tampered_payload() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let rec = sample_record();
+        let (_z32, mut payload) = build_relay_payload(&sk, &rec).expect("build");
+        payload[0] ^= 0xFF; // corrupt the signature
+        assert_eq!(
+            parse_relay_payload(&sk.verifying_key().to_bytes(), &payload),
+            Err(PkarrError::OuterSignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn parse_rejects_wrong_pubkey() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let other = SigningKey::generate(&mut OsRng);
+        let rec = sample_record();
+        let (_z32, payload) = build_relay_payload(&sk, &rec).expect("build");
+        assert_eq!(
+            parse_relay_payload(&other.verifying_key().to_bytes(), &payload),
+            Err(PkarrError::OuterSignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn z32_matches_build() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let rec = sample_record();
+        let (z32, _payload) = build_relay_payload(&sk, &rec).expect("build");
+        assert_eq!(z32_for_verifying_key(&sk.verifying_key()).unwrap(), z32);
     }
 }
 
