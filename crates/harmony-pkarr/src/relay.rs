@@ -62,6 +62,13 @@ impl RelayClient {
     pub fn new(pool: RelayPool) -> Self {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            // ZEB-381: trust Mozilla's webpki root bundle in addition to OS-native
+            // roots. `rustls-tls-native-roots` alone failed to anchor relay.pkarr.org's
+            // Let's Encrypt chain — InvalidCertificate(UnknownIssuer) — on BOTH macOS
+            // and Windows, breaking every pkarr publish/resolve and thus every
+            // first-contact invite redeem. webpki roots carry ISRG Root X1/X2 and
+            // validate the chain; native stays enabled for any private/enterprise roots.
+            .tls_built_in_webpki_certs(true)
             .build()
             .expect("reqwest client build should never fail with default settings");
         Self {
