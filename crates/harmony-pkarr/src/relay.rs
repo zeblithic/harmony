@@ -324,61 +324,53 @@ impl RelayClient {
 
     /// Replace the relay pool live. Takes effect on the next `put`/`get`.
     ///
-    /// Swaps the pool **first**, then prunes cooldown + records entries for relays
-    /// no longer present, then bumps the generation. Swap-first eliminates the "old
-    /// pool still active but its cooldown already pruned" intermediate window a
-    /// concurrent `available_relays` could otherwise observe (Qodo). Pruning gives
-    /// the settings-UI remove-then-re-add flow a fresh relay rather than one silently
-    /// skipped for up to `config.cooldown`. The generation bump makes that airtight
-    /// under concurrency: a put/get that snapshotted the old pool will, on completion,
-    /// see the generation has changed and drop its cooldown/health writes, so an
-    /// in-flight request started before a remove→re-add can't resurrect the
-    /// re-added relay's state (Cursor, CodeRabbit). Each lock is taken and released
-    /// sequentially (never two at once), so this adds no lock-ordering hazard.
+    /// Acquires all three locks in the **canonical order** `cooldown → records →
+    /// pool` — the exact order `relay_health` and `available_relays` use — then
+    /// swaps the pool, prunes cooldown/records to the new set, and bumps the
+    /// generation, all while holding them. A single global lock order is the
+    /// textbook deadlock-free invariant (no path ever acquires these in a
+    /// conflicting order). Holding all three also makes the reconfiguration
+    /// **atomic** w.r.t. (a) health polls — no observable "swapped pool but
+    /// stale cooldown" intermediate (Qodo), and (b) put/get outcome writes, which
+    /// re-check the generation under the cooldown/records lock — so an in-flight
+    /// request that snapshotted the old pool is reliably dropped and can't
+    /// resurrect a removed-then-re-added relay's state (Cursor, CodeRabbit).
     pub fn set_relays(&self, relays: Vec<String>) {
         // Owned set so it outlives the `relays` move into the pool below (≤8
         // short strings — negligible clone).
         let live: std::collections::HashSet<String> = relays.iter().cloned().collect();
-        *self.pool.write().expect("relay pool poisoned") = RelayPool::new(relays);
-        self.cooldown
-            .lock()
-            .expect("cooldown poisoned")
-            .retain(|k, _| live.contains(k.as_str()));
-        self.records
-            .lock()
-            .expect("records poisoned")
-            .retain(|k, _| live.contains(k.as_str()));
-        // Invalidate any in-flight attempt that snapshotted the pre-swap pool.
+        let mut cd = self.cooldown.lock().expect("cooldown poisoned");
+        let mut recs = self.records.lock().expect("records poisoned");
+        let mut pool = self.pool.write().expect("relay pool poisoned");
+        *pool = RelayPool::new(relays);
+        cd.retain(|k, _| live.contains(k.as_str()));
+        recs.retain(|k, _| live.contains(k.as_str()));
+        // Bump while still holding cooldown+records so a concurrent outcome write
+        // (which re-checks the generation under those locks) can't straddle it.
         self.generation.fetch_add(1, Ordering::Release);
-    }
-
-    /// True if the pool has not been reconfigured since `gen` was captured. A put/get
-    /// passes the generation it snapshotted in `available_relays`; a mismatch means a
-    /// `set_relays` ran mid-attempt, so this attempt's outcome is stale and must be
-    /// dropped (else it could pollute a removed-then-re-added relay).
-    fn generation_current(&self, gen: u64) -> bool {
-        self.generation.load(Ordering::Acquire) == gen
     }
 
     /// Put `base` into a cooldown for the configured duration. No-op if the pool was
     /// reconfigured since this attempt snapshotted it (`gen` stale) — an in-flight
     /// request must not resurrect a cooldown entry that a remove→re-add would inherit.
+    /// The generation is re-checked UNDER the cooldown lock (which `set_relays` also
+    /// holds while bumping), so the check and the insert can't straddle a reconfig.
     fn mark_cooldown(&self, gen: u64, base: &str) {
-        if !self.generation_current(gen) {
+        let mut cd = self.cooldown.lock().expect("cooldown poisoned");
+        if self.generation.load(Ordering::Acquire) != gen {
             return;
         }
-        let mut cd = self.cooldown.lock().expect("cooldown poisoned");
         cd.insert(base.to_string(), Instant::now() + self.config.cooldown);
     }
 
     /// Record the latest outcome for `base` (health observability). No-op if the pool
-    /// was reconfigured since this attempt snapshotted it (same stale-attempt guard as
-    /// `mark_cooldown`).
+    /// was reconfigured since this attempt snapshotted it (same under-lock generation
+    /// guard as `mark_cooldown`).
     fn record_outcome(&self, gen: u64, base: &str, outcome: RelayOutcome) {
-        if !self.generation_current(gen) {
+        let mut recs = self.records.lock().expect("records poisoned");
+        if self.generation.load(Ordering::Acquire) != gen {
             return;
         }
-        let mut recs = self.records.lock().expect("records poisoned");
         let rec = recs.entry(base.to_string()).or_default();
         rec.last_outcome = Some(outcome);
         if outcome == RelayOutcome::Success {
