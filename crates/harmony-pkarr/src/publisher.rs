@@ -212,10 +212,8 @@ impl PkarrPublisher {
         // key while resolvers queried under the current epoch ± tolerance.
         let ephemeral_key = (pub_state.ephemeral_key_builder)(now);
         let record = (pub_state.builder)(now);
-        let cbor = record.to_canonical_cbor()?;
-        let envelope = wrap_bep44_envelope(&ephemeral_key, &cbor, now)?;
-        let key_z32 = z32_encode_public(&ephemeral_key.verifying_key().to_bytes());
-        self.relay.put(&key_z32, &envelope).await
+        let (key_z32, payload) = crate::wire::build_relay_payload(&ephemeral_key, &record)?;
+        self.relay.put(&key_z32, &payload).await
     }
 
     async fn next_wakeup(&self) -> tokio::time::Instant {
@@ -262,50 +260,6 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Build a BEP44 envelope using the simple in-house wire format for
-/// mock-relay testing:
-///
-/// ```text
-/// envelope = sig(64 bytes) ‖ seq(8 bytes, LE u64) ‖ payload(N bytes)
-/// ```
-///
-/// The signature covers the BEP44 v=0 salt:
-/// `"3:seqi{seq}e1:v{len}:{payload}"`.
-///
-/// `seq` is milliseconds since Unix epoch as `u64` — avoids the ~49.7-day
-/// wrap that a `u32` cast would introduce.
-///
-/// This is the format the companion `PkarrResolver` decodes.
-/// Real pkarr-relay bencoded compatibility is Phase 3 hardening.
-fn wrap_bep44_envelope(
-    ephemeral_key: &SigningKey,
-    payload: &[u8],
-    seq: u64,
-) -> Result<Vec<u8>, PkarrError> {
-    use ed25519_dalek::Signer;
-    // BEP44 v=0 sign material (same as real pkarr relays expect).
-    let mut to_sign = Vec::new();
-    to_sign.extend_from_slice(format!("3:seqi{}e1:v{}:", seq, payload.len()).as_bytes());
-    to_sign.extend_from_slice(payload);
-    let sig = ephemeral_key.sign(&to_sign);
-
-    // Envelope: sig(64) ‖ seq(8 LE u64) ‖ payload.
-    let mut envelope = Vec::with_capacity(64 + 8 + payload.len());
-    envelope.extend_from_slice(&sig.to_bytes());
-    envelope.extend_from_slice(&seq.to_le_bytes());
-    envelope.extend_from_slice(payload);
-    Ok(envelope)
-}
-
-/// Encode a 32-byte Ed25519 public key as a string for use in relay URL paths.
-///
-/// Uses lowercase hex for now — the mock relay (Task 5) accepts arbitrary
-/// strings. Phase 3 hardening will replace this with real z-base-32 (e.g.,
-/// the `zbase32` crate) for production pkarr-relay interop.
-fn z32_encode_public(pk: &[u8; 32]) -> String {
-    hex::encode(pk)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,7 +276,7 @@ mod tests {
         let _handle = Arc::clone(&publisher).spawn();
 
         let ephemeral = SigningKey::generate(&mut OsRng);
-        let pk_hex = hex::encode(ephemeral.verifying_key().to_bytes());
+        let pk_z32 = crate::wire::z32_for_verifying_key(&ephemeral.verifying_key()).expect("z32");
         let ephemeral_for_builder = ephemeral.clone();
         let key_builder: EphemeralKeyBuilder = Arc::new(move |_| ephemeral_for_builder.clone());
 
@@ -348,17 +302,13 @@ mod tests {
         let mut retries = 0;
         while retries < 50 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let resp = reqwest::get(format!("{}/{}", relay.base_url, pk_hex))
+            let resp = reqwest::get(format!("{}/{}", relay.base_url, pk_z32))
                 .await
                 .expect("http get");
             if resp.status() == 200 {
                 let body = resp.bytes().await.expect("body");
-                // Envelope = 64-byte sig + 8-byte seq (u64 LE) + CBOR payload (>= ~70 bytes).
-                assert!(
-                    body.len() > 64 + 8,
-                    "envelope too short: {} bytes",
-                    body.len()
-                );
+                // Real pkarr relay payload is non-empty (sig + seq + DNS packet).
+                assert!(!body.is_empty(), "payload should be non-empty");
                 return;
             }
             retries += 1;
@@ -418,8 +368,8 @@ mod tests {
         // subsequent calls so we can verify both surfaces appear on the relay.
         let key_a = SigningKey::generate(&mut OsRng);
         let key_b = SigningKey::generate(&mut OsRng);
-        let pk_a_hex = hex::encode(key_a.verifying_key().to_bytes());
-        let pk_b_hex = hex::encode(key_b.verifying_key().to_bytes());
+        let pk_a_z32 = crate::wire::z32_for_verifying_key(&key_a.verifying_key()).expect("z32 a");
+        let pk_b_z32 = crate::wire::z32_for_verifying_key(&key_b.verifying_key()).expect("z32 b");
         let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let call_count_clone = Arc::clone(&call_count);
         let key_a_clone = key_a.clone();
@@ -457,7 +407,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             tries += 1;
             assert!(tries < 60, "first publish (key_a) did not land");
-            let resp = reqwest::get(format!("{}/{}", relay.base_url, pk_a_hex))
+            let resp = reqwest::get(format!("{}/{}", relay.base_url, pk_a_z32))
                 .await
                 .expect("http get");
             if resp.status() == 200 {
@@ -504,7 +454,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             tries += 1;
             assert!(tries < 60, "second publish (key_b) did not land");
-            let resp = reqwest::get(format!("{}/{}", relay.base_url, pk_b_hex))
+            let resp = reqwest::get(format!("{}/{}", relay.base_url, pk_b_z32))
                 .await
                 .expect("http get");
             if resp.status() == 200 {
@@ -519,5 +469,51 @@ mod tests {
             call_count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
             "builder must be invoked on every publish, not just at register"
         );
+    }
+
+    #[tokio::test]
+    async fn publishes_real_pkarr_payload_to_strict_mock() {
+        let relay = MockPkarrRelay::start_strict().await;
+        let client = Arc::new(crate::relay::RelayClient::new(
+            crate::relay::RelayPool::new(vec![relay.base_url.clone()]),
+        ));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+
+        let id_sk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&id_sk.verifying_key().to_bytes());
+        let id_sk_for_builder = id_sk.clone();
+
+        publisher
+            .register(
+                "h1".to_string(),
+                Arc::new(|_now| ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])),
+                Arc::new(move |now| {
+                    crate::record::PkarrRoutingRecord::sign_new(
+                        b"routing".to_vec(),
+                        id_pub,
+                        now,
+                        &id_sk_for_builder,
+                    )
+                    .expect("sign record")
+                }),
+            )
+            .await;
+
+        let handle = Arc::clone(&publisher).spawn();
+        // Give the background loop time to publish once.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        handle.abort();
+
+        // Strict mock accepted the PUT → the payload is real pkarr format.
+        let ephemeral = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let z32 = crate::wire::z32_for_verifying_key(&ephemeral.verifying_key()).unwrap();
+        let client2 = reqwest::Client::new();
+        let got = client2
+            .get(format!("{}/{}", relay.base_url, z32))
+            .send()
+            .await
+            .expect("get");
+        assert_eq!(got.status(), 200);
     }
 }

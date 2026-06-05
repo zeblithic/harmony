@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use futures::future::join_all;
 use lru::LruCache;
 
@@ -52,21 +52,23 @@ impl PkarrResolver {
         if let Some(cached) = self.cache_get(&pk_bytes) {
             return Ok(cached.record.clone());
         }
-        let key_z32 = hex::encode(pk_bytes);
+        let key_z32 = crate::wire::z32_for_verifying_key(pk)?;
         match self.relay.get(&key_z32).await? {
             None => {
                 self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
                 Ok(None)
             }
             Some(envelope) => {
-                // RPK1: outer sig failure → silent-drop (cache negative).
-                let record = match parse_and_verify(&envelope, pk) {
+                // Outer-sig failure (RPK1) OR malformed record (bad TXT/base64/
+                // CBOR) → silent-drop (cache negative). The error field carries
+                // the specific cause.
+                let record = match crate::wire::parse_relay_payload(&pk_bytes, &envelope) {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(
                             key = %key_z32,
                             error = ?e,
-                            "pkarr envelope failed outer verification — dropping (RPK1)"
+                            "pkarr relay payload rejected — bad outer signature (RPK1) or malformed record; see error field — dropping"
                         );
                         self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
                         return Ok(None);
@@ -189,35 +191,6 @@ impl PkarrResolver {
     }
 }
 
-/// Parse the BEP44 envelope, verify the outer Ed25519 sig under `expected_pk`,
-/// then parse + return the inner `PkarrRoutingRecord` (does NOT verify the
-/// inner sig — caller does that with the expected identity).
-///
-/// Envelope = 64 sig + 8 seq (LE u64) + payload (matching publisher.rs format).
-fn parse_and_verify(
-    envelope: &[u8],
-    expected_pk: &VerifyingKey,
-) -> Result<PkarrRoutingRecord, PkarrError> {
-    // Envelope = 64 sig + 8 seq (LE u64) + payload (matching publisher.rs format).
-    if envelope.len() < 64 + 8 {
-        return Err(PkarrError::RelayResponseInvalid);
-    }
-    let sig_bytes: [u8; 64] = envelope[..64].try_into().expect("64 == 64");
-    let seq = u64::from_le_bytes(envelope[64..72].try_into().expect("8 == 8"));
-    let payload = &envelope[72..];
-
-    let mut to_verify = Vec::new();
-    to_verify.extend_from_slice(format!("3:seqi{}e1:v{}:", seq, payload.len()).as_bytes());
-    to_verify.extend_from_slice(payload);
-
-    let sig = Signature::from_bytes(&sig_bytes);
-    expected_pk
-        .verify(&to_verify, &sig)
-        .map_err(|_| PkarrError::OuterSignatureInvalid)?;
-
-    PkarrRoutingRecord::from_canonical_cbor(payload)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +304,39 @@ mod tests {
         // Second resolve hits cache.
         let r = resolver.resolve(&vk).await.expect("resolve");
         assert!(r.is_some());
+    }
+
+    #[tokio::test]
+    async fn resolves_real_pkarr_payload() {
+        let relay = MockPkarrRelay::start_strict().await;
+        let put_client = Arc::new(crate::relay::RelayClient::new(
+            crate::relay::RelayPool::new(vec![relay.base_url.clone()]),
+        ));
+
+        let ephemeral = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let id_sk = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&id_sk.verifying_key().to_bytes());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let rec = crate::record::PkarrRoutingRecord::sign_new(
+            b"iroh-routing".to_vec(),
+            id_pub,
+            now_ms,
+            &id_sk,
+        )
+        .expect("sign");
+        let (z32, payload) = crate::wire::build_relay_payload(&ephemeral, &rec).unwrap();
+        put_client.put(&z32, &payload).await.expect("publish");
+
+        let resolver = PkarrResolver::new(put_client);
+        let got = resolver
+            .resolve(&ephemeral.verifying_key())
+            .await
+            .expect("resolve")
+            .expect("present");
+        assert_eq!(got.routing_blob, b"iroh-routing".to_vec());
     }
 }

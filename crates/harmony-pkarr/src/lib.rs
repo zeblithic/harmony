@@ -26,6 +26,7 @@ pub mod relay;
 pub mod resolver;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod testing;
+mod wire;
 
 pub use derive::{derive_ephemeral_key, PkarrCase};
 pub use epoch::{current_epoch_id, epoch_start_ms, epoch_tolerance_window, EPOCH_DURATION_MS};
