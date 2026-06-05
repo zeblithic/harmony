@@ -5,11 +5,18 @@
 //! while `relay.rs` keeps doing the actual HTTP. The record's canonical CBOR
 //! rides inside one `_r` TXT record as base64url.
 
+// publisher.rs/resolver.rs call these in Tasks 7/8; suppress until then.
+#![allow(dead_code)]
+
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
 use crate::error::PkarrError;
 use crate::record::PkarrRoutingRecord;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use pkarr::dns::rdata::{RData, TXT};
+use pkarr::dns::{CharacterString, Name};
+use pkarr::{Keypair, PublicKey, SignedPacket};
 
 /// DNS label carrying the routing record's base64url payload.
 const RECORD_LABEL: &str = "_r";
@@ -26,19 +33,12 @@ pub(crate) fn routing_record_to_txt_string(
 }
 
 /// Decode a base64url-unpadded string back into a routing record.
-pub(crate) fn txt_string_to_routing_record(
-    s: &str,
-) -> Result<PkarrRoutingRecord, PkarrError> {
+pub(crate) fn txt_string_to_routing_record(s: &str) -> Result<PkarrRoutingRecord, PkarrError> {
     let cbor = URL_SAFE_NO_PAD
         .decode(s.as_bytes())
         .map_err(|_| PkarrError::InvalidRecord)?;
     PkarrRoutingRecord::from_canonical_cbor(&cbor)
 }
-
-use ed25519_dalek::SigningKey;
-use pkarr::dns::rdata::TXT;
-use pkarr::dns::{CharacterString, Name};
-use pkarr::{Keypair, SignedPacket};
 
 /// Build the `(z-base-32 key, relay PUT payload)` for `record` signed under
 /// the ephemeral `signing_key`. Returns `RecordTooLarge` if the packet would
@@ -68,10 +68,6 @@ pub(crate) fn build_relay_payload(
 
     Ok((keypair.to_z32(), signed.to_relay_payload().to_vec()))
 }
-
-use ed25519_dalek::VerifyingKey;
-use pkarr::dns::rdata::RData;
-use pkarr::PublicKey;
 
 /// Parse + outer-verify a relay GET payload back into a routing record.
 /// Verifies the BEP44 (ephemeral-key) signature against `expected_pk`; does
@@ -127,7 +123,10 @@ mod tests {
     fn txt_string_round_trips() {
         let rec = sample_record();
         let s = routing_record_to_txt_string(&rec).expect("encode");
-        assert!(s.len() > 255, "encoded payload should exceed one char-string");
+        assert!(
+            s.len() > 255,
+            "encoded payload should exceed one char-string"
+        );
         let back = txt_string_to_routing_record(&s).expect("decode");
         assert_eq!(rec, back);
     }
@@ -153,13 +152,9 @@ mod tests {
         let mut id_pub = [0u8; 64];
         id_pub[32..].copy_from_slice(&sk.verifying_key().to_bytes());
         // routing_blob far over the ~1000-byte v budget once base64'd.
-        let big = crate::record::PkarrRoutingRecord::sign_new(
-            vec![0u8; 3000],
-            id_pub,
-            1_000_000,
-            &sk,
-        )
-        .expect("sign");
+        let big =
+            crate::record::PkarrRoutingRecord::sign_new(vec![0u8; 3000], id_pub, 1_000_000, &sk)
+                .expect("sign");
         assert_eq!(
             build_relay_payload(&sk, &big),
             Err(PkarrError::RecordTooLarge)
@@ -171,8 +166,7 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let rec = sample_record();
         let (_z32, payload) = build_relay_payload(&sk, &rec).expect("build");
-        let parsed =
-            parse_relay_payload(&sk.verifying_key().to_bytes(), &payload).expect("parse");
+        let parsed = parse_relay_payload(&sk.verifying_key().to_bytes(), &payload).expect("parse");
         assert_eq!(parsed, rec);
     }
 
