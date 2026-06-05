@@ -5,9 +5,6 @@
 //! while `relay.rs` keeps doing the actual HTTP. The record's canonical CBOR
 //! rides inside one `_r` TXT record as base64url.
 
-// publisher.rs/resolver.rs call these in Tasks 7/8; suppress until then.
-#![allow(dead_code)]
-
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
