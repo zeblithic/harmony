@@ -121,10 +121,7 @@ async fn put_record(
     StatusCode::OK
 }
 
-async fn get_record(
-    Path(key): Path<String>,
-    State(state): State<MockState>,
-) -> impl IntoResponse {
+async fn get_record(Path(key): Path<String>, State(state): State<MockState>) -> impl IntoResponse {
     match state.store.read().await.get(&key) {
         Some(bytes) => (StatusCode::OK, bytes.clone()).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
