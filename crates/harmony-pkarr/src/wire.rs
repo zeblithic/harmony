@@ -103,11 +103,14 @@ pub(crate) fn z32_for_verifying_key(pk: &VerifyingKey) -> Result<String, PkarrEr
 fn read_record_txt(signed: &SignedPacket) -> Result<String, PkarrError> {
     let mut found: Option<String> = None;
     for rr in signed.resource_records(RECORD_LABEL) {
-        if let RData::TXT(txt) = &rr.rdata {
-            let value = String::try_from(txt.clone()).map_err(|_| PkarrError::InvalidRecord)?;
-            if found.replace(value).is_some() {
-                return Err(PkarrError::InvalidRecord);
-            }
+        // Any non-TXT `_r` record violates the contract (exactly one `_r` TXT).
+        let txt = match &rr.rdata {
+            RData::TXT(txt) => txt,
+            _ => return Err(PkarrError::InvalidRecord),
+        };
+        let value = String::try_from(txt.clone()).map_err(|_| PkarrError::InvalidRecord)?;
+        if found.replace(value).is_some() {
+            return Err(PkarrError::InvalidRecord);
         }
     }
     found.ok_or(PkarrError::InvalidRecord)
