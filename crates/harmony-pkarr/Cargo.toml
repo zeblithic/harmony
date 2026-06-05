@@ -26,8 +26,6 @@ reqwest = { workspace = true, default-features = false }
 # tokio is always required — the publisher background task needs it.
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 tracing = { workspace = true }
-# hex is used in publisher (z32_encode_public) and dev/test code.
-hex = { workspace = true }
 lru = { workspace = true }
 futures = { workspace = true }
 pkarr = { workspace = true }
@@ -39,6 +37,8 @@ axum = { workspace = true, optional = true, default-features = false, features =
 hyper = { workspace = true, optional = true }
 
 [dev-dependencies]
+# hex: derive.rs reference-vector tests assert verifying-key hex (test-only;
+# the production z32 encoding moved to wire.rs via pkarr in ZEB-382).
 hex = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
