@@ -202,7 +202,7 @@ mod tests {
     /// Live round-trip against the public relay. Ignored by default; run with:
     ///   HARMONY_PKARR_LIVE_RELAY=1 cargo nextest run -p harmony-pkarr \
     ///     --run-ignored all wire::tests::live_relay_round_trip
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "hits relay.pkarr.org; set HARMONY_PKARR_LIVE_RELAY=1 to run"]
     async fn live_relay_round_trip() {
         if std::env::var("HARMONY_PKARR_LIVE_RELAY").is_err() {
@@ -210,14 +210,15 @@ mod tests {
         }
         use crate::relay::{RelayClient, RelayPool};
 
-        let relay = RelayClient::new(RelayPool::new(vec![
-            "https://relay.pkarr.org".to_string(),
-        ]));
+        let relay = RelayClient::new(RelayPool::new(vec!["https://relay.pkarr.org".to_string()]));
         let ephemeral = SigningKey::generate(&mut OsRng);
         let rec = sample_record();
         let (z32, payload) = build_relay_payload(&ephemeral, &rec).expect("build");
 
-        relay.put(&z32, &payload).await.expect("publish to live relay");
+        relay
+            .put(&z32, &payload)
+            .await
+            .expect("publish to live relay");
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let got = relay
