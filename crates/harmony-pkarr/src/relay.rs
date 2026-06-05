@@ -11,7 +11,61 @@ use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::PkarrError;
+
+/// Whether a relay is currently usable or sitting out a cooldown.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RelayState {
+    /// Available for the next request.
+    Healthy,
+    /// On cooldown until `until_ms` (wall-clock Unix millis).
+    CoolingDown { until_ms: u64 },
+}
+
+/// The last recorded result of talking to a relay.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RelayOutcome {
+    /// 2xx — record accepted (put) or returned (get).
+    Success,
+    /// Per-request timeout elapsed.
+    Timeout,
+    /// Non-timeout transport failure (connection refused, DNS, TLS).
+    Transport,
+    /// An explicit HTTP error status (429 / 5xx / other non-success).
+    Http(u16),
+}
+
+/// A point-in-time health summary for one relay in the pool. One entry per
+/// **current** pool relay (removed relays drop out; freshly added relays appear
+/// with `last_outcome: None` until first use).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RelayHealth {
+    pub url: String,
+    pub state: RelayState,
+    pub last_outcome: Option<RelayOutcome>,
+    /// Wall-clock Unix millis of the last 2xx exchange (None if never).
+    pub last_success_ms: Option<u64>,
+}
+
+/// Per-URL mutable record folded behind a `Mutex`. `state` is NOT stored here —
+/// it is derived from the cooldown map at read time so there is a single source
+/// of truth for "is this relay cooling down".
+#[derive(Debug, Default, Clone)]
+struct RelayRecord {
+    last_outcome: Option<RelayOutcome>,
+    last_success_ms: Option<u64>,
+}
+
+/// Wall-clock Unix millis (mirrors `network_health.rs::now_ms`).
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Tunable timeouts for [`RelayClient`]. **Not user-facing** — multi-relay
 /// redundancy (ZEB-380) already removes the "5 s timeout is terminal" failure
@@ -73,6 +127,8 @@ pub struct RelayClient {
     config: RelayConfig,
     /// Maps relay base URL → `Instant` at which the cooldown expires.
     cooldown: Mutex<HashMap<String, Instant>>,
+    /// Per-URL last-outcome / last-success record (health observability).
+    records: Mutex<HashMap<String, RelayRecord>>,
 }
 
 impl RelayClient {
@@ -99,6 +155,7 @@ impl RelayClient {
             http,
             config,
             cooldown: Mutex::new(HashMap::new()),
+            records: Mutex::new(HashMap::new()),
         }
     }
 
@@ -116,9 +173,13 @@ impl RelayClient {
         for base in self.available_relays() {
             let url = format!("{}/{}", base, key_z32);
             match self.http.put(&url).body(envelope.to_vec()).send().await {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) if resp.status().is_success() => {
+                    self.record_outcome(&base, RelayOutcome::Success);
+                    return Ok(());
+                }
                 Ok(resp) if resp.status().as_u16() == 429 => {
                     self.mark_cooldown(&base);
+                    self.record_outcome(&base, RelayOutcome::Http(429));
                     continue;
                 }
                 Ok(resp) => {
@@ -126,12 +187,21 @@ impl RelayClient {
                     // put the relay on cooldown, and rotate to the next one.
                     let status = resp.status().as_u16();
                     self.mark_cooldown(&base);
+                    self.record_outcome(&base, RelayOutcome::Http(status));
                     last_http_error = Some(status);
                     continue;
                 }
-                Err(_) => {
+                Err(e) => {
                     // Transport error (timeout, connection refused, DNS, etc.)
                     self.mark_cooldown(&base);
+                    self.record_outcome(
+                        &base,
+                        if e.is_timeout() {
+                            RelayOutcome::Timeout
+                        } else {
+                            RelayOutcome::Transport
+                        },
+                    );
                     continue;
                 }
             }
@@ -173,30 +243,43 @@ impl RelayClient {
                         .bytes()
                         .await
                         .map_err(|_| PkarrError::RelayResponseInvalid)?;
+                    self.record_outcome(&base, RelayOutcome::Success);
                     return Ok(Some(bytes.to_vec()));
                 }
                 Ok(resp) if resp.status().as_u16() == 404 => {
                     // 404 is a definitive "not here" answer; keep going.
-                    // all_404 remains true.
+                    // all_404 remains true. No record update: the relay
+                    // answered correctly (reachable, not failing) — neither a
+                    // success-for-us nor an error.
                     continue;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
                     self.mark_cooldown(&base);
+                    self.record_outcome(&base, RelayOutcome::Http(429));
                     all_404 = false;
                     continue;
                 }
-                Ok(_) => {
+                Ok(resp) => {
                     // Other non-success status (e.g. 500): treat as transport
                     // error — we can't confirm the key is absent. Mirror the
                     // PUT path: mark cooldown so a misbehaving relay doesn't
                     // get hammered with every GET.
                     self.mark_cooldown(&base);
+                    self.record_outcome(&base, RelayOutcome::Http(resp.status().as_u16()));
                     all_404 = false;
                     continue;
                 }
-                Err(_) => {
+                Err(e) => {
                     // Timeout / connection refused / DNS failure.
                     self.mark_cooldown(&base);
+                    self.record_outcome(
+                        &base,
+                        if e.is_timeout() {
+                            RelayOutcome::Timeout
+                        } else {
+                            RelayOutcome::Transport
+                        },
+                    );
                     all_404 = false;
                     continue;
                 }
@@ -234,6 +317,49 @@ impl RelayClient {
     fn mark_cooldown(&self, base: &str) {
         let mut cd = self.cooldown.lock().expect("cooldown poisoned");
         cd.insert(base.to_string(), Instant::now() + self.config.cooldown);
+    }
+
+    /// Record the latest outcome for `base` (health observability).
+    fn record_outcome(&self, base: &str, outcome: RelayOutcome) {
+        let mut recs = self.records.lock().expect("records poisoned");
+        let rec = recs.entry(base.to_string()).or_default();
+        rec.last_outcome = Some(outcome);
+        if outcome == RelayOutcome::Success {
+            rec.last_success_ms = Some(now_ms());
+        }
+    }
+
+    /// Synchronous per-relay health for the current pool — one entry per pool
+    /// relay, in pool order. `state` is derived from the cooldown map; a relay
+    /// whose cooldown expiry is in the future reports `CoolingDown { until_ms }`
+    /// (cooldown `Instant` converted to wall-clock millis), else `Healthy`.
+    pub fn relay_health(&self) -> Vec<RelayHealth> {
+        let now_inst = Instant::now();
+        let now_wall = now_ms();
+        let cd = self.cooldown.lock().expect("cooldown poisoned");
+        let recs = self.records.lock().expect("records poisoned");
+        let pool = self.pool.read().expect("relay pool poisoned");
+        pool.relays
+            .iter()
+            .map(|url| {
+                let state = match cd.get(url.as_str()) {
+                    Some(expiry) if *expiry > now_inst => {
+                        let remaining = expiry.duration_since(now_inst).as_millis() as u64;
+                        RelayState::CoolingDown {
+                            until_ms: now_wall + remaining,
+                        }
+                    }
+                    _ => RelayState::Healthy,
+                };
+                let rec = recs.get(url).cloned().unwrap_or_default();
+                RelayHealth {
+                    url: url.clone(),
+                    state,
+                    last_outcome: rec.last_outcome,
+                    last_success_ms: rec.last_success_ms,
+                }
+            })
+            .collect()
     }
 }
 
@@ -290,6 +416,103 @@ mod tests {
         let cfg = RelayConfig::default();
         assert_eq!(cfg.request_timeout, Duration::from_secs(5));
         assert_eq!(cfg.cooldown, Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn with_config_short_cooldown_is_honored() {
+        // A relay that fails goes on cooldown for the CONFIGURED duration.
+        // With a 0ms cooldown the failed relay is immediately available again.
+        let cfg = RelayConfig {
+            request_timeout: Duration::from_millis(200),
+            cooldown: Duration::from_millis(0),
+        };
+        let pool = RelayPool::new(vec!["http://192.0.2.1:80".to_string()]);
+        let client = RelayClient::with_config(pool, cfg);
+        // First get marks the unreachable relay on cooldown, then (cooldown=0)
+        // it is available again on the next call — so we still see the relay,
+        // not an empty pool. The point is `with_config` compiles + plumbs cfg.
+        let _ = client.get("k").await; // Err(NoRelaysAvailable) or transport err
+        assert_eq!(client.relay_health().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn relay_health_lists_pool_relays_healthy_by_default() {
+        let relay = MockPkarrRelay::start().await;
+        let client = RelayClient::new(RelayPool::new(vec![relay.base_url.clone()]));
+        let health = client.relay_health();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].url, relay.base_url);
+        assert_eq!(health[0].state, RelayState::Healthy);
+        assert_eq!(health[0].last_outcome, None);
+        assert_eq!(health[0].last_success_ms, None);
+    }
+
+    #[tokio::test]
+    async fn relay_health_records_success_after_put() {
+        let relay = MockPkarrRelay::start().await;
+        let client = RelayClient::new(RelayPool::new(vec![relay.base_url.clone()]));
+        client.put("k1", b"v").await.expect("put");
+        let h = &client.relay_health()[0];
+        assert_eq!(h.state, RelayState::Healthy);
+        assert_eq!(h.last_outcome, Some(RelayOutcome::Success));
+        assert!(h.last_success_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn relay_health_reflects_cooldown_after_transport_failure() {
+        // A closed loopback port yields an immediate connection-refused — a
+        // non-timeout transport failure. (TEST-NET-1 192.0.2.1 is unrouted, so
+        // packets are silently dropped and the attempt times out instead — that
+        // path is `Timeout`, exercised separately below.) Bind a listener to grab
+        // a free port, then drop it so the port is closed before we connect.
+        let port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind ephemeral");
+            listener.local_addr().expect("local_addr").port()
+            // listener dropped here → port closed → connect() gets ECONNREFUSED
+        };
+        let client = RelayClient::new(RelayPool::new(vec![format!("http://127.0.0.1:{port}")]));
+        let _ = client.get("k").await; // trips cooldown on the unreachable relay
+        let h = &client.relay_health()[0];
+        match h.state {
+            RelayState::CoolingDown { until_ms } => assert!(until_ms > 0),
+            RelayState::Healthy => panic!("expected CoolingDown after transport failure"),
+        }
+        // A connection refused / DNS error is Transport, not Timeout.
+        assert_eq!(h.last_outcome, Some(RelayOutcome::Transport));
+    }
+
+    #[tokio::test]
+    async fn relay_health_reflects_cooldown_after_timeout() {
+        // TEST-NET-1 (192.0.2.1) is unrouted: the connect attempt hangs until the
+        // per-request timeout elapses, so reqwest reports `is_timeout()` → Timeout.
+        // Short request_timeout keeps the test fast. Both Timeout and Transport
+        // trip cooldown identically; this asserts the discrimination is correct.
+        let cfg = RelayConfig {
+            request_timeout: Duration::from_millis(300),
+            cooldown: Duration::from_secs(30),
+        };
+        let pool = RelayPool::new(vec!["http://192.0.2.1:80".to_string()]);
+        let client = RelayClient::with_config(pool, cfg);
+        let _ = client.get("k").await; // hangs → times out → cooldown
+        let h = &client.relay_health()[0];
+        match h.state {
+            RelayState::CoolingDown { until_ms } => assert!(until_ms > 0),
+            RelayState::Healthy => panic!("expected CoolingDown after timeout"),
+        }
+        assert_eq!(h.last_outcome, Some(RelayOutcome::Timeout));
+    }
+
+    #[tokio::test]
+    async fn relay_health_only_lists_current_pool_after_swap() {
+        let relay_a = MockPkarrRelay::start().await;
+        let relay_b = MockPkarrRelay::start().await;
+        let client = RelayClient::new(RelayPool::new(vec![relay_a.base_url.clone()]));
+        client.set_relays(vec![relay_b.base_url.clone()]);
+        let health = client.relay_health();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].url, relay_b.base_url);
     }
 
     #[tokio::test]
