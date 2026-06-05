@@ -5,6 +5,70 @@
 //! while `relay.rs` keeps doing the actual HTTP. The record's canonical CBOR
 //! rides inside one `_r` TXT record as base64url.
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+
+use crate::error::PkarrError;
+use crate::record::PkarrRoutingRecord;
+
+/// DNS label carrying the routing record's base64url payload.
+const RECORD_LABEL: &str = "_r";
+/// TTL (seconds) on the TXT record. Not load-bearing — harmony freshness is
+/// governed by PkarrRoutingRecord::verify_skew + epoch rotation, not DNS TTL.
+const RECORD_TTL: u32 = 300;
+
+/// Encode a routing record's canonical CBOR as a base64url-unpadded string.
+pub(crate) fn routing_record_to_txt_string(
+    record: &PkarrRoutingRecord,
+) -> Result<String, PkarrError> {
+    let cbor = record.to_canonical_cbor()?;
+    Ok(URL_SAFE_NO_PAD.encode(&cbor))
+}
+
+/// Decode a base64url-unpadded string back into a routing record.
+pub(crate) fn txt_string_to_routing_record(
+    s: &str,
+) -> Result<PkarrRoutingRecord, PkarrError> {
+    let cbor = URL_SAFE_NO_PAD
+        .decode(s.as_bytes())
+        .map_err(|_| PkarrError::InvalidRecord)?;
+    PkarrRoutingRecord::from_canonical_cbor(&cbor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    fn sample_record() -> crate::record::PkarrRoutingRecord {
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut id_pub = [0u8; 64];
+        id_pub[32..].copy_from_slice(&sk.verifying_key().to_bytes());
+        crate::record::PkarrRoutingRecord::sign_new(
+            vec![0xCDu8; 120], // routing_blob big enough to force >255 base64
+            id_pub,
+            1_000_000,
+            &sk,
+        )
+        .expect("sign record")
+    }
+
+    #[test]
+    fn txt_string_round_trips() {
+        let rec = sample_record();
+        let s = routing_record_to_txt_string(&rec).expect("encode");
+        assert!(s.len() > 255, "encoded payload should exceed one char-string");
+        let back = txt_string_to_routing_record(&s).expect("decode");
+        assert_eq!(rec, back);
+    }
+
+    #[test]
+    fn txt_string_rejects_garbage() {
+        assert!(txt_string_to_routing_record("!!!not-base64!!!").is_err());
+    }
+}
+
 #[cfg(test)]
 mod spike_tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
