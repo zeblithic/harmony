@@ -20,6 +20,9 @@ pub enum OwnerError {
     #[error("device {device:?} is revoked")]
     Revoked { device: [u8; 16] },
 
+    #[error("enrollment cert expired at {expires_at} (now {now_ms})")]
+    EnrollmentCertExpired { expires_at: u64, now_ms: u64 },
+
     #[error("quorum requires at least {min} signers, got {got}")]
     InsufficientQuorum { min: usize, got: usize },
 
