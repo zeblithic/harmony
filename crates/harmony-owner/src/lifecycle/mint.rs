@@ -108,6 +108,13 @@ pub fn mint_owner(now: u64) -> Result<MintResult, OwnerError> {
     // window value here is irrelevant; pass the trust default for consistency.
     state.add_enrollment(cert, now, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS)?;
 
+    // ZEB-342: device #1 is alive at mint. Without an initial liveness cert the
+    // device is not "active", so evaluate_trust refuses the sole device with
+    // StaleTrustState (the client's fresh-mint "● refused" badge). device_sk +
+    // owner_id are already in scope here.
+    let liveness = crate::certs::LivenessCert::sign(&device_sk, owner_id, now)?;
+    state.add_liveness(liveness)?;
+
     let recovery_artifact = RecoveryArtifact::from_seed(seed);
     seed.zeroize();
     // master_sk is dropped here, signaling intent to wipe master from RAM
@@ -127,9 +134,28 @@ mod tests {
 
     #[test]
     fn mint_produces_active_device_one() {
-        let result = mint_owner(1_700_000_000).unwrap();
+        let now = 1_700_000_000;
+        let result = mint_owner(now).unwrap();
         assert_eq!(result.state.enrollments.len(), 1);
         assert_eq!(result.recovery_artifact.as_bytes().len(), 32);
+        // ZEB-342: the sole minted device must be alive + trusted, not Refused.
+        assert_eq!(
+            result.state.liveness.len(),
+            1,
+            "device #1 must have an initial liveness cert"
+        );
+        let device_id = *result.state.enrollments.keys().next().unwrap();
+        assert_eq!(
+            crate::trust::evaluate_trust(
+                &result.state,
+                device_id,
+                now,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                crate::trust::DEFAULT_FRESHNESS_WINDOW_SECS,
+            ),
+            crate::trust::TrustDecision::Full,
+            "freshly-minted sole device must evaluate to Full trust"
+        );
     }
 
     #[test]
