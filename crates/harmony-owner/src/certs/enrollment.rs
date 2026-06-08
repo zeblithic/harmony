@@ -88,15 +88,19 @@ impl EnrollmentCert {
         })
     }
 
-    pub fn verify(&self, now_ms: u64) -> Result<(), OwnerError> {
+    /// `now_secs` is the current time in **Unix SECONDS** — the same unit as the
+    /// cert's `issued_at`/`expires_at` and `OwnerState`'s `now`/`active_window_secs`
+    /// (see `add_enrollment`/`active_devices`). Callers in millisecond domains (HLC
+    /// `wall_ms`, `SystemTime::as_millis`) MUST convert (`/ 1000`) before calling.
+    pub fn verify(&self, now_secs: u64) -> Result<(), OwnerError> {
         if self.version != ENROLLMENT_VERSION {
             return Err(OwnerError::UnknownVersion(self.version));
         }
         if let Some(exp) = self.expires_at {
-            if now_ms > exp {
+            if now_secs > exp {
                 return Err(OwnerError::EnrollmentCertExpired {
                     expires_at: exp,
-                    now_ms,
+                    now_secs,
                 });
             }
         }
@@ -296,7 +300,7 @@ mod tests {
             cert.verify(2_001),
             Err(OwnerError::EnrollmentCertExpired {
                 expires_at: 2_000,
-                now_ms: 2_001
+                now_secs: 2_001
             })
         ));
         assert!(cert.verify(2_000).is_ok()); // exactly-at-expiry still valid (not strictly greater)
