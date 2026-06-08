@@ -88,9 +88,21 @@ impl EnrollmentCert {
         })
     }
 
-    pub fn verify(&self) -> Result<(), OwnerError> {
+    /// `now_secs` is the current time in **Unix SECONDS** — the same unit as the
+    /// cert's `issued_at`/`expires_at` and `OwnerState`'s `now`/`active_window_secs`
+    /// (see `add_enrollment`/`active_devices`). Callers in millisecond domains (HLC
+    /// `wall_ms`, `SystemTime::as_millis`) MUST convert (`/ 1000`) before calling.
+    pub fn verify(&self, now_secs: u64) -> Result<(), OwnerError> {
         if self.version != ENROLLMENT_VERSION {
             return Err(OwnerError::UnknownVersion(self.version));
+        }
+        if let Some(exp) = self.expires_at {
+            if now_secs > exp {
+                return Err(OwnerError::EnrollmentCertExpired {
+                    expires_at: exp,
+                    now_secs,
+                });
+            }
         }
         match &self.issuer {
             EnrollmentIssuer::Master { master_pubkey } => {
@@ -223,7 +235,7 @@ mod tests {
         )
         .unwrap();
 
-        cert.verify().unwrap();
+        cert.verify(0).unwrap();
     }
 
     #[test]
@@ -244,7 +256,7 @@ mod tests {
 
         // Tamper with timestamp
         cert.issued_at = 1_800_000_000;
-        let result = cert.verify();
+        let result = cert.verify(0);
         assert!(matches!(result, Err(OwnerError::InvalidSignature { .. })));
     }
 
@@ -267,6 +279,49 @@ mod tests {
         let bytes = cbor::to_canonical(&cert).unwrap();
         let decoded: EnrollmentCert = cbor::from_bytes(&bytes).unwrap();
         assert_eq!(cert, decoded);
-        decoded.verify().unwrap();
+        decoded.verify(0).unwrap();
+    }
+
+    #[test]
+    fn verify_rejects_past_expiry() {
+        let (master_sk, master_bundle) = fresh_pubkey_bundle(1, 2);
+        let (_d_sk, device_bundle) = fresh_pubkey_bundle(3, 4);
+        let device_id = device_bundle.identity_hash();
+        let cert = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000,
+            Some(2_000),
+        )
+        .unwrap();
+        assert!(matches!(
+            cert.verify(2_001),
+            Err(OwnerError::EnrollmentCertExpired {
+                expires_at: 2_000,
+                now_secs: 2_001
+            })
+        ));
+        assert!(cert.verify(2_000).is_ok()); // exactly-at-expiry still valid (not strictly greater)
+        assert!(cert.verify(1_500).is_ok());
+    }
+
+    #[test]
+    fn verify_accepts_none_expiry_at_any_clock() {
+        let (master_sk, master_bundle) = fresh_pubkey_bundle(5, 6);
+        let (_d_sk, device_bundle) = fresh_pubkey_bundle(7, 8);
+        let device_id = device_bundle.identity_hash();
+        let cert = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            device_id,
+            device_bundle,
+            1_000,
+            None,
+        )
+        .unwrap();
+        assert!(cert.verify(0).is_ok());
+        assert!(cert.verify(u64::MAX).is_ok());
     }
 }

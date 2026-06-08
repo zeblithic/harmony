@@ -94,7 +94,7 @@ fn master_enrollment_cert_v1_is_deterministic() {
     // Round-trip
     let decoded: EnrollmentCert = cbor::from_bytes(&bytes_a).unwrap();
     assert_eq!(cert, decoded);
-    decoded.verify().unwrap();
+    decoded.verify(0).unwrap();
 
     // Print bytes for documentation; fixtures consumers can save these.
     println!(

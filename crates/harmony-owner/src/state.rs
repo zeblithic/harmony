@@ -205,7 +205,7 @@ impl OwnerState {
                 device: cert.device_id,
             });
         }
-        cert.verify()?;
+        cert.verify(now)?;
         // For Quorum certs, also walk back to verify each signer's enrollment
         // is present and was issued before this cert's `issued_at`.
         if let EnrollmentIssuer::Quorum {
