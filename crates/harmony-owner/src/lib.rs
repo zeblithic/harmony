@@ -47,6 +47,7 @@ pub mod pubkey_bundle;
 pub mod signing;
 pub mod state;
 pub mod trust;
+pub mod x25519;
 
 #[cfg(feature = "recovery")]
 pub mod recovery;
