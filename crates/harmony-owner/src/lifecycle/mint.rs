@@ -89,10 +89,8 @@ pub fn mint_owner(now: u64) -> Result<MintResult, OwnerError> {
     let device_bundle = PubKeyBundle {
         classical: ClassicalKeys {
             ed25519_verify: device_sk.verifying_key().to_bytes(),
-            x25519_pub: crate::x25519::ed25519_pub_to_x25519(
-                &device_sk.verifying_key().to_bytes(),
-            )
-            .expect("freshly derived ed25519 verify key is a valid non-small-order point"),
+            x25519_pub: crate::x25519::ed25519_pub_to_x25519(&device_sk.verifying_key().to_bytes())
+                .expect("freshly derived ed25519 verify key is a valid non-small-order point"),
         },
         post_quantum: None,
     };

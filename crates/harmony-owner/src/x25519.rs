@@ -31,8 +31,8 @@ mod tests {
     fn pub_conversion_matches_priv_derived_public() {
         for seed in [[0x42u8; 32], [0x01u8; 32], [0xEEu8; 32]] {
             let sk = SigningKey::from_bytes(&seed);
-            let via_pub = ed25519_pub_to_x25519(&sk.verifying_key().to_bytes())
-                .expect("valid key converts");
+            let via_pub =
+                ed25519_pub_to_x25519(&sk.verifying_key().to_bytes()).expect("valid key converts");
             // mul_base_clamped applies RFC 7748 clamping internally — identical
             // to harmony-client's ed25519_priv_to_x25519 + X25519 base-point mul.
             let via_priv = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(
