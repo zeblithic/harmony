@@ -24,14 +24,19 @@ pub struct PqKeys {
 
 impl PubKeyBundle {
     /// Convenience constructor for a classical-only bundle from a verifying key.
-    /// X25519 stub — see TODO in mint.rs for HKDF derivation in v1.1. Used by
-    /// VouchingCert / LivenessCert sign() to derive the signer identity hash
-    /// from the signing key without requiring callers to pass it explicitly.
+    /// `x25519_pub` is derived from `ed25519_verify` via the RFC 7748 §5
+    /// birational map ([`crate::x25519::ed25519_pub_to_x25519`]).
+    ///
+    /// Contract: `ed25519_verify` must be the caller's OWN valid Ed25519
+    /// verifying key (callers are VouchingCert / LivenessCert `sign()`
+    /// deriving the signer identity hash from the signing key) — passing a
+    /// non-canonical or small-order point panics.
     pub fn classical_only(ed25519_verify: [u8; 32]) -> Self {
         Self {
             classical: ClassicalKeys {
                 ed25519_verify,
-                x25519_pub: [0u8; 32],
+                x25519_pub: crate::x25519::ed25519_pub_to_x25519(&ed25519_verify)
+                    .expect("caller's own ed25519 verify key is a valid non-small-order point"),
             },
             post_quantum: None,
         }
@@ -103,6 +108,19 @@ mod tests {
             post_quantum: None,
         };
         assert_ne!(a.identity_hash(), b.identity_hash());
+    }
+
+    #[test]
+    fn classical_only_populates_birational_x25519() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x07u8; 32]);
+        let vk = sk.verifying_key().to_bytes();
+        let bundle = PubKeyBundle::classical_only(vk);
+        assert_eq!(
+            bundle.classical.x25519_pub,
+            crate::x25519::ed25519_pub_to_x25519(&vk).unwrap(),
+            "classical_only must carry the birational X25519, not zeros"
+        );
+        assert_ne!(bundle.classical.x25519_pub, [0u8; 32]);
     }
 
     #[test]
