@@ -84,8 +84,9 @@ impl VouchingCert {
         // this prevents a cert that names device-A as signer from being
         // accepted as if signed by device-B (callers that only check the
         // ed25519 signature would otherwise be fooled).
-        // classical_identity_hash (not classical_only): signer_pubkey is
-        // externally supplied, and classical_only panics on small-order keys.
+        // classical_identity_hash (not classical_only): verification only
+        // needs the signing-material hash, so deriving (or zero-filling) an
+        // X25519 key for an externally-supplied signer is pointless.
         let expected_signer = PubKeyBundle::classical_identity_hash(&signer_pubkey.to_bytes());
         if self.signer != expected_signer {
             return Err(OwnerError::IdentityHashMismatch);

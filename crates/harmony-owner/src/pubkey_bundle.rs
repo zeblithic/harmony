@@ -66,13 +66,14 @@ impl PubKeyBundle {
 
     /// Identity hash for a classical-only signer key WITHOUT constructing a
     /// bundle (and without deriving its X25519). Cert `verify()` paths use
-    /// this for externally-supplied keys, where `classical_only`'s
-    /// own-valid-key contract must not apply (it panics on non-canonical or
-    /// small-order points — a crafted cert could DoS a verifier). Any 32-byte
-    /// key hashes here; a weak key simply fails the signer-hash comparison or
-    /// the signature check downstream. Because `identity_hash()` excludes
-    /// encryption keys, this equals `classical_only(k).identity_hash()` for
-    /// every valid `k`.
+    /// this for externally-supplied keys: verification only needs the
+    /// signing-material hash, so deriving an encryption key — or zero-filling
+    /// one via `classical_only`'s arbitrary-bytes fallback — is wasted work
+    /// and would couple cert verification to that fallback contract. Any
+    /// 32-byte key hashes here; a weak key simply fails the signer-hash
+    /// comparison or the signature check downstream. Because
+    /// `identity_hash()` excludes encryption keys, this equals
+    /// `classical_only(k).identity_hash()` for every `k`.
     pub fn classical_identity_hash(ed25519_verify: &[u8; 32]) -> [u8; 16] {
         Self::signing_identity_hash(ed25519_verify, None)
     }
