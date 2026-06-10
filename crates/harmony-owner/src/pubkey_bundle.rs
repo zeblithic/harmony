@@ -27,16 +27,23 @@ impl PubKeyBundle {
     /// `x25519_pub` is derived from `ed25519_verify` via the RFC 7748 §5
     /// birational map ([`crate::x25519::ed25519_pub_to_x25519`]).
     ///
-    /// Contract: `ed25519_verify` must be the caller's OWN valid Ed25519
-    /// verifying key (callers are VouchingCert / LivenessCert `sign()`
-    /// deriving the signer identity hash from the signing key) — passing a
-    /// non-canonical or small-order point panics.
+    /// Accepts ARBITRARY bytes and never panics: downstream callers derive
+    /// identity hashes from network-supplied keys through this constructor
+    /// (e.g. harmony-client `friend_graph::owner_id_from_master_ed25519` on
+    /// friend-token bytes), and `identity_hash()` ignores encryption keys, so
+    /// identity derivation must keep working for any input. Bytes that fail
+    /// Edwards decompression or decode to a small-order point fall back to a
+    /// zeroed `x25519_pub` — "no usable encryption key", exactly the
+    /// pre-ZEB-372 wire value; sealing to a zeroed key already fails loudly
+    /// (zero-shared-secret check in the seal paths). Callers that need to
+    /// REJECT such keys should call
+    /// [`crate::x25519::ed25519_pub_to_x25519`] directly and handle `None`.
     pub fn classical_only(ed25519_verify: [u8; 32]) -> Self {
         Self {
             classical: ClassicalKeys {
                 ed25519_verify,
                 x25519_pub: crate::x25519::ed25519_pub_to_x25519(&ed25519_verify)
-                    .expect("caller's own ed25519 verify key is a valid non-small-order point"),
+                    .unwrap_or([0u8; 32]),
             },
             post_quantum: None,
         }
@@ -149,6 +156,28 @@ mod tests {
         let mut small_order = [0u8; 32];
         small_order[0] = 1; // compressed identity point
         let _ = PubKeyBundle::classical_identity_hash(&small_order); // must not panic
+    }
+
+    #[test]
+    fn classical_only_with_invalid_bytes_falls_back_to_zeroed_x25519_no_panic() {
+        // harmony-client derives friend owner-ids via
+        // classical_only(network_supplied_master_key).identity_hash(); a
+        // crafted small-order or off-curve key must NOT panic (remote DoS).
+        // It falls back to the pre-ZEB-372 zeroed x25519, and the identity
+        // hash still matches the dedicated helper.
+        let mut small_order = [0u8; 32];
+        small_order[0] = 1; // compressed identity point (small order)
+        let mut off_curve = [0u8; 32];
+        off_curve[0] = 2; // y = 2 is not on the curve
+        for bytes in [small_order, off_curve] {
+            let bundle = PubKeyBundle::classical_only(bytes);
+            assert_eq!(bundle.classical.x25519_pub, [0u8; 32], "zeros fallback");
+            assert_eq!(
+                bundle.identity_hash(),
+                PubKeyBundle::classical_identity_hash(&bytes),
+                "identity derivation unaffected by the fallback"
+            );
+        }
     }
 
     #[test]

@@ -178,3 +178,11 @@ pub(crate) fn master_pubkey_bundle_from_sk(sk: &SigningKey) -> PubKeyBundle {
 3. Parity pin: assert `cert.classical.x25519_pub == dm_signing::ed25519_pub_to_x25519(&cert.classical.ed25519_verify)` (the two repos' implementations agree forever).
 4. Carry the PR #218 CodeRabbit nitpick: add a plain-string `"superseded"` rejection case to `src/lib/notes-migrate.test.ts` (production Tauri rejects with strings, not Error objects).
 5. Full harmony-client gates (fmt/clippy/nextest --all-targets/tsc/vitest) + PR + bot loop.
+
+---
+
+## Implementation notes (post-plan corrections, 2026-06-09 — kept so this doc matches what shipped)
+
+1. **Task 1 rejection-test correction:** `[0xFF; 32]` does NOT decompress-fail — curve25519-dalek reduces the y field element mod p (y ≡ 18, on-curve), so it is a bad "invalid input" probe. The shipped test uses `off_curve[0] = 2` (y = 2, genuinely off-curve) plus the small-order identity point. `ed25519_pub_to_x25519` is documented as NOT a canonicality gate.
+2. **Task 2.5 (added during review): certificate verifier hardening.** `LivenessCert::verify` / `VouchingCert::verify` receive EXTERNALLY-supplied signer keys and previously derived the expected signer hash via `classical_only` — which would panic on small-order keys (remote DoS). Added the non-panicking `PubKeyBundle::classical_identity_hash(&[u8; 32])` (hashes signing material directly; byte-identical to `classical_only(k).identity_hash()` for valid `k`) and switched both verify paths to it. Regression tests: small-order signer key → `IdentityHashMismatch`, never a panic.
+3. **`classical_only` accepts arbitrary bytes (zeros fallback).** harmony-client derives friend owner-ids from NETWORK-supplied master keys through `classical_only(..).identity_hash()` (`friend_graph.rs:58`), so the constructor must never panic: invalid/small-order bytes fall back to a zeroed `x25519_pub` (the pre-ZEB-372 wire value; "no usable encryption key" — seal paths already reject zero shared secrets loudly). The `mint.rs` own-key paths keep their loud `expect`: for freshly-generated own keys the failure is unreachable, and a silent zeros fallback there would invisibly resurrect the stub bug this ticket fixes.

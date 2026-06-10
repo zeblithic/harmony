@@ -7,9 +7,14 @@
 //! (dm_signing.rs): same decompress → small-order reject → Montgomery.
 
 /// Convert an Ed25519 verify key to its birational X25519 public key
-/// (RFC 7748 §5). Returns `None` for non-canonical or small-order (torsion)
-/// points — callers constructing bundles from freshly generated keys may
-/// `expect()`; callers handling external bytes must propagate the `None`.
+/// (RFC 7748 §5). Returns `None` when the bytes fail Edwards decompression
+/// (off-curve) or decode to a small-order (torsion) point.
+///
+/// NOT a canonicality gate: curve25519-dalek's decompression reduces the y
+/// field element mod p, so some non-canonical encodings decompress and return
+/// `Some` — never treat `Some(_)` as proof of a canonical Ed25519 encoding.
+/// Callers constructing bundles from freshly generated keys may `expect()`;
+/// callers handling external bytes must propagate the `None`.
 pub fn ed25519_pub_to_x25519(ed25519_pub: &[u8; 32]) -> Option<[u8; 32]> {
     use curve25519_dalek::edwards::CompressedEdwardsY;
     let edwards = CompressedEdwardsY(*ed25519_pub).decompress()?;
