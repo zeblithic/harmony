@@ -5641,10 +5641,7 @@ mod tests {
         // UnicastReceived.packet carries the parsed packet's `data`
         // field (payload only), not the full wire bytes — matches the
         // dispatcher behavior in dispatch_router_actions.
-        assert_eq!(
-            received.2, payload,
-            "payload bytes must round-trip A → B"
-        );
+        assert_eq!(received.2, payload, "payload bytes must round-trip A → B");
     }
 
     #[test]

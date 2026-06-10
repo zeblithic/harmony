@@ -3689,6 +3689,7 @@ dependencies = [
  "bip39",
  "chacha20poly1305",
  "ciborium",
+ "curve25519-dalek",
  "ed25519-dalek",
  "harmony-crypto",
  "harmony-identity",
@@ -3721,6 +3722,8 @@ name = "harmony-pkarr"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
+ "bytes",
  "ciborium",
  "ed25519-dalek",
  "futures",
@@ -3728,6 +3731,7 @@ dependencies = [
  "hkdf",
  "hyper 1.8.1",
  "lru 0.18.0",
+ "pkarr",
  "rand 0.8.5",
  "reqwest",
  "serde",

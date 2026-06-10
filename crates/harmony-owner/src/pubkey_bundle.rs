@@ -24,14 +24,26 @@ pub struct PqKeys {
 
 impl PubKeyBundle {
     /// Convenience constructor for a classical-only bundle from a verifying key.
-    /// X25519 stub — see TODO in mint.rs for HKDF derivation in v1.1. Used by
-    /// VouchingCert / LivenessCert sign() to derive the signer identity hash
-    /// from the signing key without requiring callers to pass it explicitly.
+    /// `x25519_pub` is derived from `ed25519_verify` via the RFC 7748 §5
+    /// birational map ([`crate::x25519::ed25519_pub_to_x25519`]).
+    ///
+    /// Accepts ARBITRARY bytes and never panics: downstream callers derive
+    /// identity hashes from network-supplied keys through this constructor
+    /// (e.g. harmony-client `friend_graph::owner_id_from_master_ed25519` on
+    /// friend-token bytes), and `identity_hash()` ignores encryption keys, so
+    /// identity derivation must keep working for any input. Bytes that fail
+    /// Edwards decompression or decode to a small-order point fall back to a
+    /// zeroed `x25519_pub` — "no usable encryption key", exactly the
+    /// pre-ZEB-372 wire value; sealing to a zeroed key already fails loudly
+    /// (zero-shared-secret check in the seal paths). Callers that need to
+    /// REJECT such keys should call
+    /// [`crate::x25519::ed25519_pub_to_x25519`] directly and handle `None`.
     pub fn classical_only(ed25519_verify: [u8; 32]) -> Self {
         Self {
             classical: ClassicalKeys {
                 ed25519_verify,
-                x25519_pub: [0u8; 32],
+                x25519_pub: crate::x25519::ed25519_pub_to_x25519(&ed25519_verify)
+                    .unwrap_or([0u8; 32]),
             },
             post_quantum: None,
         }
@@ -44,6 +56,29 @@ impl PubKeyBundle {
     /// included so encryption-key rotation does not change identity. This
     /// mirrors Matrix's master signing key and Signal's identity key model.
     pub fn identity_hash(&self) -> [u8; 16] {
+        Self::signing_identity_hash(
+            &self.classical.ed25519_verify,
+            self.post_quantum
+                .as_ref()
+                .map(|p| p.ml_dsa_verify.as_slice()),
+        )
+    }
+
+    /// Identity hash for a classical-only signer key WITHOUT constructing a
+    /// bundle (and without deriving its X25519). Cert `verify()` paths use
+    /// this for externally-supplied keys: verification only needs the
+    /// signing-material hash, so deriving an encryption key — or zero-filling
+    /// one via `classical_only`'s arbitrary-bytes fallback — is wasted work
+    /// and would couple cert verification to that fallback contract. Any
+    /// 32-byte key hashes here; a weak key simply fails the signer-hash
+    /// comparison or the signature check downstream. Because
+    /// `identity_hash()` excludes encryption keys, this equals
+    /// `classical_only(k).identity_hash()` for every `k`.
+    pub fn classical_identity_hash(ed25519_verify: &[u8; 32]) -> [u8; 16] {
+        Self::signing_identity_hash(ed25519_verify, None)
+    }
+
+    fn signing_identity_hash(ed25519_verify: &[u8; 32], ml_dsa_verify: Option<&[u8]>) -> [u8; 16] {
         // Build a stable, signing-only payload for hashing.
         #[derive(serde::Serialize)]
         struct SigningMaterial<'a> {
@@ -53,11 +88,8 @@ impl PubKeyBundle {
             ml_dsa_verify: Option<&'a [u8]>,
         }
         let payload = SigningMaterial {
-            ed25519_verify: &self.classical.ed25519_verify,
-            ml_dsa_verify: self
-                .post_quantum
-                .as_ref()
-                .map(|p| p.ml_dsa_verify.as_slice()),
+            ed25519_verify,
+            ml_dsa_verify,
         };
         let bytes = crate::cbor::to_canonical(&payload).expect("signing payload always encodes");
         let digest: [u8; 32] = harmony_crypto::hash::full_hash(&bytes);
@@ -103,6 +135,63 @@ mod tests {
             post_quantum: None,
         };
         assert_ne!(a.identity_hash(), b.identity_hash());
+    }
+
+    #[test]
+    fn classical_identity_hash_matches_classical_only_bundle() {
+        // The verify-path helper must agree with the bundle path forever:
+        // certs store identity hashes computed at sign() time via
+        // classical_only(); verify() recomputes via classical_identity_hash().
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x09u8; 32]);
+        let vk = sk.verifying_key().to_bytes();
+        assert_eq!(
+            PubKeyBundle::classical_identity_hash(&vk),
+            PubKeyBundle::classical_only(vk).identity_hash(),
+        );
+    }
+
+    #[test]
+    fn classical_identity_hash_accepts_small_order_key_without_panic() {
+        // External (attacker-supplied) keys flow through this helper in cert
+        // verify paths; it must hash ANY 32 bytes rather than panic.
+        let mut small_order = [0u8; 32];
+        small_order[0] = 1; // compressed identity point
+        let _ = PubKeyBundle::classical_identity_hash(&small_order); // must not panic
+    }
+
+    #[test]
+    fn classical_only_with_invalid_bytes_falls_back_to_zeroed_x25519_no_panic() {
+        // harmony-client derives friend owner-ids via
+        // classical_only(network_supplied_master_key).identity_hash(); a
+        // crafted small-order or off-curve key must NOT panic (remote DoS).
+        // It falls back to the pre-ZEB-372 zeroed x25519, and the identity
+        // hash still matches the dedicated helper.
+        let mut small_order = [0u8; 32];
+        small_order[0] = 1; // compressed identity point (small order)
+        let mut off_curve = [0u8; 32];
+        off_curve[0] = 2; // y = 2 is not on the curve
+        for bytes in [small_order, off_curve] {
+            let bundle = PubKeyBundle::classical_only(bytes);
+            assert_eq!(bundle.classical.x25519_pub, [0u8; 32], "zeros fallback");
+            assert_eq!(
+                bundle.identity_hash(),
+                PubKeyBundle::classical_identity_hash(&bytes),
+                "identity derivation unaffected by the fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn classical_only_populates_birational_x25519() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x07u8; 32]);
+        let vk = sk.verifying_key().to_bytes();
+        let bundle = PubKeyBundle::classical_only(vk);
+        assert_eq!(
+            bundle.classical.x25519_pub,
+            crate::x25519::ed25519_pub_to_x25519(&vk).unwrap(),
+            "classical_only must carry the birational X25519, not zeros"
+        );
+        assert_ne!(bundle.classical.x25519_pub, [0u8; 32]);
     }
 
     #[test]
