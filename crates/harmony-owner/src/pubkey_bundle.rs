@@ -49,6 +49,28 @@ impl PubKeyBundle {
     /// included so encryption-key rotation does not change identity. This
     /// mirrors Matrix's master signing key and Signal's identity key model.
     pub fn identity_hash(&self) -> [u8; 16] {
+        Self::signing_identity_hash(
+            &self.classical.ed25519_verify,
+            self.post_quantum
+                .as_ref()
+                .map(|p| p.ml_dsa_verify.as_slice()),
+        )
+    }
+
+    /// Identity hash for a classical-only signer key WITHOUT constructing a
+    /// bundle (and without deriving its X25519). Cert `verify()` paths use
+    /// this for externally-supplied keys, where `classical_only`'s
+    /// own-valid-key contract must not apply (it panics on non-canonical or
+    /// small-order points — a crafted cert could DoS a verifier). Any 32-byte
+    /// key hashes here; a weak key simply fails the signer-hash comparison or
+    /// the signature check downstream. Because `identity_hash()` excludes
+    /// encryption keys, this equals `classical_only(k).identity_hash()` for
+    /// every valid `k`.
+    pub fn classical_identity_hash(ed25519_verify: &[u8; 32]) -> [u8; 16] {
+        Self::signing_identity_hash(ed25519_verify, None)
+    }
+
+    fn signing_identity_hash(ed25519_verify: &[u8; 32], ml_dsa_verify: Option<&[u8]>) -> [u8; 16] {
         // Build a stable, signing-only payload for hashing.
         #[derive(serde::Serialize)]
         struct SigningMaterial<'a> {
@@ -58,11 +80,8 @@ impl PubKeyBundle {
             ml_dsa_verify: Option<&'a [u8]>,
         }
         let payload = SigningMaterial {
-            ed25519_verify: &self.classical.ed25519_verify,
-            ml_dsa_verify: self
-                .post_quantum
-                .as_ref()
-                .map(|p| p.ml_dsa_verify.as_slice()),
+            ed25519_verify,
+            ml_dsa_verify,
         };
         let bytes = crate::cbor::to_canonical(&payload).expect("signing payload always encodes");
         let digest: [u8; 32] = harmony_crypto::hash::full_hash(&bytes);
@@ -108,6 +127,28 @@ mod tests {
             post_quantum: None,
         };
         assert_ne!(a.identity_hash(), b.identity_hash());
+    }
+
+    #[test]
+    fn classical_identity_hash_matches_classical_only_bundle() {
+        // The verify-path helper must agree with the bundle path forever:
+        // certs store identity hashes computed at sign() time via
+        // classical_only(); verify() recomputes via classical_identity_hash().
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x09u8; 32]);
+        let vk = sk.verifying_key().to_bytes();
+        assert_eq!(
+            PubKeyBundle::classical_identity_hash(&vk),
+            PubKeyBundle::classical_only(vk).identity_hash(),
+        );
+    }
+
+    #[test]
+    fn classical_identity_hash_accepts_small_order_key_without_panic() {
+        // External (attacker-supplied) keys flow through this helper in cert
+        // verify paths; it must hash ANY 32 bytes rather than panic.
+        let mut small_order = [0u8; 32];
+        small_order[0] = 1; // compressed identity point
+        let _ = PubKeyBundle::classical_identity_hash(&small_order); // must not panic
     }
 
     #[test]

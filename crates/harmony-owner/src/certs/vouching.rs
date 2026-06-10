@@ -84,8 +84,9 @@ impl VouchingCert {
         // this prevents a cert that names device-A as signer from being
         // accepted as if signed by device-B (callers that only check the
         // ed25519 signature would otherwise be fooled).
-        let expected_signer =
-            PubKeyBundle::classical_only(signer_pubkey.to_bytes()).identity_hash();
+        // classical_identity_hash (not classical_only): signer_pubkey is
+        // externally supplied, and classical_only panics on small-order keys.
+        let expected_signer = PubKeyBundle::classical_identity_hash(&signer_pubkey.to_bytes());
         if self.signer != expected_signer {
             return Err(OwnerError::IdentityHashMismatch);
         }
@@ -118,6 +119,24 @@ mod tests {
         let cert =
             VouchingCert::sign(&sk, [1u8; 16], [3u8; 16], Stance::Vouch, 1_700_000_000).unwrap();
         cert.verify(&sk.verifying_key()).unwrap();
+    }
+
+    #[test]
+    fn verify_with_small_order_signer_key_errs_not_panics() {
+        // Regression (ZEB-372): classical_only() derives a birational X25519
+        // and panics on small-order points. verify() receives an EXTERNAL
+        // key, so a small-order signer key must yield Err (hash mismatch),
+        // never panic the verifier (DoS).
+        let sk = SigningKey::generate(&mut OsRng);
+        let cert =
+            VouchingCert::sign(&sk, [1u8; 16], [3u8; 16], Stance::Vouch, 1_700_000_000).unwrap();
+        let mut small_order = [0u8; 32];
+        small_order[0] = 1; // compressed identity point — from_bytes accepts it
+        let weak = VerifyingKey::from_bytes(&small_order).expect("dalek accepts identity point");
+        assert!(matches!(
+            cert.verify(&weak),
+            Err(OwnerError::IdentityHashMismatch)
+        ));
     }
 
     #[test]
