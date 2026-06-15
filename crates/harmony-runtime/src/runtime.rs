@@ -1568,14 +1568,24 @@ impl<B: BookStore> NodeRuntime<B> {
             _ => return,                      // Connecting, Connected, Disabled, or untracked
         }
 
-        // Find the first tunnel address on the contact.
+        // Find the first tunnel address on the contact, capturing any PQ keys
+        // stored directly on the address (ZEB-461 fallback).
         let tunnel_addr = match self.contact_store.get(&identity_hash) {
             Some(contact) => contact.addresses.iter().find_map(|addr| {
                 if let ContactAddress::Tunnel {
-                    node_id, relay_url, ..
+                    node_id,
+                    relay_url,
+                    peer_dsa_pubkey,
+                    peer_kem_pubkey,
+                    ..
                 } = addr
                 {
-                    Some((*node_id, relay_url.clone()))
+                    Some((
+                        *node_id,
+                        relay_url.clone(),
+                        peer_dsa_pubkey.clone(),
+                        peer_kem_pubkey.clone(),
+                    ))
                 } else {
                     None
                 }
@@ -1583,12 +1593,15 @@ impl<B: BookStore> NodeRuntime<B> {
             None => return,
         };
 
-        let (node_id, relay_url) = match tunnel_addr {
+        let (node_id, relay_url, contact_dsa, contact_kem) = match tunnel_addr {
             Some(t) => t,
             None => return,
         };
 
-        // Look up PQ public keys from the discovery record.
+        // Prefer PQ public keys from the discovery record; fall back to the
+        // keys stored on the contact's tunnel address (ZEB-461: friends who
+        // share no community never send a discovery announce, so the keys
+        // arrive via the friend-handshake contact record instead).
         let (peer_dsa_pubkey, peer_kem_pubkey) = match self
             .discovery
             .get_record(&identity_hash, self.last_unix_now)
@@ -1596,14 +1609,17 @@ impl<B: BookStore> NodeRuntime<B> {
             Some(record) if !record.public_key.is_empty() && !record.encryption_key.is_empty() => {
                 (record.public_key.clone(), record.encryption_key.clone())
             }
-            _ => {
-                tracing::info!(
-                    identity = %hex::encode(&identity_hash[..4]),
-                    "contact has tunnel address but PQ keys not in discovery cache — \
-                     tunnel dial deferred until announce arrives"
-                );
-                return;
-            }
+            _ => match (contact_dsa, contact_kem) {
+                (Some(d), Some(k)) if !d.is_empty() && !k.is_empty() => (d, k),
+                _ => {
+                    tracing::info!(
+                        identity = %hex::encode(&identity_hash[..4]),
+                        "contact has tunnel address but PQ keys not in discovery cache or contact — \
+                         tunnel dial deferred until announce arrives"
+                    );
+                    return;
+                }
+            },
         };
 
         tracing::info!(
@@ -7249,6 +7265,51 @@ mod tests {
         assert!(last_seen.is_some());
         // Should be a plausible Unix timestamp (after 2024-01-01).
         assert!(last_seen.unwrap() > 1_700_000_000);
+    }
+
+    #[test]
+    fn try_initiate_tunnel_uses_contact_pq_keys_when_discovery_empty() {
+        // A contact whose ContactAddress::Tunnel carries peer_dsa_pubkey /
+        // peer_kem_pubkey must still produce a RuntimeAction::InitiateTunnel
+        // when the discovery cache is empty (no announce has arrived yet).
+        // This is the ZEB-461 fallback: friends who share no community never
+        // send a discovery announce, so the keys must come from the contact
+        // record itself.
+        let (mut rt, _) = make_runtime();
+        let id = [0x09u8; 16];
+        let contact = harmony_contacts::Contact {
+            identity_hash: id,
+            display_name: None,
+            peering: harmony_contacts::PeeringPolicy {
+                enabled: true,
+                priority: harmony_contacts::PeeringPriority::Normal,
+            },
+            added_at: 0,
+            last_seen: None,
+            notes: None,
+            addresses: vec![harmony_contacts::ContactAddress::Tunnel {
+                node_id: [0x03u8; 32],
+                relay_url: None,
+                direct_addrs: vec![],
+                peer_dsa_pubkey: Some(vec![1u8; 1952]),
+                peer_kem_pubkey: Some(vec![2u8; 1184]),
+            }],
+            replication: None,
+        };
+        rt.contact_store_mut().add(contact).unwrap();
+        // ContactChanged registers the peer (→ Searching) then calls
+        // try_initiate_tunnel, which buffers the action into
+        // pending_direct_actions.  tick() drains that buffer.
+        rt.push_event(RuntimeEvent::ContactChanged { identity_hash: id });
+        let actions = rt.tick();
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                RuntimeAction::InitiateTunnel { peer_dsa_pubkey, peer_kem_pubkey, .. }
+                    if peer_dsa_pubkey.len() == 1952 && peer_kem_pubkey.len() == 1184
+            )),
+            "expected InitiateTunnel with contact PQ keys, got: {actions:?}"
+        );
     }
 
     // ── Replication tests ─────────────────────────────────────────────────
