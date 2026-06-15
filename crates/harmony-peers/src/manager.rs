@@ -230,8 +230,8 @@ impl PeerManager {
         peers: &mut HashMap<IdentityHash, PeerState>,
         identity_hash: IdentityHash,
         valid_states: &[PeerStatus],
-        contacts: &ContactStore,
-        actions: &mut Vec<PeerAction>,
+        _contacts: &ContactStore,
+        _actions: &mut Vec<PeerAction>,
     ) {
         if let Some(peer) = peers.get_mut(&identity_hash) {
             if valid_states.contains(&peer.status) {
@@ -240,7 +240,6 @@ impl PeerManager {
                 peer.retry_count = peer.retry_count.saturating_add(1);
                 peer.connecting_since = None;
                 peer.connection_quality = None;
-
             }
         }
     }
@@ -1091,7 +1090,6 @@ mod tests {
         assert_eq!(peer.retry_count, 1);
         assert!(peer.connection_quality.is_none());
     }
-
 
     #[test]
     fn probe_interval_varies_by_local_identity() {

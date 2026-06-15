@@ -163,7 +163,6 @@ mod tests {
         assert_eq!(decoded, tunnel_addr_no_relay);
     }
 
-
     #[test]
     fn replication_policy_roundtrip() {
         let policy = ReplicationPolicy {

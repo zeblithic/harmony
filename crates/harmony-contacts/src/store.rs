@@ -79,9 +79,9 @@ impl ContactStore {
     /// Consumer: `harmony-node` event loop (harmony-dgb/harmony-h6k integration).
     pub fn find_by_tunnel_node_id(&self, node_id: &[u8; 32]) -> Option<&Contact> {
         self.contacts.values().find(|c| {
-            c.addresses.iter().any(|addr| match addr {
-                ContactAddress::Tunnel { node_id: id, .. } => id == node_id,
-                _ => false,
+            c.addresses.iter().any(|addr| {
+                let ContactAddress::Tunnel { node_id: id, .. } = addr;
+                id == node_id
             })
         })
     }
@@ -281,6 +281,4 @@ mod tests {
         store.add(contact).unwrap();
         assert!(store.find_by_tunnel_node_id(&other_node_id).is_none());
     }
-
 }
-
