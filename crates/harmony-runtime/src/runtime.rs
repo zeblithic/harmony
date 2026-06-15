@@ -3735,7 +3735,7 @@ impl<B: BookStore> NodeRuntime<B> {
                         .update_last_seen(&identity_hash, unix_now);
                 }
                 PeerAction::InitiateLink { .. } | PeerAction::CloseLink { .. } => {
-                    // Reticulum link initiation/close — stub for now.
+                    // Direct (non-tunnel) link initiation/close — stub for now.
                 }
                 PeerAction::CloseTunnel { identity_hash } => {
                     out.push(RuntimeAction::CloseTunnel { identity_hash });
