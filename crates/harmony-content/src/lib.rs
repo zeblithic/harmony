@@ -18,7 +18,6 @@ pub mod sketch;
 pub mod replica;
 pub mod vine;
 
-pub mod reticulum_bridge;
 pub mod storage_tier;
 pub mod zenoh_bridge;
 

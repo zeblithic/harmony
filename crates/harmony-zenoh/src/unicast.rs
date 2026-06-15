@@ -54,7 +54,7 @@ pub mod channels {
 /// Wire protocol frame tag for unicast messages.
 ///
 /// Sits alongside `0x01` (control) and `0x02` (pub/sub data) in the
-/// Reticulum Link data channel framing.
+/// Harmony data channel framing.
 pub const FRAME_TAG_UNICAST: u8 = 0x03;
 
 /// Minimum unicast frame size: 1 (tag) + 2 (channel_id).

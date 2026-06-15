@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 #[serde(try_from = "u8", into = "u8")]
 #[repr(u8)]
 pub enum CryptoSuite {
-    /// Ed25519 signing + X25519 encryption (Reticulum-compatible).
+    /// Ed25519 signing + X25519 encryption (classical, interop layer).
     /// Backward-compatibility layer — NOT post-quantum secure.
     Ed25519 = 0x00,
     /// ML-DSA-65 signing + ML-KEM-768 encryption (NIST FIPS 203/204).

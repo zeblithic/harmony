@@ -1,6 +1,6 @@
 //! Self-sovereign Ed25519/X25519 identity management.
 //!
-//! An identity in Harmony (and Reticulum) consists of:
+//! An identity in Harmony consists of:
 //! - An X25519 keypair for Diffie-Hellman key exchange (encryption)
 //! - An Ed25519 keypair for digital signatures
 //!
@@ -109,7 +109,7 @@ impl Identity {
     ///
     /// Returns: `[32B ephemeral X25519 pub][Fernet token]`
     ///
-    /// This matches Reticulum's encryption scheme:
+    /// Ephemeral ECDH + HKDF + Fernet encryption scheme:
     /// 1. Generate ephemeral X25519 keypair
     /// 2. ECDH with recipient's X25519 public key → shared secret
     /// 3. HKDF-SHA256(shared_secret, salt=address_hash) → 64-byte derived key

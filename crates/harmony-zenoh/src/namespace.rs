@@ -4,7 +4,6 @@
 //!
 //! | Tier | Prefix | Purpose |
 //! |------|--------|---------|
-//! | 1 | `harmony/reticulum/` | Router: packet forwarding, announces, links |
 //! | 2 | `harmony/content/`, `harmony/announce/` | Storage: CAS fetch, caching, availability |
 //! | 3 | `harmony/compute/`, `harmony/workflow/` | Compute: WASM execution, durable workflows |
 //! | — | `harmony/presence/`, `harmony/community/`, etc. | Cross-tier and application layer |
@@ -35,49 +34,6 @@ impl Locality {
     /// Returns `true` if the reply came from this node.
     pub fn is_local(self) -> bool {
         self == Locality::Local
-    }
-}
-
-// ── Tier 1: Router (Reticulum) ──────────────────────────────────────
-
-/// Reticulum router key expressions.
-pub mod reticulum {
-    use alloc::{format, string::String};
-    /// Base prefix: `harmony/reticulum`
-    pub const PREFIX: &str = "harmony/reticulum";
-
-    /// Path announcement prefix: `harmony/reticulum/announce`
-    pub const ANNOUNCE: &str = "harmony/reticulum/announce";
-
-    /// Bidirectional link prefix: `harmony/reticulum/link`
-    pub const LINK: &str = "harmony/reticulum/link";
-
-    /// Router diagnostics prefix: `harmony/reticulum/diagnostics`
-    pub const DIAGNOSTICS: &str = "harmony/reticulum/diagnostics";
-
-    // ── Subscription patterns ───────────────────────────────────
-
-    /// Subscribe to all announces: `harmony/reticulum/announce/*`
-    pub const ANNOUNCE_SUB: &str = "harmony/reticulum/announce/*";
-
-    /// Subscribe to all link data: `harmony/reticulum/link/*`
-    pub const LINK_SUB: &str = "harmony/reticulum/link/*";
-
-    // ── Builders ────────────────────────────────────────────────
-
-    /// `harmony/reticulum/announce/{dest_hash}`
-    pub fn announce_key(dest_hash: &str) -> String {
-        format!("{ANNOUNCE}/{dest_hash}")
-    }
-
-    /// `harmony/reticulum/link/{link_id}`
-    pub fn link_key(link_id: &str) -> String {
-        format!("{LINK}/{link_id}")
-    }
-
-    /// `harmony/reticulum/diagnostics/{node_addr}`
-    pub fn diagnostics_key(node_addr: &str) -> String {
-        format!("{DIAGNOSTICS}/{node_addr}")
     }
 }
 
@@ -848,38 +804,6 @@ mod tests {
         assert!(!Locality::Remote.is_local());
     }
 
-    // ── Tier 1: Reticulum ───────────────────────────────────────
-
-    #[test]
-    fn reticulum_announce_key() {
-        assert_eq!(
-            reticulum::announce_key("deadbeef01234567"),
-            "harmony/reticulum/announce/deadbeef01234567"
-        );
-    }
-
-    #[test]
-    fn reticulum_link_key() {
-        assert_eq!(
-            reticulum::link_key("link42"),
-            "harmony/reticulum/link/link42"
-        );
-    }
-
-    #[test]
-    fn reticulum_diagnostics_key() {
-        assert_eq!(
-            reticulum::diagnostics_key("abcd1234"),
-            "harmony/reticulum/diagnostics/abcd1234"
-        );
-    }
-
-    #[test]
-    fn reticulum_subscription_patterns() {
-        assert_eq!(reticulum::ANNOUNCE_SUB, "harmony/reticulum/announce/*");
-        assert_eq!(reticulum::LINK_SUB, "harmony/reticulum/link/*");
-    }
-
     // ── Tier 2: Content ─────────────────────────────────────────
 
     #[test]
@@ -1383,7 +1307,6 @@ mod tests {
     #[test]
     fn all_prefixes_start_with_root() {
         let prefixes = [
-            reticulum::PREFIX,
             content::PREFIX,
             announce::PREFIX,
             filters::PREFIX,

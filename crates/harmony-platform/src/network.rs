@@ -8,9 +8,8 @@ use crate::error::PlatformError;
 /// calls [`NetworkInterface::send`] to actuate `SendOnInterface` actions from
 /// the sans-I/O state machines. This bridges real I/O to the event/action model.
 ///
-/// The existing `Interface` trait in `harmony-reticulum` carries
-/// protocol-specific metadata (mode, bitrate, stats). `NetworkInterface`
-/// is the platform bridge — focused purely on byte I/O.
+/// `NetworkInterface` is the platform byte-I/O bridge — focused purely on
+/// byte I/O, not protocol-specific metadata (mode, bitrate, stats).
 pub trait NetworkInterface {
     /// Human-readable interface name (e.g., `"eth0"`, `"lora0"`).
     fn name(&self) -> &str;

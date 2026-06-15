@@ -1,6 +1,6 @@
-//! Reticulum-compatible Fernet token encryption.
+//! Fernet token encryption (legacy interop format).
 //!
-//! Token format (no version byte or timestamp, matching Reticulum):
+//! Token format (no version byte or timestamp; stripped-down Fernet):
 //! ```text
 //! [16 bytes IV] [N bytes AES-256-CBC ciphertext (PKCS7 padded)] [32 bytes HMAC-SHA256]
 //! ```
@@ -35,7 +35,7 @@ const AES256_KEY_LENGTH: usize = 32;
 /// valid token is: 16 (IV) + 16 (one AES block) + 32 (HMAC) = 64 bytes.
 pub const FERNET_TOKEN_MIN: usize = IV_LENGTH + 16 + HMAC_LENGTH;
 
-/// Encrypt plaintext using Reticulum-compatible Fernet.
+/// Encrypt plaintext using Harmony Fernet (legacy interop format).
 ///
 /// `key` must be 64 bytes: `[32B signing key][32B encryption key]`.
 /// Returns `[16B IV][ciphertext with PKCS7 padding][32B HMAC]`.
@@ -69,7 +69,7 @@ pub fn encrypt(
     Ok(token)
 }
 
-/// Decrypt a Reticulum-compatible Fernet token.
+/// Decrypt a Harmony Fernet token (legacy interop format).
 ///
 /// `key` must be 64 bytes: `[32B signing key][32B encryption key]`.
 /// Verifies HMAC in constant time before decrypting.

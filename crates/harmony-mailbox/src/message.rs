@@ -1,7 +1,7 @@
 //! Harmony-native email message format.
 //!
 //! Binary wire format for HarmonyMessage -- the internal representation used
-//! after SMTP ingress and before Reticulum/Zenoh transport.
+//! after SMTP ingress and before Zenoh transport.
 //!
 //! ## Wire form = delivery form (ZEB-100)
 //!
