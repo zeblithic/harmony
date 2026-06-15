@@ -785,6 +785,8 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                         node_id,
                         relay_url,
                         direct_addrs: vec![],
+                        peer_dsa_pubkey: None,
+                        peer_kem_pubkey: None,
                     }],
                     replication: None,
                 };

@@ -259,6 +259,8 @@ mod tests {
             node_id,
             relay_url: None,
             direct_addrs: vec![],
+            peer_dsa_pubkey: None,
+            peer_kem_pubkey: None,
         });
         store.add(contact).unwrap();
         let found = store.find_by_tunnel_node_id(&node_id);
@@ -277,6 +279,8 @@ mod tests {
             node_id,
             relay_url: None,
             direct_addrs: vec![],
+            peer_dsa_pubkey: None,
+            peer_kem_pubkey: None,
         });
         store.add(contact).unwrap();
         assert!(store.find_by_tunnel_node_id(&other_node_id).is_none());

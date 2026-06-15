@@ -423,6 +423,8 @@ mod tests {
             node_id: [0xAA; 32],
             relay_url: Some("https://iroh.q8.fyi".into()),
             direct_addrs: vec![],
+            peer_dsa_pubkey: None,
+            peer_kem_pubkey: None,
         }];
         if with_reticulum {
             addrs.push(ContactAddress::Reticulum {

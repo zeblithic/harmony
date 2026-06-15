@@ -12,6 +12,14 @@ pub enum ContactAddress {
         node_id: [u8; 32],
         relay_url: Option<String>,
         direct_addrs: Vec<String>,
+        /// ML-DSA-65 public key (1952 bytes) for the tunnel handshake, learned
+        /// out-of-band (e.g. a friend handshake) when no discovery announce
+        /// exists. `try_initiate_tunnel` falls back to this on discovery miss. ZEB-461.
+        #[serde(default)]
+        peer_dsa_pubkey: Option<Vec<u8>>,
+        /// ML-KEM-768 public key (1184 bytes), paired with `peer_dsa_pubkey`. ZEB-461.
+        #[serde(default)]
+        peer_kem_pubkey: Option<Vec<u8>>,
     },
 }
 
@@ -135,6 +143,8 @@ mod tests {
                 node_id: [0xEE; 32],
                 relay_url: Some("https://iroh.q8.fyi".into()),
                 direct_addrs: vec!["192.168.1.10:4242".into()],
+                peer_dsa_pubkey: None,
+                peer_kem_pubkey: None,
             }],
             replication: None,
         };
@@ -158,6 +168,8 @@ mod tests {
             node_id: [0x22; 32],
             relay_url: Some("https://relay.example.com".into()),
             direct_addrs: vec!["192.168.1.1:1234".into(), "10.0.0.1:5678".into()],
+            peer_dsa_pubkey: None,
+            peer_kem_pubkey: None,
         };
         let bytes = postcard::to_allocvec(&tunnel_addr).unwrap();
         let decoded: ContactAddress = postcard::from_bytes(&bytes).unwrap();
@@ -167,6 +179,8 @@ mod tests {
             node_id: [0x33; 32],
             relay_url: None,
             direct_addrs: vec![],
+            peer_dsa_pubkey: None,
+            peer_kem_pubkey: None,
         };
         let bytes = postcard::to_allocvec(&tunnel_addr_no_relay).unwrap();
         let decoded: ContactAddress = postcard::from_bytes(&bytes).unwrap();
@@ -193,6 +207,8 @@ mod tests {
                     node_id: [0xBB; 32],
                     relay_url: Some("https://relay.example.com".into()),
                     direct_addrs: vec!["127.0.0.1:1234".into()],
+                    peer_dsa_pubkey: None,
+                    peer_kem_pubkey: None,
                 },
             ],
             replication: None,
@@ -240,5 +256,48 @@ mod tests {
                 quota_bytes: 10 * 1024 * 1024 * 1024
             })
         );
+    }
+
+    #[test]
+    fn tunnel_address_roundtrips_with_pq_keys() {
+        let addr = ContactAddress::Tunnel {
+            node_id: [7u8; 32],
+            relay_url: Some("https://relay.example".into()),
+            direct_addrs: vec![],
+            peer_dsa_pubkey: Some(vec![1, 2, 3]),
+            peer_kem_pubkey: Some(vec![4, 5, 6]),
+        };
+        let bytes = postcard::to_allocvec(&addr).unwrap();
+        let back: ContactAddress = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(addr, back);
+    }
+
+    #[test]
+    fn tunnel_address_pq_keys_none_roundtrip() {
+        // Verifies that None PQ fields serialize and deserialize cleanly.
+        // (postcard uses compact binary encoding; #[serde(default)] provides
+        // backward compat only for text-based formats. The contact store is
+        // rebuilt on each startup, so binary compat is not a concern — see
+        // the FORMAT_VERSION strict check in store.rs.)
+        let addr = ContactAddress::Tunnel {
+            node_id: [0u8; 32],
+            relay_url: None,
+            direct_addrs: vec![],
+            peer_dsa_pubkey: None,
+            peer_kem_pubkey: None,
+        };
+        let bytes = postcard::to_allocvec(&addr).unwrap();
+        let back: ContactAddress = postcard::from_bytes(&bytes).unwrap();
+        match back {
+            ContactAddress::Tunnel {
+                peer_dsa_pubkey,
+                peer_kem_pubkey,
+                ..
+            } => {
+                assert!(peer_dsa_pubkey.is_none());
+                assert!(peer_kem_pubkey.is_none());
+            }
+            _ => panic!("expected Tunnel"),
+        }
     }
 }

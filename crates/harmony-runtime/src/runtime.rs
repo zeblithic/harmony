@@ -3036,6 +3036,8 @@ impl<B: BookStore> NodeRuntime<B> {
                         node_id: *node_id,
                         relay_url: relay_url.clone(),
                         direct_addrs: direct_addrs.clone(),
+                        peer_dsa_pubkey: None,
+                        peer_kem_pubkey: None,
                     })
                 } else {
                     None
@@ -7042,6 +7044,8 @@ mod tests {
                 node_id: [0x11; 32],
                 relay_url: None,
                 direct_addrs: vec![],
+                peer_dsa_pubkey: None,
+                peer_kem_pubkey: None,
             }],
             replication: None,
         };
@@ -7225,6 +7229,8 @@ mod tests {
                 node_id: [0xCC; 32],
                 relay_url: None,
                 direct_addrs: vec![],
+                peer_dsa_pubkey: None,
+                peer_kem_pubkey: None,
             }],
             replication: None,
         };
