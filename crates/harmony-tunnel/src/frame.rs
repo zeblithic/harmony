@@ -9,7 +9,6 @@ use crate::error::TunnelError;
 #[repr(u8)]
 pub enum FrameTag {
     Keepalive = 0x00,
-    Reticulum = 0x01,
     Zenoh = 0x02,
     Replication = 0x03,
     /// ZEB-472: opaque 1:1 DM body (already sealed+signed by the caller) carried
@@ -21,7 +20,6 @@ impl FrameTag {
     pub fn from_byte(b: u8) -> Result<Self, TunnelError> {
         match b {
             0x00 => Ok(Self::Keepalive),
-            0x01 => Ok(Self::Reticulum),
             0x02 => Ok(Self::Zenoh),
             0x03 => Ok(Self::Replication),
             0x04 => Ok(Self::Dm),
@@ -138,7 +136,7 @@ mod tests {
     #[test]
     fn frame_encode_decode_roundtrip() {
         let frame = Frame {
-            tag: FrameTag::Reticulum,
+            tag: FrameTag::Zenoh,
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
         };
 
@@ -146,7 +144,7 @@ mod tests {
         assert_eq!(bytes.len(), 1 + 4 + 4); // tag + length + payload
 
         let decoded = Frame::decode(&bytes).unwrap();
-        assert_eq!(decoded.tag, FrameTag::Reticulum);
+        assert_eq!(decoded.tag, FrameTag::Zenoh);
         assert_eq!(decoded.payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
@@ -188,7 +186,7 @@ mod tests {
         let wrong_aad = [0xCDu8; 32];
 
         let frame = Frame {
-            tag: FrameTag::Reticulum,
+            tag: FrameTag::Zenoh,
             payload: b"secret".to_vec(),
         };
 
@@ -217,6 +215,9 @@ mod tests {
     #[test]
     fn from_byte_maps_dm_and_still_rejects_unknown() {
         assert_eq!(FrameTag::from_byte(0x04).unwrap(), FrameTag::Dm);
+        // Retired wire tag 0x01 (former FrameTag::Reticulum) must stay invalid
+        // after the ZEB-475 teardown — its byte is never re-mapped.
+        assert!(FrameTag::from_byte(0x01).is_err());
         // The set stays closed — tags beyond the known ones are still rejected.
         assert!(FrameTag::from_byte(0x05).is_err());
         assert!(FrameTag::from_byte(0xFF).is_err());

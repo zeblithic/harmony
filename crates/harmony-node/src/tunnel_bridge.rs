@@ -20,12 +20,6 @@ pub enum TunnelBridgeEvent {
         /// Monotonic connection ID assigned by the event loop.
         connection_id: u64,
     },
-    /// A decrypted Reticulum packet arrived from a tunnel peer.
-    ReticulumReceived {
-        interface_name: String,
-        packet: Vec<u8>,
-        connection_id: u64,
-    },
     /// A decrypted Zenoh message arrived from a tunnel peer.
     ZenohReceived {
         interface_name: String,
@@ -58,8 +52,6 @@ pub struct TunnelSender {
 /// Commands sent from the event loop to a tunnel task.
 #[derive(Debug)]
 pub enum TunnelCommand {
-    /// Send a Reticulum packet through this tunnel.
-    SendReticulum { packet: Vec<u8> },
     /// Send a Zenoh message through this tunnel.
     SendZenoh { message: Vec<u8> },
     /// Close this tunnel.
@@ -85,12 +77,5 @@ pub struct ReadyConnection {
 impl TunnelSender {
     pub fn new(tx: mpsc::Sender<TunnelCommand>, connection_id: u64) -> Self {
         Self { tx, connection_id }
-    }
-
-    pub fn try_send_reticulum(
-        &self,
-        packet: Vec<u8>,
-    ) -> Result<(), mpsc::error::TrySendError<TunnelCommand>> {
-        self.tx.try_send(TunnelCommand::SendReticulum { packet })
     }
 }

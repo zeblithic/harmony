@@ -1,6 +1,6 @@
 //! ChaCha20-Poly1305 AEAD encryption for Harmony-native E2EE.
 //!
-//! This is the preferred cipher for Harmony traffic (vs Fernet for Reticulum compat).
+//! This is the preferred cipher for Harmony-native traffic (vs Fernet for legacy compat).
 //! Single-pass authenticated encryption with associated data.
 //!
 //! # Security: Nonce Reuse

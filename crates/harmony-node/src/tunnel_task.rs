@@ -4,7 +4,7 @@
 //! It owns a TunnelSession state machine and drives it by:
 //! 1. Reading bytes from the iroh RecvStream -> TunnelEvent::InboundBytes
 //! 2. Processing TunnelActions: OutboundBytes -> iroh SendStream
-//! 3. Forwarding ReticulumReceived/ZenohReceived -> TunnelBridgeEvent via mpsc
+//! 3. Forwarding ZenohReceived/ReplicationReceived -> TunnelBridgeEvent via mpsc
 //! 4. Running a keepalive timer -> TunnelEvent::Tick
 
 use std::time::{Duration, Instant};
@@ -355,21 +355,6 @@ async fn run_tunnel_loop(
             // Commands from the event loop
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(TunnelCommand::SendReticulum { packet }) => {
-                        let now_ms = millis_since_start();
-                        match session.handle_event(TunnelEvent::SendReticulum { packet, now_ms }) {
-                            Ok(actions) => {
-                                if !dispatch_tunnel_actions(
-                                    &actions, &mut send_stream, &bridge_tx, &interface_name, connection_id,
-                                ).await {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(%interface_name, err = %e, "send reticulum error");
-                            }
-                        }
-                    }
                     Some(TunnelCommand::SendZenoh { message }) => {
                         let now_ms = millis_since_start();
                         match session.handle_event(TunnelEvent::SendZenoh { message, now_ms }) {
@@ -442,7 +427,7 @@ async fn run_tunnel_loop(
 ///
 /// Two-pass dispatch: OutboundBytes are written first (ensuring e.g. TunnelAccept
 /// is on the wire before HandshakeComplete registers the interface), then
-/// bridge events (HandshakeComplete, ReticulumReceived, etc.) are forwarded.
+/// bridge events (HandshakeComplete, ZenohReceived, etc.) are forwarded.
 ///
 /// **Invariant:** TunnelSession guarantees that OutboundBytes always precede
 /// Error/Closed in the returned action slice. If this invariant is violated,
@@ -506,15 +491,6 @@ async fn dispatch_tunnel_actions(
                         interface_name: interface_name.to_string(),
                         peer_node_id: *peer_node_id,
                         peer_dsa_pubkey: peer_dsa_pubkey.clone(),
-                        connection_id,
-                    })
-                    .await;
-            }
-            TunnelAction::ReticulumReceived { packet } => {
-                let _ = bridge_tx
-                    .send(TunnelBridgeEvent::ReticulumReceived {
-                        interface_name: interface_name.to_string(),
-                        packet: packet.clone(),
                         connection_id,
                     })
                     .await;
@@ -586,9 +562,9 @@ async fn write_length_prefixed(
 const HANDSHAKE_MAX_MESSAGE: usize = 8 * 1024;
 
 /// Maximum message size during the authenticated data phase.
-/// Reticulum MTU is 500–1024 bytes; the higher cap here covers Zenoh
-/// content-item frames routed over the tunnel (Bead #3). Capped at 2 MiB
-/// to limit per-peer allocation (64 peers × 2 MiB = 128 MiB worst case).
+/// Sized to cover Zenoh content-item frames routed over the tunnel (Bead #3).
+/// Capped at 2 MiB to limit per-peer allocation (64 peers × 2 MiB = 128 MiB
+/// worst case).
 const DATA_MAX_MESSAGE: usize = 2 * 1024 * 1024;
 
 /// Read a length-prefixed message: [4 bytes big-endian length][payload].

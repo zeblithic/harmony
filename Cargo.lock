@@ -3636,7 +3636,6 @@ dependencies = [
  "harmony-memo",
  "harmony-peers",
  "harmony-rawlink",
- "harmony-reticulum",
  "harmony-runtime",
  "harmony-s3",
  "harmony-speculative",
@@ -3777,23 +3776,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "harmony-reticulum"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "harmony-crypto",
- "harmony-identity",
- "hashbrown 0.15.5",
- "hex",
- "rand 0.8.5",
- "rand_core 0.6.4",
- "rmp",
- "thiserror 2.0.18",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
 name = "harmony-roxy"
 version = "0.1.0"
 dependencies = [
@@ -3829,7 +3811,6 @@ dependencies = [
  "harmony-inference",
  "harmony-memo",
  "harmony-peers",
- "harmony-reticulum",
  "harmony-speculative",
  "harmony-workflow",
  "harmony-zenoh",
@@ -7122,15 +7103,6 @@ checksum = "8d3e7aa0a681b232e7cd7f856a53b10603df88ca74b79a8d8088845185492e35"
 dependencies = [
  "array-init",
  "crossbeam",
-]
-
-[[package]]
-name = "rmp"
-version = "0.8.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
-dependencies = [
- "num-traits",
 ]
 
 [[package]]

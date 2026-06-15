@@ -2,7 +2,7 @@ use harmony_contacts::PeeringPriority;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
-    /// Connected via LAN/mesh Reticulum link.
+    /// Connected via LAN/mesh link.
     /// Not yet constructed — reserved for harmony-k4g (LAN peer discovery).
     #[allow(dead_code)]
     Lan,

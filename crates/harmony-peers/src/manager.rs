@@ -70,18 +70,14 @@ impl PeerManager {
 
                         // Check whether the contact has a Tunnel address — if so, prefer it.
                         let tunnel_action = contacts.get(&identity_hash).and_then(|contact| {
-                            contact.addresses.iter().find_map(|addr| {
-                                if let ContactAddress::Tunnel {
+                            contact.addresses.first().map(|addr| {
+                                let ContactAddress::Tunnel {
                                     node_id, relay_url, ..
-                                } = addr
-                                {
-                                    Some(PeerAction::InitiateTunnel {
-                                        identity_hash,
-                                        node_id: *node_id,
-                                        relay_url: relay_url.clone(),
-                                    })
-                                } else {
-                                    None
+                                } = addr;
+                                PeerAction::InitiateTunnel {
+                                    identity_hash,
+                                    node_id: *node_id,
+                                    relay_url: relay_url.clone(),
                                 }
                             })
                         });
@@ -106,21 +102,17 @@ impl PeerManager {
                                 .get(&identity_hash)
                                 .and_then(|c| {
                                     c.addresses.iter().find_map(|addr| {
-                                        if let ContactAddress::Tunnel {
+                                        let ContactAddress::Tunnel {
                                             node_id: addr_node_id,
                                             relay_url,
                                             ..
-                                        } = addr
-                                        {
-                                            if *addr_node_id == node_id {
-                                                // TODO: This infers relayed from the stored
-                                                // config, not the actual connection path. Once
-                                                // TunnelBridgeEvent carries the real relay status
-                                                // from iroh-net, pass it through TunnelEstablished.
-                                                Some(relay_url.is_some())
-                                            } else {
-                                                None
-                                            }
+                                        } = addr;
+                                        if *addr_node_id == node_id {
+                                            // TODO: This infers relayed from the stored
+                                            // config, not the actual connection path. Once
+                                            // TunnelBridgeEvent carries the real relay status
+                                            // from iroh-net, pass it through TunnelEstablished.
+                                            Some(relay_url.is_some())
                                         } else {
                                             None
                                         }
@@ -164,8 +156,6 @@ impl PeerManager {
                     &mut self.peers,
                     identity_hash,
                     &[PeerStatus::Connecting],
-                    contacts,
-                    &mut actions,
                 );
             }
             PeerEvent::TunnelDropped { identity_hash } => {
@@ -173,8 +163,6 @@ impl PeerManager {
                     &mut self.peers,
                     identity_hash,
                     &[PeerStatus::Connected, PeerStatus::Connecting],
-                    contacts,
-                    &mut actions,
                 );
             }
             PeerEvent::LinkEstablished { identity_hash, now } => {
@@ -225,14 +213,11 @@ impl PeerManager {
 
     /// Shared disconnect handler for TunnelFailed and TunnelDropped.
     ///
-    /// Resets probe timing, increments retry count, clears connection quality,
-    /// and falls back to Reticulum if the contact has a Reticulum address.
+    /// Resets probe timing, increments retry count, and clears connection quality.
     fn handle_tunnel_disconnect(
         peers: &mut HashMap<IdentityHash, PeerState>,
         identity_hash: IdentityHash,
         valid_states: &[PeerStatus],
-        contacts: &ContactStore,
-        actions: &mut Vec<PeerAction>,
     ) {
         if let Some(peer) = peers.get_mut(&identity_hash) {
             if valid_states.contains(&peer.status) {
@@ -241,22 +226,6 @@ impl PeerManager {
                 peer.retry_count = peer.retry_count.saturating_add(1);
                 peer.connecting_since = None;
                 peer.connection_quality = None;
-
-                // If the contact also has a Reticulum address, immediately
-                // fall back — no backoff for the fallback path.
-                let has_reticulum = contacts
-                    .get(&identity_hash)
-                    .map(|c| {
-                        c.addresses
-                            .iter()
-                            .any(|addr| matches!(addr, ContactAddress::Reticulum { .. }))
-                    })
-                    .unwrap_or(false);
-
-                if has_reticulum {
-                    actions.push(PeerAction::InitiateLink { identity_hash });
-                    peer.status = PeerStatus::Connecting;
-                }
             }
         }
     }
@@ -415,20 +384,12 @@ mod tests {
         store
     }
 
-    fn make_tunnel_contact(
-        identity_hash: IdentityHash,
-        with_reticulum: bool,
-    ) -> (ContactStore, Contact) {
-        let mut addrs = vec![ContactAddress::Tunnel {
+    fn make_tunnel_contact(identity_hash: IdentityHash) -> (ContactStore, Contact) {
+        let addrs = vec![ContactAddress::Tunnel {
             node_id: [0xAA; 32],
             relay_url: Some("https://iroh.q8.fyi".into()),
             direct_addrs: vec![],
         }];
-        if with_reticulum {
-            addrs.push(ContactAddress::Reticulum {
-                destination_hash: [0xBB; 16],
-            });
-        }
         let contact = Contact {
             identity_hash,
             display_name: None,
@@ -1050,7 +1011,7 @@ mod tests {
     #[test]
     fn tunnel_address_emits_initiate_tunnel() {
         let id: IdentityHash = [0xD0; 16];
-        let (store, _) = make_tunnel_contact(id, false);
+        let (store, _) = make_tunnel_contact(id);
         let mut mgr = PeerManager::new();
         mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
         let actions = mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
@@ -1074,7 +1035,7 @@ mod tests {
     #[test]
     fn tunnel_established_transitions_to_connected() {
         let id: IdentityHash = [0xD1; 16];
-        let (store, _) = make_tunnel_contact(id, false);
+        let (store, _) = make_tunnel_contact(id);
         let mut mgr = PeerManager::new();
         mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
         mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
@@ -1103,7 +1064,7 @@ mod tests {
     #[test]
     fn tunnel_failed_transitions_to_searching() {
         let id: IdentityHash = [0xD2; 16];
-        let (store, _) = make_tunnel_contact(id, false);
+        let (store, _) = make_tunnel_contact(id);
         let mut mgr = PeerManager::new();
         mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
         mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
@@ -1114,66 +1075,6 @@ mod tests {
         assert_eq!(peer.status, PeerStatus::Searching);
         assert_eq!(peer.retry_count, 1);
         assert!(peer.connection_quality.is_none());
-    }
-
-    #[test]
-    fn tunnel_dropped_falls_back_to_reticulum() {
-        let id: IdentityHash = [0xD3; 16];
-        let (store, _) = make_tunnel_contact(id, true); // Tunnel + Reticulum
-        let mut mgr = PeerManager::new();
-        mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
-        mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
-        mgr.on_event(
-            PeerEvent::TunnelEstablished {
-                identity_hash: id,
-                node_id: [0xAA; 32],
-                now: 8000,
-            },
-            &store,
-        );
-        assert_eq!(mgr.peers.get(&id).unwrap().status, PeerStatus::Connected);
-
-        let actions = mgr.on_event(PeerEvent::TunnelDropped { identity_hash: id }, &store);
-        let peer = mgr.peers.get(&id).unwrap();
-        // Falls back to Reticulum immediately — status is Connecting, not Searching.
-        assert_eq!(peer.status, PeerStatus::Connecting);
-        assert_eq!(peer.retry_count, 1);
-        assert!(peer.connection_quality.is_none());
-        // Should immediately emit InitiateLink as Reticulum fallback
-        assert!(
-            actions.contains(&PeerAction::InitiateLink { identity_hash: id }),
-            "expected InitiateLink fallback, got: {actions:?}"
-        );
-    }
-
-    #[test]
-    fn tunnel_dropped_no_fallback_without_reticulum_address() {
-        let id: IdentityHash = [0xD4; 16];
-        let (store, _) = make_tunnel_contact(id, false); // Tunnel only
-        let mut mgr = PeerManager::new();
-        mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
-        mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
-        mgr.on_event(
-            PeerEvent::TunnelEstablished {
-                identity_hash: id,
-                node_id: [0xAA; 32],
-                now: 8000,
-            },
-            &store,
-        );
-        assert_eq!(mgr.peers.get(&id).unwrap().status, PeerStatus::Connected);
-
-        let actions = mgr.on_event(PeerEvent::TunnelDropped { identity_hash: id }, &store);
-        let peer = mgr.peers.get(&id).unwrap();
-        assert_eq!(peer.status, PeerStatus::Searching);
-        assert_eq!(peer.retry_count, 1);
-        // No Reticulum address → no InitiateLink
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, PeerAction::InitiateLink { .. })),
-            "should NOT emit InitiateLink when there is no Reticulum address"
-        );
     }
 
     #[test]

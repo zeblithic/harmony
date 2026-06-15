@@ -30,7 +30,6 @@ members = [
     "crates/harmony-pkarr",
     "crates/harmony-profile",
     "crates/harmony-platform",
-    "crates/harmony-reticulum",
     "crates/harmony-runtime",
     "crates/harmony-roxy",
     "crates/harmony-trust",
@@ -183,7 +182,6 @@ harmony-memo = { path = "crates/harmony-memo", default-features = false }
 harmony-peers = { path = "crates/harmony-peers", default-features = false }
 harmony-profile = { path = "crates/harmony-profile", default-features = false }
 harmony-platform = { path = "crates/harmony-platform", default-features = false }
-harmony-reticulum = { path = "crates/harmony-reticulum", default-features = false }
 harmony-runtime = { path = "crates/harmony-runtime", default-features = false }
 harmony-sdjwt = { path = "crates/harmony-sdjwt", default-features = false }
 harmony-roxy = { path = "crates/harmony-roxy", default-features = false }

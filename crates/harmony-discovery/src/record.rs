@@ -4,7 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DiscoveryError;
 
-const FORMAT_VERSION: u8 = 3;
+// v4 (ZEB-475): `RoutingHint::Reticulum` was removed. postcard encodes enum
+// variants by index, so dropping a variant shifts every later variant's
+// discriminant — an on-wire break. Bumping the version byte makes mixed-version
+// nodes reject foreign-format announces cleanly instead of silently misparsing.
+const FORMAT_VERSION: u8 = 4;
 
 /// Internal struct for the signable portion of an announce record.
 /// Everything except the signature.
@@ -23,8 +27,6 @@ struct SignablePayload {
 /// A routing hint that tells peers how to reach this identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoutingHint {
-    /// Reticulum destination hash (16 bytes).
-    Reticulum { destination_hash: [u8; 16] },
     /// Zenoh locator (e.g. `"tcp/192.168.1.1:7447"`).
     Zenoh { locator: alloc::string::String },
     /// iroh-net tunnel: NodeId + optional relay + optional direct addresses.
@@ -107,10 +109,11 @@ impl AnnounceRecord {
         if data.is_empty() {
             return Err(DiscoveryError::DeserializeError("empty data"));
         }
-        // Strict version check. V1 records would fail signature verification
-        // because signable_bytes() uses the compile-time FORMAT_VERSION (2),
-        // producing different payload bytes than the v1 signer used. Rejecting
-        // v1 upfront gives a clear error instead of a cryptic signature failure.
+        // Strict version check. Older-format records are rejected here: a signer
+        // on a previous FORMAT_VERSION embeds that version into signable_bytes(),
+        // producing different payload bytes than this binary expects, so they
+        // would otherwise fail with a cryptic signature error. Rejecting on the
+        // version byte upfront gives a clear error instead.
         if data[0] != FORMAT_VERSION {
             return Err(DiscoveryError::DeserializeError(
                 "unsupported announce format version",
@@ -228,8 +231,8 @@ mod tests {
 
     #[test]
     fn builder_produces_correct_fields() {
-        let hint = RoutingHint::Reticulum {
-            destination_hash: [0xDE; 16],
+        let hint = RoutingHint::Zenoh {
+            locator: alloc::string::String::from("tcp/127.0.0.1:7447"),
         };
         let mut builder = AnnounceBuilder::new(
             test_identity(),
@@ -302,8 +305,10 @@ mod tests {
             2000,
             [0x01; 16],
         );
-        builder.add_routing_hint(RoutingHint::Reticulum {
-            destination_hash: [0xAA; 16],
+        builder.add_routing_hint(RoutingHint::Tunnel {
+            node_id: [0xAA; 32],
+            relay_url: None,
+            direct_addrs: alloc::vec![],
         });
         builder.add_routing_hint(RoutingHint::Zenoh {
             locator: alloc::string::String::from("tcp/127.0.0.1:7447"),
@@ -322,8 +327,8 @@ mod tests {
             2000,
             [0x01; 16],
         );
-        builder.add_routing_hint(RoutingHint::Reticulum {
-            destination_hash: [0xBB; 16],
+        builder.add_routing_hint(RoutingHint::Zenoh {
+            locator: alloc::string::String::from("tcp/10.0.0.1:7447"),
         });
         let record = builder.build(alloc::vec![0xDE, 0xAD]);
 

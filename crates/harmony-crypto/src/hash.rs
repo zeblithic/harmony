@@ -3,7 +3,7 @@ use sha2::{Digest, Sha224, Sha256};
 /// Full SHA-256 hash length in bytes.
 pub const HASH_LENGTH: usize = 32;
 
-/// Truncated hash length in bytes (Reticulum address hash).
+/// Truncated hash length in bytes (Harmony address hash — first 16 bytes of SHA-256).
 pub const TRUNCATED_HASH_LENGTH: usize = 16;
 
 /// Compute the full SHA-256 hash of `data` (32 bytes).
@@ -15,7 +15,7 @@ pub fn full_hash(data: &[u8]) -> [u8; HASH_LENGTH] {
 
 /// Compute a truncated SHA-256 hash of `data` (first 16 bytes).
 ///
-/// This matches Reticulum's address derivation: `SHA256(data)[:16]`.
+/// Address derivation: `SHA256(data)[:16]`.
 pub fn truncated_hash(data: &[u8]) -> [u8; TRUNCATED_HASH_LENGTH] {
     let full = full_hash(data);
     let mut truncated = [0u8; TRUNCATED_HASH_LENGTH];
@@ -28,10 +28,10 @@ pub fn blake3_hash(data: &[u8]) -> [u8; 32] {
     blake3::hash(data).into()
 }
 
-/// Name hash length in bytes (Reticulum).
+/// Name hash length in bytes (Harmony name hash — first 10 bytes of SHA-256).
 pub const NAME_HASH_LENGTH: usize = 10;
 
-/// Compute the Reticulum name hash: `SHA256(data)[:10]`.
+/// Compute the Harmony name hash: `SHA256(data)[:10]`.
 pub fn name_hash(data: &[u8]) -> [u8; NAME_HASH_LENGTH] {
     let full = full_hash(data);
     let mut result = [0u8; NAME_HASH_LENGTH];

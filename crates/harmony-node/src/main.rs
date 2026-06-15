@@ -76,7 +76,7 @@ enum Commands {
         /// Path to the identity key file
         #[arg(long, value_name = "PATH")]
         identity_file: Option<std::path::PathBuf>,
-        /// UDP listen address for Reticulum mesh packets
+        /// UDP listen address for the node's broadcast socket
         #[arg(long)]
         listen_address: Option<String>,
         /// Disable mDNS peer discovery (broadcast-only mode)
@@ -586,10 +586,9 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 drop(pq); // zeroize-on-drop
                 None
             };
-            // Extract Ed25519 private bytes for Reticulum announcing destination,
-            // then drop the key (zeroize-on-drop fires).
-            let reticulum_identity_bytes =
-                Some(zeroize::Zeroizing::new(ed25519.to_private_bytes()));
+            // The Ed25519 identity's address hash was already captured above
+            // (`our_addr_bytes`/`node_addr`). Nothing else needs the secret, so
+            // drop it now — zeroize-on-drop fires, leaving no dangling key.
             drop(ed25519);
 
             let content_policy = ContentPolicy {
@@ -707,7 +706,6 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
                 local_pq_identity_hash,
                 local_dsa_pubkey,
                 local_kem_pubkey,
-                reticulum_identity_bytes,
                 inference_gguf_cid: config_file
                     .inference_model_gguf_cid
                     .as_deref()

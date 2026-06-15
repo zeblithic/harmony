@@ -5,10 +5,10 @@ use zeroize::Zeroize;
 
 use crate::CryptoError;
 
-/// Default derived key length for AES-256-CBC Fernet (Reticulum default).
+/// Default derived key length for AES-256-CBC Fernet (64 bytes: 32B signing + 32B encryption).
 pub const DERIVED_KEY_LENGTH_256: usize = 64;
 
-/// Derived key length for AES-128-CBC Fernet (Reticulum optional).
+/// Derived key length for AES-128-CBC Fernet (32 bytes: 16B signing + 16B encryption).
 pub const DERIVED_KEY_LENGTH_128: usize = 32;
 
 /// Maximum HKDF-SHA256 output length: 255 * 32 = 8160 bytes.
@@ -16,7 +16,7 @@ const HKDF_SHA256_MAX_OUTPUT: usize = 255 * 32;
 
 /// Perform HKDF-SHA256 key derivation.
 ///
-/// Matches Reticulum's key derivation:
+/// HKDF-SHA256 key derivation used throughout Harmony:
 /// - `ikm`: Input key material (e.g., ECDH shared secret)
 /// - `salt`: Optional salt (defaults to 32 zero bytes if `None`)
 /// - `info`: Optional context info (defaults to empty)
@@ -37,7 +37,7 @@ pub fn derive_key(
     Ok(okm)
 }
 
-/// Convenience: derive a 64-byte key (Reticulum AES-256-CBC default).
+/// Convenience: derive a 64-byte key for AES-256-CBC Fernet.
 ///
 /// The returned key is split by the caller:
 /// - First 32 bytes: HMAC signing key

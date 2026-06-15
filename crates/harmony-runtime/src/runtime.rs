@@ -4,7 +4,6 @@
 // wired. Per-item #[allow(dead_code)] is applied below rather than crate-wide.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 
 use harmony_compute::InstructionBudget;
 use harmony_contacts::ContactStore;
@@ -20,7 +19,6 @@ use harmony_content::storage_tier::{
 use harmony_discovery::DiscoveryManager;
 use harmony_memo::store::MemoStore;
 use harmony_peers::{PeerAction, PeerEvent, PeerManager};
-use harmony_reticulum::node::{Node, NodeAction, NodeEvent};
 use harmony_workflow::{ComputeHint, WorkflowAction, WorkflowEngine, WorkflowEvent, WorkflowId};
 use harmony_zenoh::namespace::content as content_ns;
 use harmony_zenoh::namespace::{announce as announce_ns, archive as archive_ns, page as page_ns};
@@ -65,7 +63,7 @@ pub struct NodeConfig {
     pub local_identity_hash: harmony_identity::IdentityHash,
     /// This node's PQ identity hash (16-byte address derived from ML-KEM + ML-DSA keys).
     /// Used as the issuer identity for Discovery UCAN tokens. Distinct from
-    /// `local_identity_hash` (Ed25519-derived, used for Reticulum/PeerManager).
+    /// `local_identity_hash` (Ed25519-derived, used for PeerManager).
     /// Defaults to all-zeros; must be set from the PQ identity at startup.
     pub local_pq_identity_hash: harmony_identity::IdentityHash,
     /// This node's ML-DSA-65 public verifying key bytes.
@@ -76,12 +74,6 @@ pub struct NodeConfig {
     /// Included in Discovery announce records so peers can initiate PQ tunnels.
     /// Defaults to empty; must be set from the loaded PQ identity at startup.
     pub local_kem_pubkey: Vec<u8>,
-    /// Combined Reticulum private identity bytes (64 bytes: 32B X25519 secret + 32B Ed25519 secret).
-    /// When present, the runtime registers a Reticulum announcing destination
-    /// so periodic path announces flow to UDP peers.
-    /// Consumed (moved out) during `new()`; `None` disables announces.
-    /// Wrapped in `Zeroizing` so key material is wiped when the config is dropped.
-    pub reticulum_identity_bytes: Option<zeroize::Zeroizing<[u8; 64]>>,
     /// Hex-decoded 32-byte CID of the GGUF model file in CAS (for inference).
     pub inference_gguf_cid: Option<[u8; 32]>,
     /// Hex-decoded 32-byte CID of the tokenizer.json file in CAS (for inference).
@@ -173,7 +165,6 @@ impl Default for NodeConfig {
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
             local_kem_pubkey: Vec::new(),
-            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -193,77 +184,9 @@ impl Default for NodeConfig {
 /// Inbound events fed into the node runtime.
 #[derive(Debug)]
 pub enum RuntimeEvent {
-    /// Tier 1: Reticulum packet received on a network interface.
-    InboundPacket {
-        interface_name: String,
-        raw: Vec<u8>,
-        now: u64,
-    },
     /// Tier 1: Periodic timer tick for path expiry, announce scheduling.
     /// `now` is monotonic millis-since-start. `unix_now` is Unix epoch seconds.
     TimerTick { now: u64, unix_now: u64 },
-    /// Tier 1: Client requests a Reticulum unicast send to a specific
-    /// destination. Translated to `RuntimeAction::SendOnInterface` during
-    /// the next tick by looking up `destination_hash` in the inner
-    /// router's path table.
-    ///
-    /// Path-table miss semantics (round-10 race+budget fix):
-    ///   - **While the router queue still has backlog** (e.g. announces
-    ///     queued in the same batch), the request is **deferred** —
-    ///     re-queued at the front of `pending_unicast_sends` for a later
-    ///     tick after the queued router events apply to the path table.
-    ///     This avoids spurious drops when an announce that would create
-    ///     the route is sitting one event behind in the same batch.
-    ///   - **Once the router queue fully drains** without producing the
-    ///     route, the request is logged at WARN and dropped.
-    ///   - Both deferred re-queues and final drops count against
-    ///     `router_max_per_tick` (round-11 budget fix) to bound per-tick
-    ///     latency — a defer-only tick cannot walk the entire pending
-    ///     queue.
-    ///
-    /// Ordering contract:
-    ///   - **Per-destination FIFO is preserved.** Multiple sends to the
-    ///     same `destination_hash` queued in the same tick remain in
-    ///     arrival order across deferrals. (Same-destination entries
-    ///     that all defer get re-queued at the front in arrival order
-    ///     and on the next tick hit the same path-exists state.)
-    ///   - **Cross-destination ordering is best-effort, routability-
-    ///     driven.** A send to a known-routable destination can leave
-    ///     the runtime ahead of an earlier-queued send to an unknown
-    ///     destination. This is intentional — strict cross-destination
-    ///     FIFO would mean a single un-resolvable destination at the
-    ///     head blocks deliverable sends behind it (e.g., a DM to an
-    ///     offline recipient blocking a DM to an online recipient).
-    ///     The CodeRabbit-suggested `break`-on-first-defer was rejected
-    ///     for this reason.
-    ///   - Callers that need cross-destination ordering MUST enforce it
-    ///     above this surface (the harmony-client outbox layer is the
-    ///     natural place — it can chain dependent sends or use a
-    ///     per-conversation queue).
-    ///
-    /// Retry/expiration semantics live above this surface — harmony-client's
-    /// outbox layer (ZEB-216 Sub-B Phase 3b, ZEB-227) owns retry policy,
-    /// 30-day expiration, and the user-visible "couldn't deliver" surface.
-    /// Callers MUST NOT assume immediate drop on miss.
-    ///
-    /// **`destination_hash` is a Reticulum destination hash, NOT a raw
-    /// device identity hash.** The path table is keyed by destination
-    /// hashes (`SHA256(name_hash || identity_address_hash)[:16]`) which
-    /// the runtime learns from announces. The harmony-client side
-    /// (Phase 3b, ZEB-227) is responsible for computing this from a
-    /// device identity hash + a destination name (e.g. DM inbox, voice
-    /// channel, file sync — the runtime is generic plumbing and does not
-    /// know what destination names exist).
-    ///
-    /// (ZEB-216 Sub-B Phase 3a — DM transport surface)
-    SendUnicastToDevice {
-        /// 16-byte Reticulum destination hash. Caller-provided; see the
-        /// variant doc above for the derivation contract.
-        destination_hash: [u8; 16],
-        /// Opaque packet bytes — the runtime does not parse or validate
-        /// the payload. The client owns encryption + framing.
-        packet: Vec<u8>,
-    },
     /// Tier 2: Zenoh query received (content fetch or stats request).
     QueryReceived {
         query_id: u64,
@@ -292,12 +215,6 @@ pub enum RuntimeEvent {
     TunnelHandshakeComplete {
         interface_name: String,
         peer_node_id: [u8; 32],
-    },
-    /// A Reticulum packet arrived via a tunnel interface.
-    TunnelReticulumReceived {
-        interface_name: String,
-        packet: Vec<u8>,
-        now: u64,
     },
     /// A tunnel was closed.
     TunnelClosed { interface_name: String },
@@ -359,10 +276,6 @@ pub enum RuntimeEvent {
         unix_now: u64,
     },
 
-    /// A raw L2 interface is ready for Reticulum traffic.
-    L2InterfaceReady { interface_name: String },
-    /// A raw L2 interface has been shut down.
-    L2InterfaceClosed { interface_name: String },
     /// DSD: verify response received from target node.
     VerifyResponse { payload: Vec<u8> },
 
@@ -401,48 +314,6 @@ pub enum RuntimeEvent {
 /// Outbound actions returned by the runtime for the caller to execute.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeAction {
-    /// Tier 1: Send raw packet on a network interface.
-    SendOnInterface {
-        interface_name: Arc<str>,
-        raw: Vec<u8>,
-        /// Cooperation weight for probabilistic broadcast selection.
-        /// `None` = directed send (always deliver).
-        /// `Some(score)` = broadcast send (caller may drop if random > score).
-        weight: Option<f32>,
-    },
-    /// Tier 1: Surface a received Reticulum unicast packet to the
-    /// client. Emitted from `dispatch_router_actions` when the inner
-    /// router produces `NodeAction::DeliverLocally` for a packet
-    /// addressed to a locally-registered destination.
-    ///
-    /// `destination_hash` is the 16-byte local Reticulum destination
-    /// hash the packet was addressed to. Lets the client dispatch by
-    /// destination kind (DM inbox vs voice channel vs file sync, etc.)
-    /// — the client registered the destination, so it knows the
-    /// mapping from hash to handler. (Added in round-10 review,
-    /// ZEB-226: the client registers MULTIPLE destination types per
-    /// its spec and needs the destination hash to dispatch; the
-    /// dispatch arm previously discarded it.)
-    ///
-    /// `source` is the remote sender's identity hash, **when known**.
-    /// `Some(hash)` once link-identity binding lands in ZEB-227 /
-    /// Phase 3b; `None` in Phase 3a (terminal-link state isn't tracked
-    /// at the Node layer yet, so the runtime can't surface a real
-    /// source). Consumers MUST handle the `None` case — do NOT treat
-    /// absence as an authenticated identity. `packet` is the raw
-    /// payload — the client owns decryption + framing parsing.
-    ///
-    /// (ZEB-216 Sub-B Phase 3a — DM transport surface)
-    UnicastReceived {
-        /// 16-byte local Reticulum destination hash the packet was
-        /// addressed to. See the variant doc for the contract.
-        destination_hash: [u8; 16],
-        /// 16-byte device identity hash of the remote sender, when
-        /// known. See the variant doc for the contract.
-        source: Option<[u8; 16]>,
-        /// Opaque packet bytes as received from the wire.
-        packet: Vec<u8>,
-    },
     /// Tier 2: Reply to a content or stats query.
     SendReply { query_id: u64, payload: Vec<u8> },
     /// Tier 2: Publish a message (e.g., content availability announcement).
@@ -750,8 +621,6 @@ struct DsdSession {
 /// storage events, then run one compute slice — information flow is never
 /// starved and compute gets whatever budget remains.
 pub struct NodeRuntime<B: BookStore> {
-    // Tier 1: Reticulum packet router
-    router: Node,
     // Tier 1/2: Zenoh query dispatch
     queryable_router: QueryableRouter,
     // Tier 2: Content storage
@@ -763,7 +632,6 @@ pub struct NodeRuntime<B: BookStore> {
     // Contact store — intentional peer relationships
     contact_store: ContactStore,
     // Internal priority queues
-    router_queue: VecDeque<NodeEvent>,
     storage_queue: VecDeque<StorageTierEvent>,
     // Queryable IDs belonging to the storage tier
     storage_queryable_ids: HashSet<QueryableId>,
@@ -773,13 +641,6 @@ pub struct NodeRuntime<B: BookStore> {
     pending_workflow_actions: Vec<WorkflowAction>,
     // Direct runtime actions buffered from push_event (error replies, module fetches, etc.)
     pending_direct_actions: Vec<RuntimeAction>,
-    // Unicast send requests deferred from push_event to tick (ZEB-226).
-    // Resolved against `router.path_table()` after the router queue drains
-    // so announces enqueued in the same batch are applied to the path
-    // table BEFORE we do the lookup. Avoids a TOCTOU race where a client
-    // queues an announce + a SendUnicastToDevice for the just-announced
-    // target in the same batch and the lookup misses.
-    pending_unicast_sends: VecDeque<([u8; 16], Vec<u8>)>,
     // Maps WorkflowId -> query_ids for reply routing (multiple callers may
     // submit the same module+input; the engine deduplicates but all callers
     // need a reply).
@@ -789,7 +650,6 @@ pub struct NodeRuntime<B: BookStore> {
     // Tier scheduling configuration
     schedule: TierSchedule,
     // Starvation counters: incremented when a tier has no events in a tick, reset on processing
-    router_starved: u32,
     storage_starved: u32,
     compute_starved: u32,
     // Per-peer Bloom filter table for content query routing
@@ -857,10 +717,9 @@ pub struct NodeRuntime<B: BookStore> {
     local_pq_identity_hash: harmony_identity::IdentityHash,
     // Queryable ID for the discover namespace (harmony/discover/**)
     discover_queryable_id: QueryableId,
-    // Pre-serialized public announce record (Reticulum-only hints).
-    // Populated when outbound announce publishing is wired (existing TODO).
-    // Until then, the discover queryable returns no reply (harmless — the
-    // feature becomes active once announce building is implemented).
+    // Pre-serialized public announce record (public routing hints).
+    // Served by the discover queryable to peers without a Discovery UCAN
+    // token. Populated from a published local announce record.
     local_public_announce: Option<Vec<u8>>,
     // Pre-serialized full announce record (all hints including tunnel).
     local_full_announce: Option<Vec<u8>>,
@@ -941,7 +800,7 @@ impl<'a> harmony_credential::CredentialKeyResolver for PubkeyCacheKeyResolver<'a
 impl<B: BookStore> NodeRuntime<B> {
     /// Construct a new node runtime, returning startup actions the caller
     /// must execute (queryable declarations, subscriptions).
-    pub fn new(mut config: NodeConfig, store: B) -> (Self, Vec<RuntimeAction>) {
+    pub fn new(config: NodeConfig, store: B) -> (Self, Vec<RuntimeAction>) {
         assert!(
             !matches!(config.schedule.router_max_per_tick, Some(0)),
             "router_max_per_tick must be None or > 0"
@@ -950,43 +809,6 @@ impl<B: BookStore> NodeRuntime<B> {
             !matches!(config.schedule.storage_max_per_tick, Some(0)),
             "storage_max_per_tick must be None or > 0"
         );
-
-        let mut router = Node::new();
-
-        // Register the UDP broadcast interface so inbound packets are accepted
-        // and routed through the Reticulum path table.
-        router.register_interface(
-            "udp0".to_string(),
-            harmony_reticulum::InterfaceMode::Full,
-            None,
-        );
-
-        // Register an announcing destination if Ed25519 identity bytes are
-        // provided. This causes periodic path announces (~30s) so mDNS-
-        // discovered peers get real Reticulum routing entries.
-        if let Some(id_bytes) = config.reticulum_identity_bytes.take() {
-            match harmony_identity::PrivateIdentity::from_private_bytes(id_bytes.as_ref()) {
-                Ok(identity) => {
-                    let dest_name =
-                        harmony_reticulum::DestinationName::from_name("harmony", &["node"])
-                            .expect("static destination name");
-                    router.register_announcing_destination(
-                        identity,
-                        dest_name,
-                        Vec::new(),   // no app_data
-                        Some(30_000), // 30-second announce interval (millis)
-                        0,            // now=0: first announce on next TimerTick
-                    );
-                    tracing::info!("Reticulum announcing destination registered (30s interval)");
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        ?e,
-                        "failed to deserialize Reticulum identity — announces disabled"
-                    );
-                }
-            }
-        }
 
         let mut queryable_router = QueryableRouter::new();
 
@@ -1097,23 +919,19 @@ impl<B: BookStore> NodeRuntime<B> {
         });
 
         let mut rt = Self {
-            router,
             queryable_router,
             storage,
             workflow,
             peer_manager: PeerManager::with_local_identity(config.local_identity_hash),
             contact_store: ContactStore::new(),
-            router_queue: VecDeque::new(),
             storage_queue: VecDeque::new(),
             storage_queryable_ids,
             compute_queryable_ids,
             pending_workflow_actions: Vec::new(),
             pending_direct_actions: Vec::new(),
-            pending_unicast_sends: VecDeque::new(),
             workflow_to_query: HashMap::new(),
             cid_to_query: HashMap::new(),
             schedule: config.schedule.clone(),
-            router_starved: 0,
             storage_starved: 0,
             compute_starved: 0,
             peer_filters: PeerFilterTable::new(filter_broadcast_interval_ticks * 3),
@@ -1341,26 +1159,6 @@ impl<B: BookStore> NodeRuntime<B> {
         self.storage.remove(cid)
     }
 
-    /// Number of pending Tier 1 (router) events.
-    pub fn router_queue_len(&self) -> usize {
-        self.router_queue.len()
-    }
-
-    /// Number of pending unicast sends (`RuntimeEvent::SendUnicastToDevice`)
-    /// awaiting drain on the next `tick()`. Test-only seam — round-10
-    /// review (ZEB-226) added budget + defer-on-miss semantics that need
-    /// queue-length introspection to assert. Round-11 (Greptile P2):
-    /// crate-private (`pub(crate)`) since the consumers are all
-    /// in-crate tests; `#[doc(hidden)]` only hid from rustdoc and
-    /// would have left the seam callable from downstream crates.
-    /// Round-12 (clippy): `#[cfg(test)]` so the accessor doesn't fire
-    /// `dead_code` in non-test builds (it has no production callers
-    /// by design).
-    #[cfg(test)]
-    pub(crate) fn pending_unicast_sends_len(&self) -> usize {
-        self.pending_unicast_sends.len()
-    }
-
     /// Number of pending Tier 2 (storage) events.
     pub fn storage_queue_len(&self) -> usize {
         self.storage_queue.len()
@@ -1371,13 +1169,9 @@ impl<B: BookStore> NodeRuntime<B> {
         self.workflow.workflow_count()
     }
 
-    /// Current starvation counters (router, storage, compute).
-    pub fn starvation_counters(&self) -> (u32, u32, u32) {
-        (
-            self.router_starved,
-            self.storage_starved,
-            self.compute_starved,
-        )
+    /// Current starvation counters (storage, compute).
+    pub fn starvation_counters(&self) -> (u32, u32) {
+        (self.storage_starved, self.compute_starved)
     }
 
     /// Check if a peer should be queried for a given CID.
@@ -1570,15 +1364,11 @@ impl<B: BookStore> NodeRuntime<B> {
 
         // Find the first tunnel address on the contact.
         let tunnel_addr = match self.contact_store.get(&identity_hash) {
-            Some(contact) => contact.addresses.iter().find_map(|addr| {
-                if let ContactAddress::Tunnel {
+            Some(contact) => contact.addresses.first().map(|addr| {
+                let ContactAddress::Tunnel {
                     node_id, relay_url, ..
-                } = addr
-                {
-                    Some((*node_id, relay_url.clone()))
-                } else {
-                    None
-                }
+                } = addr;
+                (*node_id, relay_url.clone())
             }),
             None => return,
         };
@@ -1635,7 +1425,7 @@ impl<B: BookStore> NodeRuntime<B> {
         &mut self.memo_store
     }
 
-    /// This node's Ed25519 identity hash (Reticulum-compatible).
+    /// This node's Ed25519 identity hash.
     pub fn local_identity_hash(&self) -> [u8; 16] {
         self.local_identity_hash
     }
@@ -1646,71 +1436,16 @@ impl<B: BookStore> NodeRuntime<B> {
         self.local_pq_identity_hash
     }
 
-    /// Set the pre-serialized public announce record (Reticulum-only hints).
+    /// Set the pre-serialized public announce record (public routing hints).
+    /// Served by the discover queryable to peers without a Discovery UCAN token.
     pub fn set_local_public_announce(&mut self, data: Vec<u8>) {
         self.local_public_announce = Some(data);
     }
 
     /// Set the pre-serialized full announce record (all hints including tunnel).
+    /// Served by the discover queryable to peers with a valid Discovery UCAN token.
     pub fn set_local_full_announce(&mut self, data: Vec<u8>) {
         self.local_full_announce = Some(data);
-    }
-
-    /// Register a 16-byte Reticulum destination hash for local delivery.
-    /// Inbound packets addressed to this destination will surface from
-    /// `tick()` as `RuntimeAction::UnicastReceived { destination_hash, .. }`
-    /// instead of being dropped with `DropReason::NoLocalDestination`.
-    ///
-    /// The `dest_hash` is computed by the caller from
-    /// `SHA256(name_hash || identity_address_hash)[:16]` per Reticulum
-    /// destination naming. Idempotent — calling twice with the same hash
-    /// is a no-op.
-    ///
-    /// Used by harmony-client (ZEB-216 Sub-B Phase 3b, ZEB-227) to
-    /// register its DM destination so inbound DmInvite/DmCidNotify/DmAck
-    /// packets surface to the application layer.
-    pub fn register_local_destination(&mut self, dest_hash: [u8; 16]) {
-        self.router.register_destination(dest_hash);
-    }
-
-    /// Unregister a previously-registered local destination. Returns
-    /// `true` if the destination was registered, `false` if it was not.
-    ///
-    /// Mirror of `register_local_destination` — narrow inverse that ONLY
-    /// removes the local-delivery registration. If the same destination
-    /// hash was independently registered for announcing (via
-    /// `register_announcing_destination` on the inner Node), that
-    /// announcement is preserved. This guarantees calling
-    /// `register_local_destination` then `unregister_local_destination`
-    /// is observationally equivalent to never having called the pair —
-    /// no side effects on unrelated state.
-    pub fn unregister_local_destination(&mut self, dest_hash: &[u8; 16]) -> bool {
-        self.router.unregister_destination_local_only(dest_hash)
-    }
-
-    /// Look up the announced `Identity` (Ed25519 verifying key + X25519
-    /// ECDH key) for `dest_hash`. Returns `Some` when an announce has
-    /// been received for this destination and the identity material is
-    /// available locally, `None` otherwise.
-    ///
-    /// Used by harmony-client (ZEB-216 Sub-B Phase 3b, ZEB-227) to
-    /// resolve `DmCidNotify.signing_device_hash` (and similar) to a
-    /// public key for application-layer Ed25519 signature verification
-    /// on inbound DM packets — the spec's "Application-signature
-    /// binding rule" (Path B per spec ea38132).
-    ///
-    /// **Important:** the `dest_hash` argument is a Reticulum
-    /// destination hash — the 16-byte
-    /// `SHA256(name_hash || identity_address_hash)[:16]`, NOT the bare
-    /// identity-address hash. Callers holding an identity-address hash
-    /// (e.g., harmony-client's `signing_device_hash` from a
-    /// `DmCidNotify` body) must first derive the destination_hash via
-    /// `DestinationName::destination_hash` before calling this API.
-    pub fn lookup_destination_identity(
-        &self,
-        dest_hash: &[u8; 16],
-    ) -> Option<&harmony_identity::Identity> {
-        self.router.lookup_identity(dest_hash)
     }
 
     /// Read-only access to the page index.
@@ -1737,7 +1472,7 @@ impl<B: BookStore> NodeRuntime<B> {
         if ac.high_water == 0 {
             return (base as f64 * ac.floor_fraction.clamp(0.0, 1.0)).round() as u64;
         }
-        let combined = self.router_queue.len() + self.storage_queue.len();
+        let combined = self.storage_queue.len();
         let load_factor = (combined as f64 / ac.high_water as f64).min(1.0);
         let floor = ac.floor_fraction.clamp(0.0, 1.0);
         let scale = 1.0 - load_factor * (1.0 - floor);
@@ -1747,21 +1482,9 @@ impl<B: BookStore> NodeRuntime<B> {
     /// Push an event into the runtime's internal priority queues.
     pub fn push_event(&mut self, event: RuntimeEvent) {
         match event {
-            RuntimeEvent::InboundPacket {
-                interface_name,
-                raw,
-                now,
-            } => {
-                self.router_queue.push_back(NodeEvent::InboundPacket {
-                    interface_name,
-                    raw,
-                    now,
-                });
-            }
             RuntimeEvent::TimerTick { now, unix_now } => {
                 self.last_now = now;
                 self.last_unix_now = unix_now;
-                self.router_queue.push_back(NodeEvent::TimerTick { now });
             }
             RuntimeEvent::QueryReceived {
                 query_id,
@@ -1907,26 +1630,9 @@ impl<B: BookStore> NodeRuntime<B> {
                     peer = %hex::encode(&peer_node_id[..4]),
                     "tunnel handshake complete"
                 );
-                self.router.register_interface(
-                    interface_name,
-                    harmony_reticulum::InterfaceMode::PointToPoint,
-                    None,
-                );
-            }
-            RuntimeEvent::TunnelReticulumReceived {
-                interface_name,
-                packet,
-                now,
-            } => {
-                self.router_queue.push_back(NodeEvent::InboundPacket {
-                    interface_name,
-                    raw: packet,
-                    now,
-                });
             }
             RuntimeEvent::TunnelClosed { interface_name } => {
-                tracing::info!(%interface_name, "tunnel closed — interface unregistered");
-                self.router.unregister_interface(&interface_name);
+                tracing::info!(%interface_name, "tunnel closed");
             }
             RuntimeEvent::DiscoveryAnnounceReceived {
                 record_bytes,
@@ -2101,18 +1807,6 @@ impl<B: BookStore> NodeRuntime<B> {
             } => {
                 self.handle_memo_fetch_response(&key_expr, &payload, unix_now);
             }
-            RuntimeEvent::L2InterfaceReady { interface_name } => {
-                tracing::info!(%interface_name, "L2 interface registered");
-                self.router.register_interface(
-                    interface_name,
-                    harmony_reticulum::InterfaceMode::Full,
-                    None,
-                );
-            }
-            RuntimeEvent::L2InterfaceClosed { interface_name } => {
-                tracing::info!(%interface_name, "L2 interface closed — unregistered");
-                self.router.unregister_interface(&interface_name);
-            }
             RuntimeEvent::VerifyResponse { payload } => {
                 #[cfg(feature = "inference")]
                 self.handle_verify_response(payload);
@@ -2187,23 +1881,6 @@ impl<B: BookStore> NodeRuntime<B> {
                     .handle(StorageTierEvent::S3ReadFailed { cid, query_id });
                 self.dispatch_storage_actions_inline(storage_actions);
             }
-            RuntimeEvent::SendUnicastToDevice {
-                destination_hash,
-                packet,
-            } => {
-                // ZEB-216 Sub-B Phase 3a — Task 4 (ZEB-226): outbound wiring.
-                //
-                // Defer resolution to tick(): queue into
-                // `pending_unicast_sends` so any inbound announces sitting
-                // in `router_queue` get applied to the path table BEFORE
-                // we attempt the path-table lookup. Resolving here would
-                // race against announces submitted in the same batch
-                // (announce + send-to-just-announced-target would miss
-                // because the announce hasn't been processed yet). The
-                // tick path drains this queue after the router queue.
-                self.pending_unicast_sends
-                    .push_back((destination_hash, packet));
-            }
         }
     }
 
@@ -2275,13 +1952,9 @@ impl<B: BookStore> NodeRuntime<B> {
         let threshold = self.schedule.starvation_threshold;
 
         // Determine tier order: promote starved tiers to front.
-        // Default order: [0=Router, 1=Storage, 2=Compute]
-        let mut order = [0u8, 1, 2];
-        let starved = [
-            self.router_starved,
-            self.storage_starved,
-            self.compute_starved,
-        ];
+        // Default order: [0=Storage, 1=Compute]
+        let mut order = [0u8, 1];
+        let starved = [self.storage_starved, self.compute_starved];
         // Stable sort: starved tiers (>= threshold) move to front, preserving original priority order
         order.sort_by_key(|&tier| {
             if starved[tier as usize] >= threshold {
@@ -2298,128 +1971,6 @@ impl<B: BookStore> NodeRuntime<B> {
         for &tier in &order {
             match tier {
                 0 => {
-                    // Tier 1: Router
-                    let limit = self.schedule.router_max_per_tick.unwrap_or(usize::MAX);
-                    let mut processed = 0;
-                    while processed < limit {
-                        match self.router_queue.pop_front() {
-                            Some(event) => {
-                                let node_actions = self.router.handle_event(event);
-                                self.dispatch_router_actions(node_actions, &mut actions);
-                                processed += 1;
-                            }
-                            None => break,
-                        }
-                    }
-                    if processed > 0 {
-                        self.router_starved = 0;
-                    } else {
-                        self.router_starved = self.router_starved.saturating_add(1);
-                    }
-
-                    // ZEB-216 Sub-B Phase 3a — Task 4 (ZEB-226): drain
-                    // queued unicast sends AFTER the router queue. Any
-                    // announces drained in this tick have now been
-                    // applied to the path table, so the lookup sees
-                    // fresh state for that batch.
-                    //
-                    // Round-10 review fixes (ZEB-226):
-                    // - **Defer-on-miss when router still has work
-                    //   (Finding 1, race).** If `router_max_per_tick`
-                    //   capped the router-queue drain, an announce that
-                    //   would have created the route may still be
-                    //   queued. Treating that as "unknown" would drop
-                    //   the unicast even though next tick's announce
-                    //   drain would populate the path table. So we
-                    //   capture `router_queue_drained` BEFORE this loop
-                    //   and only log+drop when the router is fully
-                    //   drained — otherwise re-queue for the next tick.
-                    // - **Bound the unicast drain by `router_max_per_tick`
-                    //   (Finding 3, latency).** Every other Tier 1 queue
-                    //   respects this budget; an unbounded unicast burst
-                    //   would block the tick loop. Round-11 fix
-                    //   (CodeRabbit Major / Greptile P1): the budget
-                    //   counter is incremented at the TOP of the loop so
-                    //   ALL three branches (route, defer, drop) consume
-                    //   budget. The previous shape only counted route
-                    //   and drop, so a defer-only tick (router queue has
-                    //   backlog) could walk the entire pending queue in
-                    //   one tick and bypass the cap.
-                    //
-                    // Final fallback (router fully drained AND route
-                    // still missing) remains: WARN + drop. The client's
-                    // outbox (Phase 3b, ZEB-227) owns retry/expiration
-                    // semantics on top of this surface.
-                    let router_queue_drained = self.router_queue.is_empty();
-                    let unicast_limit = self.schedule.router_max_per_tick.unwrap_or(usize::MAX);
-                    let mut processed_unicasts = 0usize;
-                    let mut deferred_unicasts: VecDeque<([u8; 16], Vec<u8>)> = VecDeque::new();
-                    while processed_unicasts < unicast_limit {
-                        let Some((destination_hash, packet)) =
-                            self.pending_unicast_sends.pop_front()
-                        else {
-                            break;
-                        };
-                        // Round-11 fix: count BEFORE branching so defer
-                        // (and drop, and route) all consume one budget
-                        // slot. Without this, the defer branch can
-                        // walk the entire queue in a single tick.
-                        processed_unicasts += 1;
-                        if self.router.path_table().get(&destination_hash).is_some() {
-                            let node_actions = self.router.route_packet(&destination_hash, packet);
-                            // Round-12 (Cursor Low): log outbound
-                            // PacketDropped here at the call site where
-                            // we have full SendUnicastToDevice context.
-                            // The top-level arm in dispatch_router_actions
-                            // was removed because it also fired on
-                            // routine inbound NoLocalDestination drops
-                            // for broadcast traffic addressed to
-                            // unregistered local destinations — noisy on
-                            // non-transport nodes.
-                            for na in &node_actions {
-                                if let NodeAction::PacketDropped {
-                                    reason,
-                                    interface_name,
-                                } = na
-                                {
-                                    tracing::warn!(
-                                        ?reason,
-                                        %interface_name,
-                                        destination_hash_first_4 = ?&destination_hash[..4],
-                                        "outbound unicast SendUnicastToDevice failed at route_packet"
-                                    );
-                                }
-                            }
-                            self.dispatch_router_actions(node_actions, &mut actions);
-                        } else if !router_queue_drained {
-                            // Router queue still has unprocessed events
-                            // (possibly an announce that would create
-                            // this route). Defer rather than drop —
-                            // re-queue for the next tick when those
-                            // announces have applied to the path table.
-                            deferred_unicasts.push_back((destination_hash, packet));
-                        } else {
-                            // Router fully drained yet route still
-                            // missing — genuine miss. Log and drop;
-                            // budget already consumed at top of loop.
-                            tracing::warn!(
-                                destination_hash_first_4 = ?&destination_hash[..4],
-                                packet_len = packet.len(),
-                                "SendUnicastToDevice destination_hash unknown — \
-                                 dropping. Client (harmony-client) owns retry/\
-                                 expiration via outbox."
-                            );
-                        }
-                    }
-                    // Re-queue deferred entries at the FRONT so they
-                    // retain their arrival-order priority over any
-                    // unicasts pushed in subsequent ticks. extend() at
-                    // the back would reorder them behind newer events.
-                    for entry in deferred_unicasts.into_iter().rev() {
-                        self.pending_unicast_sends.push_front(entry);
-                    }
-                }
-                1 => {
                     // Tier 2: Storage
                     // Snapshot the timer state BEFORE processing events — a
                     // threshold-triggered BroadcastFilter resets the counter,
@@ -2501,7 +2052,7 @@ impl<B: BookStore> NodeRuntime<B> {
                         self.storage_starved = self.storage_starved.saturating_add(1);
                     }
                 }
-                2 => {
+                1 => {
                     // Tier 3: Compute — dispatch pending workflow actions, then one slice
                     let pending = std::mem::take(&mut self.pending_workflow_actions);
                     let had_pending = !pending.is_empty();
@@ -2587,117 +2138,6 @@ impl<B: BookStore> NodeRuntime<B> {
         // TODO: When BookStore gains an iter() method, iterate local
         // encrypted-durable books and emit ReplicaPush for each peer
         // with an active replication policy.
-    }
-
-    fn dispatch_router_actions(
-        &mut self,
-        node_actions: Vec<NodeAction>,
-        out: &mut Vec<RuntimeAction>,
-    ) {
-        for action in node_actions {
-            match action {
-                NodeAction::SendOnInterface {
-                    interface_name,
-                    raw,
-                    weight,
-                } => {
-                    out.push(RuntimeAction::SendOnInterface {
-                        interface_name,
-                        raw,
-                        weight,
-                    });
-                }
-                NodeAction::AnnounceReceived {
-                    validated_announce,
-                    path_update,
-                    ..
-                } => {
-                    // Skip duplicate and unroutable announces. The path table
-                    // tracks the random blob from each announce and returns
-                    // DuplicateBlob when the same blob is received again (e.g.
-                    // via broadcast + unicast). ExceedsMaxHops means the path
-                    // table rejected the entry — no route was recorded, so
-                    // emitting a PeerEvent would trigger initiation with no path.
-                    if matches!(
-                        path_update,
-                        harmony_reticulum::PathUpdateResult::DuplicateBlob
-                            | harmony_reticulum::PathUpdateResult::ExceedsMaxHops
-                    ) {
-                        continue;
-                    }
-                    // Feed announce into PeerManager so it can trigger
-                    // link/tunnel initiation for known contacts.
-                    // Use identity.address_hash (the raw identity hash), NOT
-                    // destination_hash (which is SHA256(name_hash || address_hash)[:16]).
-                    let identity_hash = validated_announce.identity.address_hash;
-                    let peer_actions = self.peer_manager.on_event(
-                        PeerEvent::AnnounceReceived { identity_hash },
-                        &self.contact_store,
-                    );
-                    self.translate_peer_actions_out(peer_actions, out);
-                }
-                NodeAction::AnnounceNeeded { dest_hash } => {
-                    let announce_actions =
-                        self.router
-                            .announce(&dest_hash, &mut rand_core::OsRng, self.last_now);
-                    for aa in announce_actions {
-                        match aa {
-                            NodeAction::SendOnInterface {
-                                interface_name,
-                                raw,
-                                weight,
-                            } => {
-                                out.push(RuntimeAction::SendOnInterface {
-                                    interface_name,
-                                    raw,
-                                    weight,
-                                });
-                            }
-                            NodeAction::PacketDropped { reason, .. } => {
-                                tracing::warn!(?reason, "Reticulum announce dropped");
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                // ZEB-216 Sub-B Phase 3a — Task 3 (ZEB-226): surface inbound
-                // unicast packets to the client. Source identity travels on
-                // `NodeAction::DeliverLocally::source` (Option A — field
-                // added to the Reticulum action). The reticulum-layer
-                // construction site populates `None` until link/identity
-                // binding lands in Phase 3b (ZEB-227). The Option is
-                // forwarded as-is — the client must handle the `None` case
-                // and MUST NOT treat absence as an authenticated identity.
-                //
-                // Round-10 review (ZEB-226): forward `destination_hash`
-                // too — the client registers multiple destination types
-                // (DM inbox, voice channel, file sync, ...) and needs
-                // the hash to dispatch the packet to the right handler.
-                NodeAction::DeliverLocally {
-                    destination_hash,
-                    packet,
-                    interface_name: _, // diagnostic only at this layer
-                    source,
-                } => {
-                    out.push(RuntimeAction::UnicastReceived {
-                        destination_hash,
-                        source,
-                        packet: packet.data.to_vec(),
-                    });
-                }
-                // Other router actions (including top-level
-                // `NodeAction::PacketDropped`) are diagnostics — drop
-                // for now. Round-12 (Cursor Low): outbound unicast
-                // PacketDropped is logged at the call site in the
-                // SendUnicastToDevice drain where the full context
-                // (destination_hash) is available; logging it here too
-                // would also surface routine inbound
-                // `process_data_packet` drops (e.g. NoLocalDestination
-                // for broadcast traffic addressed to unregistered local
-                // destinations) and spam WARN on non-transport nodes.
-                _ => {}
-            }
-        }
     }
 
     fn dispatch_storage_actions(
@@ -4243,7 +3683,7 @@ impl<B: BookStore> NodeRuntime<B> {
     }
 
     /// Translate PeerActions into RuntimeActions, pushing directly to an output vec.
-    /// Used from tick() and dispatch_router_actions where an output vec is available.
+    /// Used from tick() where an output vec is available.
     fn translate_peer_actions_out(
         &mut self,
         peer_actions: Vec<PeerAction>,
@@ -4295,7 +3735,7 @@ impl<B: BookStore> NodeRuntime<B> {
                         .update_last_seen(&identity_hash, unix_now);
                 }
                 PeerAction::InitiateLink { .. } | PeerAction::CloseLink { .. } => {
-                    // Reticulum link initiation/close — stub for now.
+                    // Direct (non-tunnel) link initiation/close — stub for now.
                 }
                 PeerAction::CloseTunnel { identity_hash } => {
                     out.push(RuntimeAction::CloseTunnel { identity_hash });
@@ -4941,716 +4381,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_action_unicast_received_constructs_and_compares() {
-        // ZEB-216 Sub-B Phase 3a — Task 2: variant constructor smoke.
-        // Asserts variant is constructible, derives Clone + PartialEq (matches
-        // existing actions — regression guard so the new variant doesn't drop
-        // the derives and break test infrastructure that depends on them).
-        // Round-10 review added `destination_hash` to the variant — pin a
-        // distinct value here so a future shape change (e.g. dropping the
-        // field, or making it Option<>) trips the constructor smoke test.
-        let a = RuntimeAction::UnicastReceived {
-            destination_hash: [0xcc; 16],
-            source: Some([0xbb; 16]),
-            packet: vec![0x10, 0x20],
-        };
-        let b = RuntimeAction::UnicastReceived {
-            destination_hash: [0xcc; 16],
-            source: Some([0xbb; 16]),
-            packet: vec![0x10, 0x20],
-        };
-        assert_eq!(a, b);
-        let _cloned: RuntimeAction = a.clone();
-    }
-
-    #[test]
-    fn runtime_event_send_unicast_to_device_constructs_and_compares() {
-        // ZEB-216 Sub-B Phase 3a — Task 1: variant constructor smoke.
-        // Match-and-extract proves the variant is constructible by name
-        // and the field types match (catches accidental tuple-variant
-        // shape or wrong field-name typos in future refactors).
-        let e = RuntimeEvent::SendUnicastToDevice {
-            destination_hash: [0xaa; 16],
-            packet: vec![0x01, 0x02, 0x03],
-        };
-        match e {
-            RuntimeEvent::SendUnicastToDevice {
-                destination_hash,
-                packet,
-            } => {
-                assert_eq!(destination_hash, [0xaa; 16]);
-                assert_eq!(packet, vec![0x01, 0x02, 0x03]);
-            }
-            _ => panic!("expected SendUnicastToDevice variant"),
-        }
-    }
-
-    #[test]
-    fn dispatch_router_actions_surfaces_deliver_locally_as_unicast_received() {
-        // ZEB-216 Sub-B Phase 3a — Task 3: inbound wiring.
-        //
-        // Construct a NodeAction::DeliverLocally with a known source +
-        // packet, feed it through dispatch_router_actions, and assert
-        // that the runtime emits exactly one RuntimeAction::UnicastReceived
-        // carrying the same source + packet bytes.
-        //
-        // Source resolution approach (Option A): a `source: [u8; 16]`
-        // field is added directly to NodeAction::DeliverLocally so the
-        // identity travels with the action. The reticulum-layer
-        // construction site populates it as a placeholder for now (real
-        // link-state binding is deferred to Phase 3b in harmony-client).
-        // For this dispatch-layer test we construct the action directly
-        // and pin a non-zero source, which exercises the full wiring
-        // independent of the upstream construction-site placeholder.
-        use harmony_reticulum::packet::{
-            DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType,
-            PropagationType,
-        };
-
-        let (mut rt, _startup) = make_runtime();
-
-        let dest_hash = [0x42u8; 16];
-        let source = [0xcdu8; 16];
-        let payload: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef];
-
-        let packet = Packet {
-            header: PacketHeader {
-                flags: PacketFlags {
-                    ifac: false,
-                    header_type: HeaderType::Type1,
-                    context_flag: false,
-                    propagation: PropagationType::Broadcast,
-                    destination_type: DestinationType::Single,
-                    packet_type: PacketType::Data,
-                },
-                hops: 0,
-                transport_id: None,
-                destination_hash: dest_hash,
-                context: harmony_reticulum::PacketContext::None,
-            },
-            data: Arc::from(payload.clone().into_boxed_slice()),
-        };
-
-        let node_actions = vec![NodeAction::DeliverLocally {
-            destination_hash: dest_hash,
-            packet,
-            interface_name: Arc::from("test"),
-            source: Some(source),
-        }];
-
-        let mut out: Vec<RuntimeAction> = Vec::new();
-        rt.dispatch_router_actions(node_actions, &mut out);
-
-        let unicast: Vec<_> = out
-            .iter()
-            .filter_map(|a| match a {
-                RuntimeAction::UnicastReceived {
-                    destination_hash,
-                    source,
-                    packet,
-                } => Some((*destination_hash, *source, packet.clone())),
-                _ => None,
-            })
-            .collect();
-
-        assert_eq!(
-            unicast.len(),
-            1,
-            "expected exactly one UnicastReceived, got actions: {:?}",
-            out
-        );
-        assert_eq!(
-            unicast[0].0, dest_hash,
-            "destination_hash must flow through dispatch (round-10 \
-             review: was previously discarded with `_`)"
-        );
-        assert_eq!(
-            unicast[0].1,
-            Some(source),
-            "source identity must round-trip as Some(hash) when known"
-        );
-        assert_eq!(unicast[0].2, payload, "packet bytes must round-trip");
-    }
-
-    #[test]
-    fn send_unicast_to_device_emits_send_on_interface_for_known_target() {
-        // ZEB-216 Sub-B Phase 3a — Task 4: outbound wiring (happy path).
-        //
-        // Approach: target → interface lookup goes through the inner
-        // Reticulum router's path table (`Node::path_table`). The default
-        // NodeRuntime registers a `udp0` interface on construction, so
-        // we pre-seed a path entry pointing the target hash at `udp0`
-        // via the `path_table_mut_for_tests()` test seam (added on
-        // Node alongside the existing read-only `path_table()` accessor).
-        //
-        // Then we feed RuntimeEvent::SendUnicastToDevice and tick(),
-        // expecting exactly one RuntimeAction::SendOnInterface routed
-        // to `udp0` with the original packet bytes (udp0 has no IFAC,
-        // so masking is a no-op and the bytes round-trip unchanged).
-        use harmony_reticulum::path_table::PathUpdateResult;
-
-        let (mut rt, _startup) = make_runtime();
-
-        let target = [0xaau8; 16];
-        let payload: Vec<u8> = vec![0x01, 0x02, 0x03];
-
-        // Seed the path table directly. The seed key here IS a destination
-        // hash by contract — the path table is only ever populated by
-        // announces, which are keyed by destination hash. Build a minimal
-        // random_blob (10 bytes; last 5 carry the announce timestamp).
-        // The exact values don't matter — we just need a valid entry that
-        // route_packet() will resolve to udp0.
-        let random_blob = {
-            let mut b = [0u8; 10];
-            let ts: u64 = 1000;
-            let ts_bytes = ts.to_be_bytes();
-            b[5..10].copy_from_slice(&ts_bytes[3..8]);
-            b
-        };
-        let result = rt.router.path_table_mut_for_tests().update(
-            target,
-            target, // next_hop = target itself (single-hop)
-            0,      // hops
-            Arc::from("udp0"),
-            [0u8; 16], // announce_packet_hash
-            random_blob,
-            harmony_reticulum::InterfaceMode::Full,
-            1000,
-        );
-        assert_eq!(
-            result,
-            PathUpdateResult::Inserted,
-            "test seed should have inserted a fresh entry"
-        );
-
-        rt.push_event(RuntimeEvent::SendUnicastToDevice {
-            destination_hash: target,
-            packet: payload.clone(),
-        });
-        let actions = rt.tick();
-
-        let sends: Vec<_> = actions
-            .iter()
-            .filter_map(|a| match a {
-                RuntimeAction::SendOnInterface {
-                    interface_name,
-                    raw,
-                    weight,
-                } => Some((interface_name.clone(), raw.clone(), *weight)),
-                _ => None,
-            })
-            .collect();
-
-        assert_eq!(
-            sends.len(),
-            1,
-            "expected exactly one SendOnInterface for the known target, \
-             got actions: {:?}",
-            actions
-        );
-        assert_eq!(
-            &*sends[0].0, "udp0",
-            "interface_name should match the seeded path-table entry"
-        );
-        assert_eq!(sends[0].1, payload, "packet bytes must round-trip");
-        assert_eq!(
-            sends[0].2, None,
-            "directed unicast send carries weight=None (not broadcast)"
-        );
-    }
-
-    #[test]
-    fn send_unicast_to_device_drops_for_unknown_target() {
-        // ZEB-216 Sub-B Phase 3a — Task 4: outbound wiring (unknown target).
-        //
-        // With an empty path table, the runtime cannot resolve the target
-        // to an interface. Phase 3a behavior: log a WARN and drop the
-        // packet — retry/expiration semantics live in harmony-client's
-        // outbox layer (ZEB-216 Sub-B Phase 3b). Here we assert that
-        // the runtime does NOT produce any SendOnInterface action.
-        let (mut rt, _startup) = make_runtime();
-
-        let target = [0x99u8; 16];
-        let payload: Vec<u8> = vec![0xaa, 0xbb];
-
-        rt.push_event(RuntimeEvent::SendUnicastToDevice {
-            destination_hash: target,
-            packet: payload.clone(),
-        });
-        let actions = rt.tick();
-
-        let sends: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
-            .collect();
-
-        assert!(
-            sends.is_empty(),
-            "expected no SendOnInterface for unknown target, got: {:?}",
-            sends
-        );
-    }
-
-    #[test]
-    fn unicast_drain_respects_router_max_per_tick() {
-        // ZEB-226 round-10 review (Finding 3, latency budget): the
-        // pending_unicast_sends drain in tick() must respect
-        // `router_max_per_tick` like every other Tier 1 queue. A burst
-        // of unicasts must NOT block the tick loop. With limit=2 and
-        // 5 queued unicasts to a known target, the first tick should
-        // process 2 (emit 2 SendOnInterface) and leave 3 in the queue
-        // for the next tick.
-        use harmony_reticulum::path_table::PathUpdateResult;
-
-        let mut config = NodeConfig::default();
-        config.schedule.router_max_per_tick = Some(2);
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
-
-        // Seed a path so all sends resolve to udp0 (avoids the
-        // unknown-target drop path; we want to exercise the budget,
-        // not the drop semantics).
-        let target = [0xa1u8; 16];
-        let random_blob = {
-            let mut b = [0u8; 10];
-            let ts: u64 = 1000;
-            let ts_bytes = ts.to_be_bytes();
-            b[5..10].copy_from_slice(&ts_bytes[3..8]);
-            b
-        };
-        let result = rt.router.path_table_mut_for_tests().update(
-            target,
-            target,
-            0,
-            Arc::from("udp0"),
-            [0u8; 16],
-            random_blob,
-            harmony_reticulum::InterfaceMode::Full,
-            1000,
-        );
-        assert_eq!(result, PathUpdateResult::Inserted);
-
-        for _ in 0..5 {
-            rt.push_event(RuntimeEvent::SendUnicastToDevice {
-                destination_hash: target,
-                packet: vec![0xde, 0xad],
-            });
-        }
-        assert_eq!(rt.pending_unicast_sends_len(), 5);
-
-        let actions = rt.tick();
-        let send_count = actions
-            .iter()
-            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
-            .count();
-        assert_eq!(
-            send_count, 2,
-            "first tick must process exactly router_max_per_tick=2 unicasts, \
-             got actions: {:?}",
-            actions
-        );
-        assert_eq!(
-            rt.pending_unicast_sends_len(),
-            3,
-            "remaining 3 unicasts must stay queued for the next tick"
-        );
-
-        let actions = rt.tick();
-        let send_count = actions
-            .iter()
-            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
-            .count();
-        assert_eq!(send_count, 2, "second tick processes another 2");
-        assert_eq!(rt.pending_unicast_sends_len(), 1);
-
-        let actions = rt.tick();
-        let send_count = actions
-            .iter()
-            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
-            .count();
-        assert_eq!(send_count, 1, "third tick processes the final 1");
-        assert_eq!(rt.pending_unicast_sends_len(), 0);
-    }
-
-    #[test]
-    fn unicast_defers_when_router_queue_has_backlog() {
-        // ZEB-226 round-10 review (Finding 1, race): if the router queue
-        // has unprocessed events (e.g. an announce that would create the
-        // route for a queued unicast), a path-table miss must DEFER
-        // (re-queue), not drop. Otherwise an announce + send-to-just-
-        // -announced-target submitted in the same batch loses the send
-        // when `router_max_per_tick` caps the announce drain.
-        //
-        // Race-window proxy: capture `router_queue_drained` happens
-        // AFTER the router-queue drain inside tick(), so it reflects
-        // whatever's still queued post-drain. To force is_empty()=false
-        // at unicast-drain time, we need >1 router event AND a cap that
-        // can't drain them all in one tick. Two TimerTicks + cap=1 fits:
-        // one TimerTick is processed, one is left queued, the unicast
-        // sees the leftover and defers instead of dropping.
-        let mut config = NodeConfig::default();
-        config.schedule.router_max_per_tick = Some(1);
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
-
-        // Two router events; cap=1 means after the router drain the
-        // queue still has 1. The unicast drain will see `router_queue`
-        // non-empty and defer the unknown-target unicast.
-        rt.push_event(RuntimeEvent::TimerTick {
-            now: 1000,
-            unix_now: 0,
-        });
-        rt.push_event(RuntimeEvent::TimerTick {
-            now: 1001,
-            unix_now: 0,
-        });
-        assert_eq!(rt.router_queue_len(), 2);
-
-        // Push a unicast to an unknown destination. With the round-10
-        // fix, this MUST be deferred (router queue still has backlog),
-        // NOT dropped — even though the path-table lookup misses.
-        let unknown = [0x77u8; 16];
-        rt.push_event(RuntimeEvent::SendUnicastToDevice {
-            destination_hash: unknown,
-            packet: vec![0xbe, 0xef],
-        });
-        assert_eq!(rt.pending_unicast_sends_len(), 1);
-
-        let actions = rt.tick();
-
-        // Router cap=1 means 1 TimerTick processed, 1 still queued.
-        // Critically: the unicast sees router_queue still non-empty and
-        // DEFERS (no warn-and-drop, no SendOnInterface, the unicast
-        // stays queued for next tick).
-        assert_eq!(
-            rt.router_queue_len(),
-            1,
-            "router cap=1 leaves the second TimerTick queued"
-        );
-        assert_eq!(
-            rt.pending_unicast_sends_len(),
-            1,
-            "unicast must be DEFERRED (re-queued) — not dropped — \
-             because the router queue still has backlog this tick"
-        );
-        let send_count = actions
-            .iter()
-            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
-            .count();
-        assert_eq!(
-            send_count, 0,
-            "deferred unicast must NOT have produced a SendOnInterface \
-             (no real route, just a defer); got actions: {:?}",
-            actions
-        );
-
-        // Second tick: router queue drains the second TimerTick (now
-        // empty), then the unicast drain sees router_queue_drained=true
-        // AND the route is still unknown — finally the genuine drop
-        // path fires. Unicast leaves the queue, no SendOnInterface.
-        let actions = rt.tick();
-        assert_eq!(rt.router_queue_len(), 0);
-        assert_eq!(
-            rt.pending_unicast_sends_len(),
-            0,
-            "second tick: router fully drained, unknown route → \
-             genuine drop after defer attempts exhausted"
-        );
-        let send_count = actions
-            .iter()
-            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
-            .count();
-        assert_eq!(send_count, 0);
-    }
-
-    #[test]
-    fn unicast_drain_defers_count_against_router_max_per_tick() {
-        // ZEB-226 round-11 fix (CodeRabbit Major / Greptile P1):
-        // deferred unicasts must consume the unicast budget, not just
-        // routed/dropped ones. Without this, a flood of unknown-target
-        // sends during any tick where the router has backlog can walk
-        // the entire pending_unicast_sends queue in a single tick,
-        // bypassing router_max_per_tick.
-        //
-        // Setup chosen to be observable in a SINGLE tick:
-        //   - router_max_per_tick = 2
-        //   - router_queue: 3 TimerTicks (post-drain has 1 left → drained=false)
-        //   - pending_unicast_sends: 3 unknown destinations FOLLOWED BY
-        //     1 known destination
-        //
-        // With the fix: budget=2 is consumed by 2 of the 3 unknown
-        // defers; the third unknown and the known target are NEVER
-        // popped this tick → 0 SendOnInterface emitted.
-        //
-        // Without the fix: defers don't count → all 3 unknowns get
-        // deferred and the loop continues to pop the known target,
-        // routing it → 1 SendOnInterface emitted. The bug bypasses
-        // the cap.
-        use harmony_reticulum::path_table::PathUpdateResult;
-
-        let mut config = NodeConfig::default();
-        config.schedule.router_max_per_tick = Some(2);
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
-
-        // Seed a known path so the trailing known unicast WOULD route
-        // if the loop were to reach it.
-        let known_target = [0xa1u8; 16];
-        let random_blob = {
-            let mut b = [0u8; 10];
-            let ts: u64 = 1000;
-            let ts_bytes = ts.to_be_bytes();
-            b[5..10].copy_from_slice(&ts_bytes[3..8]);
-            b
-        };
-        let result = rt.router.path_table_mut_for_tests().update(
-            known_target,
-            known_target,
-            0,
-            Arc::from("udp0"),
-            [0u8; 16],
-            random_blob,
-            harmony_reticulum::InterfaceMode::Full,
-            1000,
-        );
-        assert_eq!(result, PathUpdateResult::Inserted);
-
-        // Push 3 router events; cap=2 means 1 leftover after drain →
-        // router_queue_drained=false at unicast-drain time.
-        rt.push_event(RuntimeEvent::TimerTick {
-            now: 1000,
-            unix_now: 0,
-        });
-        rt.push_event(RuntimeEvent::TimerTick {
-            now: 1001,
-            unix_now: 0,
-        });
-        rt.push_event(RuntimeEvent::TimerTick {
-            now: 1002,
-            unix_now: 0,
-        });
-        assert_eq!(rt.router_queue_len(), 3);
-
-        // Push 3 unknowns followed by 1 known. Order matters: the loop
-        // must hit unknowns first so the budget gets consumed by defers.
-        for i in 0..3u8 {
-            rt.push_event(RuntimeEvent::SendUnicastToDevice {
-                destination_hash: [0xb0 | i; 16],
-                packet: vec![0xde, 0xad],
-            });
-        }
-        rt.push_event(RuntimeEvent::SendUnicastToDevice {
-            destination_hash: known_target,
-            packet: vec![0xbe, 0xef],
-        });
-        assert_eq!(rt.pending_unicast_sends_len(), 4);
-
-        let actions = rt.tick();
-
-        // Router cap=2 leaves 1 TimerTick queued → router_queue_drained
-        // was false in the unicast loop.
-        assert_eq!(
-            rt.router_queue_len(),
-            1,
-            "router cap=2 with 3 events leaves 1 queued"
-        );
-
-        // CORE ASSERTION: with the fix, the 2 defers consumed the
-        // entire unicast budget. The known target was never reached,
-        // so NO SendOnInterface was emitted. Without the fix, the
-        // 3 defers wouldn't count and the loop would reach the known
-        // target → 1 SendOnInterface.
-        let send_count = actions
-            .iter()
-            .filter(|a| matches!(a, RuntimeAction::SendOnInterface { .. }))
-            .count();
-        assert_eq!(
-            send_count, 0,
-            "unicast budget=2 must be consumed by the first 2 unknown \
-             defers, leaving the known target untouched. Got actions: {:?}",
-            actions
-        );
-
-        // pending_unicast_sends total: 2 deferred (re-pushed to front) +
-        // 1 unknown still untouched + 1 known still untouched = 4.
-        assert_eq!(
-            rt.pending_unicast_sends_len(),
-            4,
-            "all 4 unicasts still pending: 2 deferred, 2 untouched (1 \
-             unknown + 1 known) — none routed, none dropped"
-        );
-    }
-
-    #[test]
-    fn unicast_round_trip_a_to_b_surfaces_as_unicast_received() {
-        // ZEB-216 Sub-B Phase 3a — Task 5: end-to-end plumbing smoke.
-        //
-        // Validates the full chain wired across Tasks 1-4 by running
-        // two independent NodeRuntime instances ("A" and "B") and
-        // hand-bridging A's outbound `SendOnInterface` action into B's
-        // `InboundPacket` event:
-        //
-        //   A: SendUnicastToDevice event       (Task 1: variant)
-        //     → SendOnInterface action          (Task 4: outbound dispatch)
-        //   B: InboundPacket event              (existing wiring)
-        //     → DeliverLocally NodeAction       (existing Reticulum)
-        //     → UnicastReceived action          (Task 3: inbound dispatch)
-        //
-        // Known limitation: Task 3's `source` field is `None` —
-        // Reticulum's `process_data_packet` cannot yet resolve the
-        // terminal link to an identity hash because the Node does not
-        // track terminal-link state. Real source-identity binding lands
-        // in ZEB-227 / Phase 3b. So the assertion below is
-        // `source == None`, NOT `source == Some(a.local_identity_hash())`.
-        // The round-trip still proves bytes flow + the four wiring
-        // touchpoints from Tasks 1-4 remain connected — replace the
-        // assertion with a real-identity check when ZEB-227 lands.
-        use harmony_reticulum::packet::{
-            DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType,
-            PropagationType,
-        };
-        use harmony_reticulum::path_table::PathUpdateResult;
-
-        let (mut a, _a_startup) = make_runtime();
-        let (mut b, _b_startup) = make_runtime();
-
-        // Pick a target hash and register it as a local destination on B
-        // so B's `process_data_packet` resolves it to DeliverLocally.
-        // (Both A and B already have a `udp0` interface registered by
-        // `NodeRuntime::new` — the same name on both sides keeps the
-        // hand-bridge below trivial.)
-        let target = [0xb0u8; 16];
-        b.router.register_destination(target);
-
-        // Build a Type1/Single/Data Reticulum packet with destination_hash
-        // = target, then serialize to wire bytes. This is what a real
-        // harmony-client outbox would construct + hand to the runtime.
-        let payload: Vec<u8> = vec![0x68, 0x65, 0x6c, 0x6c, 0x6f]; // "hello"
-        let pkt = Packet {
-            header: PacketHeader {
-                flags: PacketFlags {
-                    ifac: false,
-                    header_type: HeaderType::Type1,
-                    context_flag: false,
-                    propagation: PropagationType::Broadcast,
-                    destination_type: DestinationType::Single,
-                    packet_type: PacketType::Data,
-                },
-                hops: 0,
-                transport_id: None,
-                destination_hash: target,
-                context: harmony_reticulum::PacketContext::None,
-            },
-            data: Arc::from(payload.clone().into_boxed_slice()),
-        };
-        let wire_bytes = pkt.to_bytes().expect("packet should serialize");
-
-        // Seed A's path table so target → udp0 (mirrors Task 4's happy
-        // path; same path_table_mut_for_tests() seam).
-        let random_blob = {
-            let mut b = [0u8; 10];
-            let ts: u64 = 1000;
-            let ts_bytes = ts.to_be_bytes();
-            b[5..10].copy_from_slice(&ts_bytes[3..8]);
-            b
-        };
-        let result = a.router.path_table_mut_for_tests().update(
-            target,
-            target,
-            0,
-            Arc::from("udp0"),
-            [0u8; 16],
-            random_blob,
-            harmony_reticulum::InterfaceMode::Full,
-            1000,
-        );
-        assert_eq!(
-            result,
-            PathUpdateResult::Inserted,
-            "test seed should have inserted a fresh entry"
-        );
-
-        // A: enqueue the send and tick to capture the SendOnInterface action.
-        a.push_event(RuntimeEvent::SendUnicastToDevice {
-            destination_hash: target,
-            packet: wire_bytes.clone(),
-        });
-        let a_actions = a.tick();
-        let send = a_actions
-            .iter()
-            .find_map(|action| match action {
-                RuntimeAction::SendOnInterface {
-                    interface_name,
-                    raw,
-                    weight,
-                } => Some((interface_name.clone(), raw.clone(), *weight)),
-                _ => None,
-            })
-            .expect("A should emit SendOnInterface for target");
-
-        assert_eq!(
-            &*send.0, "udp0",
-            "A should route to the seeded udp0 interface"
-        );
-        assert_eq!(
-            send.1, wire_bytes,
-            "wire bytes must round-trip A unchanged (udp0 has no IFAC)"
-        );
-        assert_eq!(
-            send.2, None,
-            "directed unicast send carries weight=None (not broadcast)"
-        );
-
-        // B: feed the wire bytes back in as InboundPacket on the same
-        // interface name. Tick and look for UnicastReceived.
-        b.push_event(RuntimeEvent::InboundPacket {
-            interface_name: send.0.to_string(),
-            raw: send.1.clone(),
-            now: 1000,
-        });
-        let b_actions = b.tick();
-        let received = b_actions
-            .iter()
-            .find_map(|action| match action {
-                RuntimeAction::UnicastReceived {
-                    destination_hash,
-                    source,
-                    packet,
-                } => Some((*destination_hash, *source, packet.clone())),
-                _ => None,
-            })
-            .expect("B should surface UnicastReceived");
-
-        // Round-10 review: destination_hash now flows through. The
-        // packet was addressed to `target` (B's registered destination),
-        // and that's what B's UnicastReceived must surface so the client
-        // can dispatch by destination kind.
-        assert_eq!(
-            received.0, target,
-            "UnicastReceived.destination_hash must match the local \
-             destination the packet was addressed to"
-        );
-        // Source is `None` in Phase 3a per the Option<[u8; 16]> contract
-        // on `RuntimeAction::UnicastReceived` — terminal-link state isn't
-        // tracked at the Node layer yet, so the runtime can't surface a
-        // real source. ZEB-227 (Phase 3b) wires the real link-identity
-        // binding and this assertion should flip to
-        // `Some(a.local_identity_hash())` then.
-        assert_eq!(
-            received.1, None,
-            "source is None in Phase 3a; ZEB-227 (Phase 3b) wires \
-             real link-identity binding and this becomes Some(hash)"
-        );
-        // UnicastReceived.packet carries the parsed packet's `data`
-        // field (payload only), not the full wire bytes — matches the
-        // dispatcher behavior in dispatch_router_actions.
-        assert_eq!(received.2, payload, "payload bytes must round-trip A → B");
-    }
-
-    #[test]
     fn runtime_event_variants_exist() {
-        let _e1 = RuntimeEvent::InboundPacket {
-            interface_name: "lo".into(),
-            raw: vec![0u8; 20],
-            now: 1000,
-        };
         let _e2 = RuntimeEvent::TimerTick {
             now: 1000,
             unix_now: 0,
@@ -5692,12 +4423,6 @@ mod tests {
             payload: vec![],
             unix_now: 1000,
         };
-        let _e_l2 = RuntimeEvent::L2InterfaceReady {
-            interface_name: "l2:wlan0".into(),
-        };
-        let _e_l2c = RuntimeEvent::L2InterfaceClosed {
-            interface_name: "l2:wlan0".into(),
-        };
         let _e_vr = RuntimeEvent::VerifyResponse {
             payload: vec![0x00, 1, 0, 0, 0, 42, 0, 0, 0, 0],
         };
@@ -5723,11 +4448,6 @@ mod tests {
 
     #[test]
     fn runtime_action_variants_exist() {
-        let _a1 = RuntimeAction::SendOnInterface {
-            interface_name: "lo".into(),
-            raw: vec![0u8; 20],
-            weight: None,
-        };
         let _a2 = RuntimeAction::SendReply {
             query_id: 1,
             payload: vec![1, 2, 3],
@@ -5819,25 +4539,8 @@ mod tests {
     #[test]
     fn queues_start_empty() {
         let (rt, _) = make_runtime();
-        assert_eq!(rt.router_queue_len(), 0);
         assert_eq!(rt.storage_queue_len(), 0);
         assert_eq!(rt.compute_queue_len(), 0);
-    }
-
-    #[test]
-    fn push_event_classifies_router_events() {
-        let (mut rt, _) = make_runtime();
-        rt.push_event(RuntimeEvent::InboundPacket {
-            interface_name: "lo".into(),
-            raw: vec![0u8; 20],
-            now: 1000,
-        });
-        rt.push_event(RuntimeEvent::TimerTick {
-            now: 1001,
-            unix_now: 0,
-        });
-        assert_eq!(rt.router_queue_len(), 2);
-        assert_eq!(rt.storage_queue_len(), 0);
     }
 
     #[test]
@@ -5860,15 +4563,9 @@ mod tests {
     }
 
     #[test]
-    fn tick_drains_all_router_and_storage_events() {
+    fn tick_drains_all_storage_events() {
         let (mut rt, _) = make_runtime();
 
-        for i in 0..3 {
-            rt.push_event(RuntimeEvent::TimerTick {
-                now: 1000 + i,
-                unix_now: 0,
-            });
-        }
         rt.push_event(RuntimeEvent::QueryReceived {
             query_id: 10,
             key_expr: "harmony/content/stats".into(),
@@ -5880,12 +4577,10 @@ mod tests {
             payload: vec![],
         });
 
-        assert_eq!(rt.router_queue_len(), 3);
         assert_eq!(rt.storage_queue_len(), 2);
 
-        // One tick should drain ALL router and ALL storage events.
+        // One tick should drain ALL storage events.
         let actions = rt.tick();
-        assert_eq!(rt.router_queue_len(), 0);
         assert_eq!(rt.storage_queue_len(), 0);
 
         let reply_count = actions
@@ -6289,11 +4984,12 @@ mod tests {
         // Empty queues → full budget
         assert_eq!(rt.effective_fuel(), 1000);
 
-        // Push 5 router events (half of high_water=10)
+        // Push 5 storage events (half of high_water=10)
         for i in 0..5 {
-            rt.push_event(RuntimeEvent::TimerTick {
-                now: 1000 + i,
-                unix_now: 0,
+            rt.push_event(RuntimeEvent::QueryReceived {
+                query_id: 100 + i,
+                key_expr: "harmony/content/stats".into(),
+                payload: vec![],
             });
         }
         // load_factor = 5/10 = 0.5
@@ -6302,9 +4998,10 @@ mod tests {
 
         // Push 5 more (at high_water)
         for i in 5..10 {
-            rt.push_event(RuntimeEvent::TimerTick {
-                now: 1000 + i,
-                unix_now: 0,
+            rt.push_event(RuntimeEvent::QueryReceived {
+                query_id: 100 + i,
+                key_expr: "harmony/content/stats".into(),
+                payload: vec![],
             });
         }
         // load_factor = 10/10 = 1.0 → floor
@@ -6313,40 +5010,13 @@ mod tests {
 
         // Push beyond high_water — stays at floor
         for i in 10..20 {
-            rt.push_event(RuntimeEvent::TimerTick {
-                now: 1000 + i,
-                unix_now: 0,
+            rt.push_event(RuntimeEvent::QueryReceived {
+                query_id: 100 + i,
+                key_expr: "harmony/content/stats".into(),
+                payload: vec![],
             });
         }
         assert_eq!(rt.effective_fuel(), 100);
-    }
-
-    #[test]
-    fn router_max_per_tick_caps_drain() {
-        let mut config = NodeConfig::default();
-        config.schedule.router_max_per_tick = Some(2);
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
-
-        // Push 5 router events
-        for i in 0..5 {
-            rt.push_event(RuntimeEvent::TimerTick {
-                now: 1000 + i,
-                unix_now: 0,
-            });
-        }
-        assert_eq!(rt.router_queue_len(), 5);
-
-        // Tick should drain only 2
-        rt.tick();
-        assert_eq!(rt.router_queue_len(), 3);
-
-        // Next tick drains 2 more
-        rt.tick();
-        assert_eq!(rt.router_queue_len(), 1);
-
-        // Final tick drains the last one
-        rt.tick();
-        assert_eq!(rt.router_queue_len(), 0);
     }
 
     #[test]
@@ -6373,131 +5043,6 @@ mod tests {
             .filter(|a| matches!(a, RuntimeAction::SendReply { .. }))
             .count();
         assert_eq!(reply_count, 1);
-    }
-
-    // ── Starvation tracking tests ─────────────────────────────────
-
-    #[test]
-    fn starvation_counters_track_idle_ticks() {
-        let mut config = NodeConfig::default();
-        config.schedule.router_max_per_tick = Some(1);
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
-
-        // No events at all → all tiers idle
-        rt.tick();
-        assert_eq!(rt.starvation_counters(), (1, 1, 1));
-
-        // Push router event only
-        rt.push_event(RuntimeEvent::TimerTick {
-            now: 1000,
-            unix_now: 0,
-        });
-        rt.tick();
-        // Router processed → reset to 0. Storage/compute still idle → increment.
-        assert_eq!(rt.starvation_counters(), (0, 2, 2));
-
-        // Push storage event only
-        rt.push_event(RuntimeEvent::QueryReceived {
-            query_id: 1,
-            key_expr: "harmony/content/stats".into(),
-            payload: vec![],
-        });
-        rt.tick();
-        // Router idle → 1. Storage processed → 0. Compute still idle → 3.
-        assert_eq!(rt.starvation_counters(), (1, 0, 3));
-    }
-
-    #[test]
-    fn starvation_promotes_starved_tier() {
-        let mut config = NodeConfig::default();
-        config.schedule.router_max_per_tick = Some(1);
-        config.schedule.starvation_threshold = 3;
-        let (mut rt, _) = NodeRuntime::new(config, MemoryBookStore::new());
-
-        // Push many router events but no storage events
-        for i in 0..10 {
-            rt.push_event(RuntimeEvent::TimerTick {
-                now: 1000 + i,
-                unix_now: 0,
-            });
-        }
-
-        // Also push 1 storage event
-        rt.push_event(RuntimeEvent::QueryReceived {
-            query_id: 50,
-            key_expr: "harmony/content/stats".into(),
-            payload: vec![],
-        });
-
-        // Tick 1: router=1, storage=1 (processes the stats query)
-        let actions = rt.tick();
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, RuntimeAction::SendReply { query_id: 50, .. })));
-
-        // Verify default order: router actions appear before storage actions.
-        // SendOnInterface (router) should precede SendReply (storage) if any router events produce output.
-        // At minimum, starvation counters confirm storage is not yet starved.
-        assert_eq!(
-            rt.starvation_counters().1,
-            0,
-            "storage processed, counter should be 0"
-        );
-
-        rt.tick(); // tick 2: router=1, storage=0 (starved=1)
-        assert_eq!(rt.starvation_counters().1, 1);
-        rt.tick(); // tick 3: router=1, storage=0 (starved=2)
-        assert_eq!(rt.starvation_counters().1, 2);
-        rt.tick(); // tick 4: router=1, storage=0 (starved=3 → threshold hit)
-        assert_eq!(
-            rt.starvation_counters().1,
-            3,
-            "storage should hit starvation threshold"
-        );
-
-        // Now push both a storage event AND a router event.
-        // Without promotion, default order is [Router, Storage, Compute].
-        // With promotion, storage (starved=3 >= threshold=3) moves to front: [Storage, Router, Compute].
-        rt.push_event(RuntimeEvent::QueryReceived {
-            query_id: 60,
-            key_expr: "harmony/content/stats".into(),
-            payload: vec![],
-        });
-        rt.push_event(RuntimeEvent::TimerTick {
-            now: 2000,
-            unix_now: 0,
-        });
-
-        // Tick 5: storage promoted → its actions should appear before router actions in output
-        let actions = rt.tick();
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, RuntimeAction::SendReply { query_id: 60, .. })),
-            "promoted storage tier should process its event"
-        );
-
-        // Verify promotion resets the starvation counter
-        assert_eq!(
-            rt.starvation_counters().1,
-            0,
-            "storage counter should reset after processing"
-        );
-
-        // Verify ordering: SendReply (storage) should appear before SendOnInterface (router)
-        // because storage was promoted to process first.
-        let reply_pos = actions
-            .iter()
-            .position(|a| matches!(a, RuntimeAction::SendReply { query_id: 60, .. }));
-        let send_pos = actions
-            .iter()
-            .position(|a| matches!(a, RuntimeAction::SendOnInterface { .. }));
-        if let (Some(r), Some(s)) = (reply_pos, send_pos) {
-            assert!(
-                r < s,
-                "promoted storage actions should appear before router actions"
-            );
-        }
     }
 
     #[test]
@@ -6527,11 +5072,12 @@ mod tests {
         // Verify full fuel with empty queues
         assert_eq!(rt.effective_fuel(), 1000);
 
-        // Push 10 router events (= high_water) → fuel at floor
+        // Push 10 storage events (= high_water) → fuel at floor
         for i in 0..10 {
-            rt.push_event(RuntimeEvent::TimerTick {
-                now: 1000 + i,
-                unix_now: 0,
+            rt.push_event(RuntimeEvent::QueryReceived {
+                query_id: 100 + i,
+                key_expr: "harmony/content/stats".into(),
+                payload: vec![],
             });
         }
         assert_eq!(rt.effective_fuel(), 100);
@@ -6563,7 +5109,6 @@ mod tests {
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
             local_kem_pubkey: Vec::new(),
-            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -6645,7 +5190,6 @@ mod tests {
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
             local_kem_pubkey: Vec::new(),
-            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -6693,7 +5237,6 @@ mod tests {
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
             local_kem_pubkey: Vec::new(),
-            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -6738,7 +5281,6 @@ mod tests {
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
             local_kem_pubkey: Vec::new(),
-            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -6812,7 +5354,6 @@ mod tests {
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
             local_kem_pubkey: Vec::new(),
-            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -6875,7 +5416,6 @@ mod tests {
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
             local_kem_pubkey: Vec::new(),
-            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -6931,7 +5471,6 @@ mod tests {
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
             local_kem_pubkey: Vec::new(),
-            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -7084,8 +5623,8 @@ mod tests {
             },
             public_key: vec![0u8; 32],
             encryption_key: vec![],
-            routing_hints: vec![harmony_discovery::RoutingHint::Reticulum {
-                destination_hash: [0xAA; 16],
+            routing_hints: vec![harmony_discovery::RoutingHint::Zenoh {
+                locator: "tcp/127.0.0.1:7447".to_string(),
             }],
             published_at: 1000,
             expires_at: 2000,
@@ -7845,7 +6384,6 @@ mod tests {
             local_pq_identity_hash: [0u8; 16],
             local_dsa_pubkey: Vec::new(),
             local_kem_pubkey: Vec::new(),
-            reticulum_identity_bytes: None,
             inference_gguf_cid: None,
             inference_tokenizer_cid: None,
             engram_manifest_cid: None,
@@ -8612,363 +7150,5 @@ mod tests {
         assert!(runtime.storage_tier().cache().is_pinned(&cid));
         runtime.unpin_content(&cid);
         assert!(!runtime.storage_tier().cache().is_pinned(&cid));
-    }
-
-    // ── ZEB-227: NodeRuntime destination + identity-lookup APIs ─────────
-    //
-    // Three thin accessors on NodeRuntime that delegate to the inner
-    // Reticulum Node:
-    //   - register_local_destination(dest_hash)
-    //   - unregister_local_destination(dest_hash) -> bool
-    //   - lookup_destination_identity(dest_hash) -> Option<&Identity>
-    //
-    // Identity-lookup investigation findings (recorded here so the next
-    // implementer doesn't have to re-discover):
-    //   - `Identity` (Ed25519 verifying key + X25519 ECDH key) is
-    //     produced by `validate_announce` and surfaces transiently in
-    //     `NodeAction::AnnounceReceived { validated_announce, .. }`.
-    //   - It was NOT persisted in any Node state before this PR:
-    //     `path_table::PathEntry` only carries routing info (next_hop,
-    //     hops, expiry, random_blobs); `announce_table::AnnounceTableEntry`
-    //     only carries raw retransmission bytes for transport mode.
-    //   - This PR adds a side-table `Node.identity_table:
-    //     HashMap<DestinationHash, Identity>` populated in
-    //     `process_announce` and queried by `Node::lookup_identity`.
-
-    #[test]
-    fn node_runtime_register_local_destination_accepts_inbound_to_that_dest() {
-        use harmony_reticulum::packet::{
-            DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType,
-            PropagationType,
-        };
-
-        let (mut runtime, _startup) = make_runtime();
-
-        let dm_dest = [0xd1u8; 16];
-        runtime.register_local_destination(dm_dest);
-
-        // Build a Type1/Single/Data Reticulum packet addressed to dm_dest
-        // (mirrors the construction in
-        // `unicast_round_trip_a_to_b_surfaces_as_unicast_received` —
-        // ZEB-226 Phase 3a, commit b721148).
-        let payload: Vec<u8> = b"hello".to_vec();
-        let pkt = Packet {
-            header: PacketHeader {
-                flags: PacketFlags {
-                    ifac: false,
-                    header_type: HeaderType::Type1,
-                    context_flag: false,
-                    propagation: PropagationType::Broadcast,
-                    destination_type: DestinationType::Single,
-                    packet_type: PacketType::Data,
-                },
-                hops: 0,
-                transport_id: None,
-                destination_hash: dm_dest,
-                context: harmony_reticulum::PacketContext::None,
-            },
-            data: Arc::from(payload.clone().into_boxed_slice()),
-        };
-        let wire_bytes = pkt.to_bytes().expect("packet should serialize");
-
-        runtime.push_event(RuntimeEvent::InboundPacket {
-            interface_name: "udp0".to_string(),
-            raw: wire_bytes,
-            now: 1000,
-        });
-        let actions = runtime.tick();
-
-        let mut found = false;
-        for action in &actions {
-            if let RuntimeAction::UnicastReceived {
-                destination_hash, ..
-            } = action
-            {
-                assert_eq!(*destination_hash, dm_dest);
-                found = true;
-            }
-        }
-        assert!(
-            found,
-            "registering dm_dest must cause inbound packets to surface as UnicastReceived"
-        );
-    }
-
-    #[test]
-    fn node_runtime_unregister_local_destination_returns_bool() {
-        use harmony_reticulum::packet::{
-            DestinationType, HeaderType, Packet, PacketFlags, PacketHeader, PacketType,
-            PropagationType,
-        };
-
-        let (mut runtime, _) = make_runtime();
-
-        let dm_dest = [0xd1u8; 16];
-        runtime.register_local_destination(dm_dest);
-        assert!(runtime.unregister_local_destination(&dm_dest));
-        assert!(!runtime.unregister_local_destination(&dm_dest));
-
-        // Observable verification (CodeRabbit nitpick on PR #268): after
-        // unregister, inbound packets addressed to dm_dest MUST NOT surface
-        // as `RuntimeAction::UnicastReceived`. The boolean return value alone
-        // doesn't prove the underlying state actually changed; this asserts
-        // observable behavior at the action layer. Mirrors the packet-builder
-        // shape from `node_runtime_register_local_destination_accepts_inbound_to_that_dest`
-        // (ZEB-226 Phase 3a).
-        let payload: Vec<u8> = b"after-unregister".to_vec();
-        let pkt = Packet {
-            header: PacketHeader {
-                flags: PacketFlags {
-                    ifac: false,
-                    header_type: HeaderType::Type1,
-                    context_flag: false,
-                    propagation: PropagationType::Broadcast,
-                    destination_type: DestinationType::Single,
-                    packet_type: PacketType::Data,
-                },
-                hops: 0,
-                transport_id: None,
-                destination_hash: dm_dest,
-                context: harmony_reticulum::PacketContext::None,
-            },
-            data: Arc::from(payload.into_boxed_slice()),
-        };
-        let wire_bytes = pkt.to_bytes().expect("packet should serialize");
-
-        runtime.push_event(RuntimeEvent::InboundPacket {
-            interface_name: "udp0".to_string(),
-            raw: wire_bytes,
-            now: 1000,
-        });
-        let actions = runtime.tick();
-
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, RuntimeAction::UnicastReceived { .. })),
-            "unregistered destination must not surface inbound packets as UnicastReceived"
-        );
-    }
-
-    #[test]
-    fn node_runtime_unregister_local_destination_preserves_announcing_destination() {
-        // Asymmetry pin: NodeRuntime::register_local_destination only adds to
-        // local_destinations. The matching unregister_local_destination MUST
-        // also be narrow — only remove from local_destinations, NOT clear
-        // unrelated state like announcing_destinations.
-        //
-        // Concrete scenario: a node may register the same destination_hash
-        // both as a local destination (to receive inbound) and as an
-        // announcing destination (to advertise to peers). Calling the public
-        // unregister_local_destination must NOT silently tear down the
-        // announcement — that would be a surprising side effect on a public
-        // API whose name promises narrow semantics.
-        //
-        // Regression for the bot finding on PR #268.
-        use harmony_identity::PrivateIdentity;
-        use harmony_reticulum::DestinationName;
-        use rand::rngs::OsRng;
-
-        let (mut runtime, _) = make_runtime();
-
-        // Register the same dest_hash both as announcing (which ALSO inserts
-        // into local_destinations as a side effect of register_announcing_destination)
-        // and via the narrow public API.
-        let identity = PrivateIdentity::generate(&mut OsRng);
-        let name = DestinationName::from_name("test-app", &["dm"]).unwrap();
-        let dest_hash = name.destination_hash(&identity.public_identity().address_hash);
-
-        // Use the inner-router API for the announcing setup (mirrors how
-        // existing internal tests register announcing destinations).
-        runtime
-            .router
-            .register_announcing_destination(identity, name, vec![], Some(300), 0);
-        // ALSO register via the narrow public API (idempotent — local_destinations
-        // is a HashSet).
-        runtime.register_local_destination(dest_hash);
-
-        // Pre-condition: both tables have the dest_hash.
-        assert_eq!(runtime.router.destination_count(), 1);
-        assert_eq!(runtime.router.announcing_destination_count(), 1);
-
-        // Act: call the public narrow unregister.
-        assert!(runtime.unregister_local_destination(&dest_hash));
-
-        // Post-condition: local_destinations is empty (we just removed the only
-        // entry), but announcing_destinations is PRESERVED.
-        assert_eq!(
-            runtime.router.destination_count(),
-            0,
-            "local_destinations should be empty after unregister_local_destination"
-        );
-        assert_eq!(
-            runtime.router.announcing_destination_count(),
-            1,
-            "announcing_destinations MUST be preserved by narrow unregister — \
-             tearing it down would be a surprising side effect"
-        );
-    }
-
-    #[test]
-    fn node_runtime_lookup_destination_identity_returns_announced_identity() {
-        // After the runtime processes a valid announce on its `udp0`
-        // interface (registered by default by NodeRuntime::new), the
-        // announced Identity must be retrievable via
-        // lookup_destination_identity(dest_hash).
-        use harmony_identity::PrivateIdentity;
-        use harmony_reticulum::DestinationName;
-        use rand::rngs::OsRng;
-
-        let (mut runtime, _) = make_runtime();
-
-        // Build a real announce from a fresh identity. The runtime's
-        // `udp0` interface accepts and processes it through the
-        // existing `InboundPacket → process_announce` pipeline, which
-        // populates `Node.identity_table` (the side-table this PR adds).
-        let identity = PrivateIdentity::generate(&mut OsRng);
-        let dest_name = DestinationName::from_name("lxmf", &["delivery"]).unwrap();
-        let expected_dest_hash =
-            dest_name.destination_hash(&identity.public_identity().address_hash);
-        let announce_packet = harmony_reticulum::build_announce(
-            &identity,
-            &dest_name,
-            &mut OsRng,
-            1_700_000_000,
-            &[],
-            None,
-        )
-        .expect("build_announce must succeed");
-        let wire_bytes = announce_packet
-            .to_bytes()
-            .expect("announce packet should serialize");
-
-        runtime.push_event(RuntimeEvent::InboundPacket {
-            interface_name: "udp0".to_string(),
-            raw: wire_bytes,
-            now: 1_700_000_000,
-        });
-        let _actions = runtime.tick();
-
-        let looked_up = runtime.lookup_destination_identity(&expected_dest_hash);
-        assert!(
-            looked_up.is_some(),
-            "after announce, lookup must return Some(Identity)"
-        );
-        // Identity has a public field `address_hash`, not a method.
-        assert_eq!(
-            looked_up.unwrap().address_hash,
-            identity.public_identity().address_hash,
-            "looked-up identity must match the one that signed the announce"
-        );
-    }
-
-    #[test]
-    fn node_runtime_lookup_destination_identity_unknown_returns_none() {
-        let (runtime, _) = make_runtime();
-
-        let unknown = [0xff; 16];
-        assert!(runtime.lookup_destination_identity(&unknown).is_none());
-    }
-
-    #[test]
-    fn node_runtime_lookup_destination_identity_overwrites_on_reannounce_with_new_identity() {
-        // Identity-rotation regression: when a peer rotates its
-        // Identity (regenerates keys) and re-announces, the cached
-        // identity_table entry MUST reflect the new binding.
-        // Downstream application-layer Ed25519 signature verification
-        // (Path B per ZEB-216 spec ea38132) depends on this — verifying
-        // against a stale Identity would block valid post-rotation
-        // packets.
-        //
-        // Caveat on the map-collision shape: a Reticulum dest_hash is
-        // `SHA256(name_hash || identity_address_hash)[:16]`. Because
-        // `identity_address_hash` is a function of the identity public
-        // keys, a rotated identity necessarily produces a *different*
-        // dest_hash, so the underlying `HashMap::insert` overwrite path
-        // can only be exercised by collision-on-identical-identity
-        // (which is a no-op) — there is no signed announce we can
-        // construct that pins the same dest_hash with different
-        // identity material (the announce signature signs the
-        // dest_hash). What we *can* lock in is per-dest_hash isolation:
-        // two announces with rotated identity must each surface their
-        // own Identity under their own dest_hash, not bleed across.
-        // That is the load-bearing semantic for downstream signature
-        // verification.
-        use harmony_identity::PrivateIdentity;
-        use harmony_reticulum::DestinationName;
-        use rand::rngs::OsRng;
-
-        let (mut runtime, _) = make_runtime();
-        let dest_name = DestinationName::from_name("lxmf", &["delivery"]).unwrap();
-
-        // First announce: identity A.
-        let identity_a = PrivateIdentity::generate(&mut OsRng);
-        let dest_hash_a = dest_name.destination_hash(&identity_a.public_identity().address_hash);
-        let announce_a = harmony_reticulum::build_announce(
-            &identity_a,
-            &dest_name,
-            &mut OsRng,
-            1_700_000_000,
-            &[],
-            None,
-        )
-        .expect("build_announce A must succeed");
-        runtime.push_event(RuntimeEvent::InboundPacket {
-            interface_name: "udp0".to_string(),
-            raw: announce_a.to_bytes().expect("announce A should serialize"),
-            now: 1_700_000_000,
-        });
-        let _ = runtime.tick();
-
-        let after_a = runtime
-            .lookup_destination_identity(&dest_hash_a)
-            .expect("identity A must be cached after first announce");
-        assert_eq!(
-            after_a.address_hash,
-            identity_a.public_identity().address_hash,
-        );
-
-        // Second announce: identity B (rotated keys), same dest_name.
-        // Different dest_hash because identity_address_hash changed.
-        let identity_b = PrivateIdentity::generate(&mut OsRng);
-        let dest_hash_b = dest_name.destination_hash(&identity_b.public_identity().address_hash);
-        assert_ne!(
-            dest_hash_a, dest_hash_b,
-            "rotated identity must yield a distinct dest_hash",
-        );
-        let announce_b = harmony_reticulum::build_announce(
-            &identity_b,
-            &dest_name,
-            &mut OsRng,
-            1_700_000_001,
-            &[],
-            None,
-        )
-        .expect("build_announce B must succeed");
-        runtime.push_event(RuntimeEvent::InboundPacket {
-            interface_name: "udp0".to_string(),
-            raw: announce_b.to_bytes().expect("announce B should serialize"),
-            now: 1_700_000_001,
-        });
-        let _ = runtime.tick();
-
-        // Per-dest_hash isolation: each dest_hash resolves to its own
-        // Identity, no cross-talk.
-        let looked_up_b = runtime
-            .lookup_destination_identity(&dest_hash_b)
-            .expect("identity B must be cached after second announce");
-        assert_eq!(
-            looked_up_b.address_hash,
-            identity_b.public_identity().address_hash,
-            "dest_hash B must resolve to identity B, not the rotated-out A",
-        );
-        let looked_up_a_again = runtime
-            .lookup_destination_identity(&dest_hash_a)
-            .expect("identity A must remain cached under its own dest_hash");
-        assert_eq!(
-            looked_up_a_again.address_hash,
-            identity_a.public_identity().address_hash,
-            "dest_hash A must still resolve to identity A (no bleed from B)",
-        );
     }
 }

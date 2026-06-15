@@ -263,7 +263,6 @@ fn build_local_announce(
     pq_identity: &PqPrivateIdentity,
     node_id: [u8; 32],
     relay_url: Option<String>,
-    reticulum_addr: Option<[u8; 16]>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     use harmony_discovery::{AnnounceBuilder, AnnounceRecord, RoutingHint};
     use harmony_identity::IdentityRef;
@@ -298,13 +297,6 @@ fn build_local_announce(
         relay_url,
         direct_addrs: vec![],
     });
-
-    // Reticulum routing hint (Ed25519 destination hash for UDP mesh).
-    if let Some(dest_hash) = reticulum_addr {
-        builder.add_routing_hint(RoutingHint::Reticulum {
-            destination_hash: dest_hash,
-        });
-    }
 
     let payload = builder.signable_payload();
     let signature = pq_identity
@@ -447,54 +439,30 @@ pub async fn run(
         runtime.disable_s3();
     }
 
-    // ── L2 Reticulum channel endpoints (populated when rawlink bridge starts) ─
-    // On non-Linux / non-rawlink builds these stay None; allow_unused_mut avoids
-    // warnings while keeping the cfg-gated assignment path simple.
-    #[allow(unused_mut)]
-    let mut ret_inbound_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>> = None;
-    #[allow(unused_mut)]
-    let mut ret_outbound_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>> = None;
-    #[allow(unused_mut)]
-    let mut rawlink_iface_name: Option<String> = None;
-
     // ── AF_PACKET rawlink bridge (Linux + rawlink feature only) ──────────────
+    // Pure Zenoh-over-L2 carrier: the bridge shuttles frames directly between the
+    // raw L2 socket and the node's zenoh session, so it needs no event-loop
+    // plumbing. (The Reticulum router that previously consumed inbound L2
+    // datagrams was removed in ZEB-475; the bridge now has no Reticulum coupling
+    // and the node simply spawns it.)
     #[cfg(all(target_os = "linux", feature = "rawlink"))]
     if let Some(ref iface) = rawlink_interface {
         match harmony_rawlink::af_packet::AfPacketSocket::new(iface) {
             Ok(socket) => {
-                let (ri_tx, ri_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-                let (ro_tx, ro_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-
                 let bridge_config = harmony_rawlink::BridgeConfig {
                     identity_hash: runtime.local_pq_identity_hash(),
-                    reticulum_inbound_tx: Some(ri_tx),
                     ..harmony_rawlink::BridgeConfig::default()
                 };
                 let padded_socket =
                     harmony_rawlink::PaddedSocket::new(socket, harmony_rawlink::DEFAULT_PAD_BLOCK);
-                let mut bridge = harmony_rawlink::Bridge::new(
-                    padded_socket,
-                    session.clone(),
-                    bridge_config,
-                    Some(ro_rx),
-                );
-
-                // Register L2 interface with the Reticulum router
-                let iface_name = format!("l2:{}", iface);
-                runtime.push_event(RuntimeEvent::L2InterfaceReady {
-                    interface_name: iface_name.clone(),
-                });
-
-                ret_inbound_rx = Some(ri_rx);
-                ret_outbound_tx = Some(ro_tx);
-                rawlink_iface_name = Some(iface_name);
-
+                let mut bridge =
+                    harmony_rawlink::Bridge::new(padded_socket, session.clone(), bridge_config);
                 tokio::spawn(async move {
                     if let Err(e) = bridge.run().await {
                         tracing::warn!(err = %e, "rawlink bridge stopped");
                     }
                 });
-                tracing::info!(%iface, "rawlink AF_PACKET bridge started");
+                tracing::info!(%iface, "rawlink AF_PACKET bridge started (Zenoh-over-L2)");
             }
             Err(e) => {
                 tracing::warn!(
@@ -594,7 +562,7 @@ pub async fn run(
         // the announce here (where Arc<PqPrivateIdentity> is accessible) and feed
         // the pre-serialized bytes to the runtime for Zenoh publishing.
         if let Some(ref tc) = tunnel_config {
-            match build_local_announce(&tc.local_identity, node_id_bytes, relay_url, mdns_addr) {
+            match build_local_announce(&tc.local_identity, node_id_bytes, relay_url) {
                 Ok(record_bytes) => {
                     runtime.push_event(RuntimeEvent::LocalAnnounceReady { record_bytes });
                 }
@@ -689,7 +657,6 @@ pub async fn run(
             None,
             &tunnel_senders,
             &mut deferred_dials,
-            &ret_outbound_tx,
             &data_dir,
             &disk_tx,
             &archive_dir,
@@ -764,8 +731,8 @@ pub async fn run(
     timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     // ── Reusable UDP receive buffer ───────────────────────────────────────────
-    // Max UDP datagram size — Reticulum MTU is 500 (default) or 1024 (medium
-    // interfaces). Use 65535 to never silently truncate.
+    // Max UDP datagram size — use 65535 to never silently truncate an inbound
+    // datagram (the mDNS/discovery traffic on this socket is far smaller).
     let mut udp_buf = vec![0u8; 65535];
 
     // ── Monotonic query-id counter ────────────────────────────────────────────
@@ -827,18 +794,16 @@ pub async fn run(
         let mut should_tick = false;
 
         tokio::select! {
-            // Arm 1: UDP packet received — buffer only, tick on timer.
+            // Arm 1: UDP packet received — mark the peer seen for mDNS liveness.
+            // The Reticulum router that consumed these datagrams was removed
+            // (ZEB-475); the socket stays bound so peer liveness tracking and
+            // any future direct-UDP use remain available.
             result = udp.recv_from(&mut udp_buf) => {
                 match result {
-                    Ok((len, src)) => {
+                    Ok((_len, src)) => {
                         // Invariant: src port matches the peer's mDNS-announced listen port
                         // because each node sends from its bound --listen-address socket.
                         peer_table.mark_seen(&src);
-                        runtime.push_event(RuntimeEvent::InboundPacket {
-                            interface_name: "udp0".to_string(),
-                            raw: udp_buf[..len].to_vec(),
-                            now: now_ms(),
-                        });
                     }
                     Err(e) => {
                         tracing::warn!(err = %e, "UDP recv error");
@@ -1002,7 +967,6 @@ pub async fn run(
                     &peer_table,
                     &tunnel_senders,
                     &mut deferred_dials,
-                    &ret_outbound_tx,
                     &data_dir,
                     &disk_tx,
                     &s3_read_library,
@@ -1119,26 +1083,9 @@ pub async fn run(
                             });
                         }
                     }
-                    TunnelBridgeEvent::ReticulumReceived {
-                        interface_name,
-                        packet,
-                        connection_id,
-                    } => {
-                        let is_current = tunnel_senders
-                            .get(&interface_name)
-                            .map(|s| s.connection_id == connection_id)
-                            .unwrap_or(false);
-                        if is_current {
-                            runtime.push_event(RuntimeEvent::TunnelReticulumReceived {
-                                interface_name,
-                                packet,
-                                now: now_ms(),
-                            });
-                        }
-                    }
                     TunnelBridgeEvent::ZenohReceived { connection_id, .. } => {
                         // TODO(harmony-h6k): Zenoh over tunnel
-                        let _ = connection_id; // will be guarded like ReticulumReceived
+                        let _ = connection_id; // will be guarded like ReplicationReceived
                     }
                     TunnelBridgeEvent::ReplicationReceived {
                         interface_name,
@@ -1363,40 +1310,7 @@ pub async fn run(
                 }
             }
 
-            // Arm 9: Inbound Reticulum packet from L2 rawlink bridge.
-            result = async {
-                match ret_inbound_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                match result {
-                    Some(packet) => {
-                        if let Some(ref iface_name) = rawlink_iface_name {
-                            runtime.push_event(RuntimeEvent::InboundPacket {
-                                interface_name: iface_name.clone(),
-                                raw: packet,
-                                now: now_ms(),
-                            });
-                        }
-                    }
-                    None => {
-                        // Bridge task exited — sender dropped. Clean up fully:
-                        // clear channels, unregister the interface from the router.
-                        tracing::warn!("L2 rawlink bridge inbound channel closed — disabling L2 transport");
-                        ret_inbound_rx = None;
-                        ret_outbound_tx = None;
-                        if let Some(ref iface_name) = rawlink_iface_name {
-                            runtime.push_event(RuntimeEvent::L2InterfaceClosed {
-                                interface_name: iface_name.clone(),
-                            });
-                        }
-                        rawlink_iface_name = None;
-                    }
-                }
-            }
-
-            // Arm 10: Graceful shutdown (SIGTERM from procd, Ctrl+C).
+            // Arm 9: Graceful shutdown (SIGTERM from procd, Ctrl+C).
             _ = &mut shutdown => {
                 break;
             }
@@ -1405,8 +1319,8 @@ pub async fn run(
         // Only tick on timer — counters (tick_count, ticks_since_filter_broadcast,
         // peer filter eviction) must advance at wall-clock rate, not event rate.
         // Events queue up between ticks (max ~250ms). At worst case 1 Gbps with
-        // 500-byte Reticulum frames, ~62K events queue per tick (~31 MB) — bounded
-        // by the timer interval and acceptable for 1-2 GB RAM routers.
+        // small (~500-byte) datagrams, ~62K events queue per tick (~31 MB) —
+        // bounded by the timer interval and acceptable for 1-2 GB RAM nodes.
         // A drain-without-counter-increment API would allow bounded queues under
         // flood conditions, but requires changing NodeRuntime's interface — deferred.
         if should_tick {
@@ -1450,7 +1364,6 @@ pub async fn run(
                                             Some(&peer_table),
                                             &tunnel_senders,
                                             &mut deferred_dials,
-                                            &ret_outbound_tx,
                                             &data_dir,
                                             &disk_tx,
                                             &s3_read_library,
@@ -1481,7 +1394,6 @@ pub async fn run(
                                         Some(&peer_table),
                                         &tunnel_senders,
                                         &mut deferred_dials,
-                                        &ret_outbound_tx,
                                         &data_dir,
                                         &disk_tx,
                                         &s3_read_library,
@@ -1710,7 +1622,6 @@ pub async fn run(
                             Some(&peer_table),
                             &tunnel_senders,
                             &mut deferred_dials,
-                            &ret_outbound_tx,
                             &data_dir,
                             &disk_tx,
                             &s3_read_library,
@@ -1730,7 +1641,6 @@ pub async fn run(
                     Some(&peer_table),
                     &tunnel_senders,
                     &mut deferred_dials,
-                    &ret_outbound_tx,
                     &data_dir,
                     &disk_tx,
                     &archive_dir,
@@ -1891,7 +1801,6 @@ async fn dispatch_action(
     peer_table: Option<&PeerTable>,
     tunnel_senders: &HashMap<String, TunnelSender>,
     deferred_dials: &mut BinaryHeap<Reverse<DeferredDial>>,
-    ret_outbound_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     data_dir: &Option<std::path::PathBuf>,
     disk_tx: &mpsc::Sender<DiskIoResult>,
     archive_dir: &Option<std::path::PathBuf>,
@@ -1900,49 +1809,6 @@ async fn dispatch_action(
     s3_tx: &mpsc::Sender<S3IoResult>,
 ) {
     match action {
-        // ── Tier 1: Send on interface (UDP broadcast + unicast, or tunnel) ────
-        // Awaited inline (not spawned) because tokio::net::UdpSocket is not
-        // Clone. For Reticulum's small MTU (≤1024 bytes), send_to is
-        // effectively non-blocking on a UDP socket with default buffer sizes.
-        // Tunnel interfaces route through TunnelSender (non-blocking try_send).
-        RuntimeAction::SendOnInterface {
-            ref interface_name,
-            ref raw,
-            weight,
-        } => {
-            let should_send = match weight {
-                None => true,                         // directed: always send
-                Some(w) if w >= 1.0 => true,          // best interface: always send
-                Some(w) => rand::random::<f32>() < w, // probabilistic
-            };
-            if should_send {
-                if interface_name.starts_with("l2:") {
-                    if let Some(ref tx) = ret_outbound_tx {
-                        if tx.try_send(raw.clone()).is_err() {
-                            tracing::warn!(%interface_name, "L2 send queue full — dropping packet");
-                        }
-                    }
-                } else if interface_name.starts_with("tunnel-") {
-                    if let Some(sender) = tunnel_senders.get(interface_name.as_ref()) {
-                        if sender.try_send_reticulum(raw.clone()).is_err() {
-                            tracing::warn!(%interface_name, "tunnel send queue full — dropping packet");
-                        }
-                    }
-                } else {
-                    if let Err(e) = udp.send_to(raw, broadcast_addr).await {
-                        tracing::warn!(err = %e, "UDP broadcast send error");
-                    }
-                    if let Some(peers) = peer_table {
-                        for addr in peers.peer_addrs() {
-                            if let Err(e) = udp.send_to(raw, addr).await {
-                                tracing::warn!(peer = %addr, err = %e, "UDP unicast send error");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         // ── Tier 2: Zenoh publish (spawned to avoid blocking select loop) ────
         RuntimeAction::Publish { key_expr, payload } => {
             let session = session.clone();
@@ -2104,8 +1970,8 @@ async fn dispatch_action(
         }
 
         // ── Peer lifecycle: Path request ──────────────────────────────────────
-        // Stub — announce probing will be wired when path request packets are
-        // implemented in the Reticulum router.
+        // Stub — announce probing is not wired on the surviving transports
+        // (tunnel/zenoh); kept as a no-op so the action stays exhaustively matched.
         RuntimeAction::SendPathRequest { identity_hash } => {
             tracing::debug!(
                 identity = %hex::encode(identity_hash),
@@ -2377,26 +2243,6 @@ async fn dispatch_action(
         RuntimeAction::RunInference { .. } => {
             tracing::error!("RunInference reached dispatch_action — should be intercepted");
         }
-        // ZEB-216 Sub-B Phase 3a: harmony-node has no client-facing IPC channel
-        // for unicast delivery yet. The harmony-client (Phase 3b, ZEB-227)
-        // consumes this variant directly via its embedded NodeRuntime — when
-        // running under harmony-node (the standalone binary), there's no
-        // consumer, so log at debug and drop. This keeps harmony-node compiling
-        // exhaustively against the new variant without inventing a delivery
-        // path that has no recipient.
-        RuntimeAction::UnicastReceived {
-            destination_hash,
-            source,
-            packet,
-        } => {
-            tracing::debug!(
-                destination_hash_first_4 = ?&destination_hash[..4],
-                source_known = source.is_some(),
-                packet_len = packet.len(),
-                "UnicastReceived in harmony-node — no client consumer; dropping. \
-                 Real consumer is harmony-client per ZEB-216 Sub-B Phase 3b."
-            );
-        }
     }
 }
 
@@ -2417,7 +2263,6 @@ async fn handle_inference_result(
     peer_table: &PeerTable,
     tunnel_senders: &HashMap<String, TunnelSender>,
     deferred_dials: &mut BinaryHeap<Reverse<DeferredDial>>,
-    ret_outbound_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     data_dir: &Option<std::path::PathBuf>,
     disk_tx: &mpsc::Sender<DiskIoResult>,
     archive_dir: &Option<std::path::PathBuf>,
@@ -2504,7 +2349,6 @@ async fn handle_inference_result(
                         Some(peer_table),
                         tunnel_senders,
                         deferred_dials,
-                        ret_outbound_tx,
                         data_dir,
                         disk_tx,
                         s3_read_library,
@@ -2541,7 +2385,6 @@ async fn handle_inference_result(
                         Some(peer_table),
                         tunnel_senders,
                         deferred_dials,
-                        ret_outbound_tx,
                         data_dir,
                         disk_tx,
                         s3_read_library,
@@ -2575,7 +2418,6 @@ async fn handle_inference_result(
                         Some(peer_table),
                         tunnel_senders,
                         deferred_dials,
-                        ret_outbound_tx,
                         data_dir,
                         disk_tx,
                         s3_read_library,

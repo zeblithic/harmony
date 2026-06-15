@@ -1,6 +1,6 @@
 //! Batch frame encoding and decoding for the Harmony L2 protocol.
 //!
-//! Packs multiple Data/Reticulum sub-frames into a single Ethernet broadcast
+//! Packs multiple sub-frames (Scout, Data, etc.) into a single Ethernet broadcast
 //! to reduce PHY preamble overhead on WiFi mesh (where broadcast frames cannot
 //! use A-MSDU/A-MPDU aggregation).
 //!
@@ -231,7 +231,7 @@ mod tests {
         let mut acc = BatchAccumulator::new(1500);
 
         let ret_payload = vec![0xAA; 100];
-        assert!(acc.push(frame_type::RETICULUM, &ret_payload).is_none());
+        assert!(acc.push(frame_type::DATA, &ret_payload).is_none());
 
         let data_payload = b"harmony/test";
         assert!(acc.push(frame_type::DATA, data_payload).is_none());
@@ -243,8 +243,8 @@ mod tests {
         // content_len = (3+100) + (3+12) = 118
         assert_eq!(u16::from_be_bytes([batch[1], batch[2]]), 118);
 
-        // Sub-frame 1: RETICULUM, len=100
-        assert_eq!(batch[3], frame_type::RETICULUM);
+        // Sub-frame 1: DATA, len=100
+        assert_eq!(batch[3], frame_type::DATA);
         assert_eq!(u16::from_be_bytes([batch[4], batch[5]]), 100);
         assert_eq!(&batch[6..106], &ret_payload[..]);
 
@@ -334,19 +334,19 @@ mod tests {
     #[test]
     fn decode_roundtrip() {
         let mut acc = BatchAccumulator::new(1500);
-        acc.push(frame_type::RETICULUM, &[0xAA; 50]);
+        acc.push(frame_type::DATA, &[0xAA; 50]);
         acc.push(frame_type::DATA, b"harmony/topic/data-payload-here");
-        acc.push(frame_type::RETICULUM, &[0xBB; 10]);
+        acc.push(frame_type::DATA, &[0xBB; 10]);
         let batch = acc.flush().unwrap();
 
         let subs: Vec<(u8, Vec<u8>)> = decode_batch(&batch).map(|(t, p)| (t, p.to_vec())).collect();
 
         assert_eq!(subs.len(), 3);
-        assert_eq!(subs[0].0, frame_type::RETICULUM);
+        assert_eq!(subs[0].0, frame_type::DATA);
         assert_eq!(subs[0].1, vec![0xAA; 50]);
         assert_eq!(subs[1].0, frame_type::DATA);
         assert_eq!(subs[1].1, b"harmony/topic/data-payload-here");
-        assert_eq!(subs[2].0, frame_type::RETICULUM);
+        assert_eq!(subs[2].0, frame_type::DATA);
         assert_eq!(subs[2].1, vec![0xBB; 10]);
     }
 
@@ -354,7 +354,7 @@ mod tests {
     fn decode_truncated_stops_cleanly() {
         let mut acc = BatchAccumulator::new(1500);
         acc.push(frame_type::DATA, b"valid");
-        acc.push(frame_type::RETICULUM, &[0xCC; 40]);
+        acc.push(frame_type::DATA, &[0xCC; 40]);
         let mut batch = acc.flush().unwrap();
 
         // Truncate the second sub-frame's payload (chop 10 bytes off the end).
@@ -374,8 +374,8 @@ mod tests {
         // content_len = (3+3) + (3+5) + (3+2) = 19
         let mut batch = vec![frame_type::BATCH];
         batch.extend_from_slice(&19u16.to_be_bytes());
-        // Sub-frame 1: RETICULUM, 3 bytes
-        batch.push(frame_type::RETICULUM);
+        // Sub-frame 1: DATA, 3 bytes
+        batch.push(frame_type::DATA);
         batch.extend_from_slice(&3u16.to_be_bytes());
         batch.extend_from_slice(&[0xAA; 3]);
         // Sub-frame 2: unknown type 0xFF, 5 bytes
@@ -391,7 +391,7 @@ mod tests {
 
         // All three should be yielded — the caller decides what to do with unknown types.
         assert_eq!(subs.len(), 3);
-        assert_eq!(subs[0].0, frame_type::RETICULUM);
+        assert_eq!(subs[0].0, frame_type::DATA);
         assert_eq!(subs[1].0, 0xFF);
         assert_eq!(subs[2].0, frame_type::DATA);
         assert_eq!(subs[2].1, vec![0xBB; 2]);

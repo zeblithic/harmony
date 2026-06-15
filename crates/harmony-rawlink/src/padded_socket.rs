@@ -1,7 +1,7 @@
 //! Socket wrapper that pads outgoing frames to uniform block sizes.
 //!
 //! Prevents traffic analysis based on frame size — a 31-byte scout frame and
-//! a 500-byte Reticulum announce look identical on the wire (both 1024 bytes).
+//! a 500-byte data frame look identical on the wire (both 1024 bytes).
 
 use crate::error::RawLinkError;
 use crate::socket::RawSocket;
@@ -107,7 +107,7 @@ mod tests {
         let (mut a, mut b) = MockSocket::pair(MAC_A, MAC_B);
         let mut padded = PaddedSocket::new(a, 1024);
 
-        // 500-byte Reticulum packet + 1-byte type tag = 501 bytes payload.
+        // 500-byte data packet + 1-byte type tag = 501 bytes payload.
         // + 14 ETH header = 515 bytes → pad to 1024.
         let payload = vec![0xAB; 501];
         padded.send_frame(MAC_B, &payload).unwrap();

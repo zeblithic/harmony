@@ -24,8 +24,6 @@ pub const HARMONY_ETHERTYPE: u16 = 0x88B5;
 
 /// Frame type discriminator (first byte after EtherType).
 pub mod frame_type {
-    /// Raw Reticulum packet (harmony-os, harmony-kuw).
-    pub const RETICULUM: u8 = 0x00;
     /// L2 scouting — broadcast presence announcement.
     pub const SCOUT: u8 = 0x01;
     /// Zenoh data — carries key expression + payload.
