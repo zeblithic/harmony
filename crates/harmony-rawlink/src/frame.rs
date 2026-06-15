@@ -1,4 +1,4 @@
-//! Scout, Data, and Reticulum frame encoding/decoding for the Harmony L2 protocol.
+//! Scout and Data frame encoding/decoding for the Harmony L2 protocol.
 //!
 //! All frames share the layout:
 //! `[6 dst_mac][6 src_mac][2 EtherType=0x88B5][1 frame_type][payload...]`

@@ -97,8 +97,6 @@ pub struct BridgeConfig {
     pub scout_interval: Duration,
     /// Time-to-live for peer table entries.
     pub peer_ttl: Duration,
-    /// Channel to forward inbound Reticulum packets to (frame_type 0x00).
-    pub reticulum_inbound_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl Default for BridgeConfig {
@@ -108,7 +106,6 @@ impl Default for BridgeConfig {
             subscribe_pattern: "harmony/**".to_string(),
             scout_interval: std::time::Duration::from_secs(5),
             peer_ttl: std::time::Duration::from_secs(30),
-            reticulum_inbound_tx: None,
         }
     }
 }
@@ -120,7 +117,6 @@ pub struct Bridge<S: RawSocket> {
     config: BridgeConfig,
     peer_table: PeerTable,
     blacklist: MacBlacklist,
-    reticulum_outbound_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 }
 
 impl<S: RawSocket> Bridge<S> {
@@ -128,15 +124,7 @@ impl<S: RawSocket> Bridge<S> {
     ///
     /// The zenoh session must already be open. The bridge does **not** own the
     /// session lifetime — callers keep a handle for other uses.
-    ///
-    /// `reticulum_outbound_rx` is an optional channel receiver for outbound
-    /// Reticulum packets that the bridge will broadcast as L2 frames.
-    pub fn new(
-        socket: S,
-        session: zenoh::Session,
-        config: BridgeConfig,
-        reticulum_outbound_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
-    ) -> Self {
+    pub fn new(socket: S, session: zenoh::Session, config: BridgeConfig) -> Self {
         let peer_table = PeerTable::new(config.peer_ttl);
         let blacklist = MacBlacklist::new(BlacklistConfig::default());
         Self {
@@ -145,7 +133,6 @@ impl<S: RawSocket> Bridge<S> {
             config,
             peer_table,
             blacklist,
-            reticulum_outbound_rx,
         }
     }
 
@@ -231,22 +218,6 @@ impl<S: RawSocket> Bridge<S> {
                     }
                 }
 
-                // 7. Drain outbound Reticulum packets → push into batch accumulator.
-                if let Some(ref mut rx) = self.reticulum_outbound_rx {
-                    while let Ok(packet) = rx.try_recv() {
-                        if packet.len() > u16::MAX as usize {
-                            warn!(
-                                len = packet.len(),
-                                "reticulum packet exceeds u16 max, dropping"
-                            );
-                            continue;
-                        }
-                        if let Some(flushed) = batch.push(frame_type::RETICULUM, &packet) {
-                            self.socket.send_frame(BROADCAST_MAC, &flushed)?;
-                        }
-                    }
-                }
-
                 Ok(())
             }
             .await;
@@ -315,7 +286,6 @@ impl<S: RawSocket> Bridge<S> {
             ..
         } = self;
         let allowed_prefix = &config.subscribe_pattern;
-        let reticulum_tx = &config.reticulum_inbound_tx;
 
         // Pending violations collected during recv_frames; applied afterwards
         // to avoid two mutable borrows of `blacklist` through simultaneous closures.
@@ -330,14 +300,6 @@ impl<S: RawSocket> Bridge<S> {
              body: &[u8],
              violations: &mut Vec<([u8; 6], ViolationCategory)>| {
                 match frame_type_byte {
-                    frame_type::RETICULUM => {
-                        if !body.is_empty() {
-                            if let Some(ref reticulum_tx) = reticulum_tx {
-                                let packet = body.to_vec();
-                                let _ = reticulum_tx.try_send(packet);
-                            }
-                        }
-                    }
                     frame_type::SCOUT => {
                         if body.len() < 16 {
                             debug!(len = body.len(), "scout frame too short, ignoring");
@@ -627,7 +589,6 @@ mod tests {
             subscribe_pattern: "harmony/**".into(),
             scout_interval: Duration::from_secs(5),
             peer_ttl: Duration::from_secs(30),
-            reticulum_inbound_tx: None,
         };
 
         // We can't create a real zenoh::Session in a unit test without a
@@ -726,51 +687,17 @@ mod tests {
     }
 
     #[test]
-    fn reticulum_frame_routed_to_channel() {
-        let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        let reticulum_packet = vec![0xAA; 100];
-        let mut frame_payload = vec![frame_type::RETICULUM];
-        frame_payload.extend_from_slice(&reticulum_packet);
-        socket_b
-            .send_frame(MAC_A, &frame_payload)
-            .expect("mock send");
-
-        socket_a
-            .recv_frames(&mut |_src_mac, payload| {
-                if !payload.is_empty() && payload[0] == frame_type::RETICULUM && payload.len() > 1 {
-                    let _ = tx.send(payload[1..].to_vec());
-                }
-            })
-            .expect("recv");
-
-        let received = rx.try_recv().expect("should receive packet");
-        assert_eq!(received, reticulum_packet);
-    }
-
-    #[test]
-    fn reticulum_outbound_encoding() {
-        let packet = vec![0xBB; 200];
-        let mut frame_payload = Vec::with_capacity(1 + packet.len());
-        frame_payload.push(frame_type::RETICULUM);
-        frame_payload.extend_from_slice(&packet);
-        assert_eq!(frame_payload[0], 0x00);
-        assert_eq!(&frame_payload[1..], &packet[..]);
-    }
-
-    #[test]
     fn interleaved_frame_types_routed_correctly() {
         let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
-        let (ret_tx, ret_rx) = std::sync::mpsc::channel();
+        let (data_tx, data_rx) = std::sync::mpsc::channel();
 
         let scout = make_scout_payload(&IDENTITY);
-        let mut ret_frame = vec![frame_type::RETICULUM];
-        ret_frame.extend_from_slice(&[0xCC; 50]);
+        let mut data_frame = vec![frame_type::DATA];
+        data_frame.extend_from_slice(&[0xCC; 50]);
         let unknown = vec![0xFF, 0x01, 0x02];
 
         socket_b.send_frame(MAC_A, &scout).unwrap();
-        socket_b.send_frame(MAC_A, &ret_frame).unwrap();
+        socket_b.send_frame(MAC_A, &data_frame).unwrap();
         socket_b.send_frame(MAC_A, &unknown).unwrap();
 
         let mut peer_table = PeerTable::new(Duration::from_secs(30));
@@ -787,8 +714,8 @@ mod tests {
                         hash.copy_from_slice(&payload[1..17]);
                         peer_table.update(hash, *src_mac);
                     }
-                    frame_type::RETICULUM if payload.len() > 1 => {
-                        let _ = ret_tx.send(payload[1..].to_vec());
+                    frame_type::DATA if payload.len() > 1 => {
+                        let _ = data_tx.send(payload[1..].to_vec());
                     }
                     _ => {
                         unknown_count += 1;
@@ -798,7 +725,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(peer_table.peer_count(), 1);
-        assert!(ret_rx.try_recv().is_ok());
+        assert!(data_rx.try_recv().is_ok());
         assert_eq!(unknown_count, 1);
     }
 
@@ -807,12 +734,12 @@ mod tests {
         use crate::batch::BatchAccumulator;
 
         let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
-        let (ret_tx, ret_rx) = std::sync::mpsc::channel();
+        let (data_tx, data_rx) = std::sync::mpsc::channel();
 
-        // Build a batch containing a Reticulum packet and a Scout.
+        // Build a batch containing a Data sub-frame and a Scout.
         let mut acc = BatchAccumulator::new(1500);
-        let ret_packet = vec![0xDD; 80];
-        acc.push(frame_type::RETICULUM, &ret_packet);
+        let data_packet = vec![0xDD; 80];
+        acc.push(frame_type::DATA, &data_packet);
 
         let mut scout_body = vec![0u8; 16];
         scout_body.copy_from_slice(&IDENTITY);
@@ -832,8 +759,8 @@ mod tests {
                 if payload[0] == frame_type::BATCH {
                     for (sub_type, sub_payload) in crate::batch::decode_batch(payload) {
                         match sub_type {
-                            frame_type::RETICULUM if !sub_payload.is_empty() => {
-                                let _ = ret_tx.send(sub_payload.to_vec());
+                            frame_type::DATA if !sub_payload.is_empty() => {
+                                let _ = data_tx.send(sub_payload.to_vec());
                             }
                             frame_type::SCOUT if sub_payload.len() >= 16 => {
                                 let mut hash = [0u8; 16];
@@ -847,8 +774,8 @@ mod tests {
             })
             .expect("recv");
 
-        let received_ret = ret_rx.try_recv().expect("should receive Reticulum packet");
-        assert_eq!(received_ret, ret_packet);
+        let received_data = data_rx.try_recv().expect("should receive Data sub-frame");
+        assert_eq!(received_data, data_packet);
         assert_eq!(peer_table.peer_count(), 1);
         assert_eq!(peer_table.lookup(&IDENTITY), Some(MAC_B));
     }
@@ -859,18 +786,18 @@ mod tests {
 
         let (mut socket_a, mut socket_b) = MockSocket::pair(MAC_A, MAC_B);
 
-        // Send a standalone Reticulum frame.
+        // Send a standalone Data frame.
         let standalone_packet = vec![0x11; 30];
-        let mut standalone_payload = vec![frame_type::RETICULUM];
+        let mut standalone_payload = vec![frame_type::DATA];
         standalone_payload.extend_from_slice(&standalone_packet);
         socket_b
             .send_frame(MAC_A, &standalone_payload)
             .expect("mock send");
 
-        // Send a batch containing another Reticulum frame.
+        // Send a batch containing another Data frame.
         let mut acc = BatchAccumulator::new(1500);
         let batch_packet = vec![0x22; 40];
-        acc.push(frame_type::RETICULUM, &batch_packet);
+        acc.push(frame_type::DATA, &batch_packet);
         let batch = acc.flush().unwrap();
         socket_b.send_frame(MAC_A, &batch).expect("mock send");
 
@@ -884,11 +811,11 @@ mod tests {
                 }
                 if payload[0] == frame_type::BATCH {
                     for (sub_type, sub_payload) in crate::batch::decode_batch(payload) {
-                        if sub_type == frame_type::RETICULUM {
+                        if sub_type == frame_type::DATA {
                             received.push(sub_payload.to_vec());
                         }
                     }
-                } else if payload[0] == frame_type::RETICULUM && payload.len() > 1 {
+                } else if payload[0] == frame_type::DATA && payload.len() > 1 {
                     received.push(payload[1..].to_vec());
                 }
             })

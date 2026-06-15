@@ -5,8 +5,6 @@ use alloc::vec::Vec;
 pub enum TunnelEvent {
     /// Raw bytes received from the transport (iroh-net connection).
     InboundBytes { data: Vec<u8>, now_ms: u64 },
-    /// Send a Reticulum packet through this tunnel.
-    SendReticulum { packet: Vec<u8>, now_ms: u64 },
     /// Send a Zenoh message through this tunnel.
     SendZenoh { message: Vec<u8>, now_ms: u64 },
     /// Send a replication message through this tunnel.
@@ -24,8 +22,6 @@ pub enum TunnelEvent {
 pub enum TunnelAction {
     /// Encrypted bytes to write to the transport.
     OutboundBytes { data: Vec<u8> },
-    /// A decrypted Reticulum packet received from the tunnel peer.
-    ReticulumReceived { packet: Vec<u8> },
     /// A decrypted Zenoh message received from the tunnel peer.
     ZenohReceived { message: Vec<u8> },
     /// A decrypted replication message received from the tunnel peer.

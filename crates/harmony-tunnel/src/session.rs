@@ -195,9 +195,6 @@ impl TunnelSession {
                 self.last_received_ms = now_ms;
                 self.handle_inbound(data)
             }
-            TunnelEvent::SendReticulum { packet, now_ms } => {
-                self.handle_send(FrameTag::Reticulum, packet, now_ms)
-            }
             TunnelEvent::SendZenoh { message, now_ms } => {
                 self.handle_send(FrameTag::Zenoh, message, now_ms)
             }
@@ -269,9 +266,6 @@ impl TunnelSession {
 
         match frame.tag {
             FrameTag::Keepalive => Ok(Vec::new()),
-            FrameTag::Reticulum => Ok(vec![TunnelAction::ReticulumReceived {
-                packet: frame.payload,
-            }]),
             FrameTag::Zenoh => Ok(vec![TunnelAction::ZenohReceived {
                 message: frame.payload,
             }]),
@@ -498,10 +492,10 @@ mod tests {
                     })
                     .unwrap();
 
-                // Initiator sends Reticulum packet to responder
+                // Initiator sends Zenoh message to responder
                 let actions = initiator
-                    .handle_event(TunnelEvent::SendReticulum {
-                        packet: b"hello-reticulum".to_vec(),
+                    .handle_event(TunnelEvent::SendZenoh {
+                        message: b"hello-from-initiator".to_vec(),
                         now_ms: 0,
                     })
                     .unwrap();
@@ -520,7 +514,7 @@ mod tests {
 
                 assert!(matches!(
                     &actions[0],
-                    TunnelAction::ReticulumReceived { packet } if packet == b"hello-reticulum"
+                    TunnelAction::ZenohReceived { message } if message == b"hello-from-initiator"
                 ));
 
                 // Responder sends Zenoh message back to initiator
@@ -672,13 +666,13 @@ mod tests {
                         .unwrap();
 
                 // State is Initiating — sending data must fail
-                let result = initiator.handle_event(TunnelEvent::SendReticulum {
-                    packet: b"early".to_vec(),
+                let result = initiator.handle_event(TunnelEvent::SendZenoh {
+                    message: b"early".to_vec(),
                     now_ms: 0,
                 });
                 assert!(
                     result.is_err(),
-                    "SendReticulum before handshake must return error"
+                    "SendZenoh before handshake must return error"
                 );
                 assert_eq!(initiator.state(), TunnelState::Initiating);
             })
@@ -795,8 +789,8 @@ mod tests {
 
                 // Responder sends a packet
                 let send_actions = responder
-                    .handle_event(TunnelEvent::SendReticulum {
-                        packet: b"ping".to_vec(),
+                    .handle_event(TunnelEvent::SendZenoh {
+                        message: b"ping".to_vec(),
                         now_ms: 0,
                     })
                     .unwrap();
