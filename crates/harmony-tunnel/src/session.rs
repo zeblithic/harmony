@@ -892,12 +892,19 @@ mod tests {
                         .unwrap();
 
                 // State is Initiating — sending a DM must fail like the other sends.
+                // Session was created at now_ms=0, so last_sent_ms starts at 0.
                 let result = initiator.handle_event(TunnelEvent::SendDm {
                     payload: b"early".to_vec(),
-                    now_ms: 0,
+                    now_ms: 5_000,
                 });
                 assert!(result.is_err(), "SendDm before handshake must error");
                 assert_eq!(initiator.state(), TunnelState::Initiating);
+                // ZEB-472 Qodo Bug 2 regression: a send rejected before the
+                // handshake must NOT advance the keepalive clock.
+                assert_eq!(
+                    initiator.last_sent_ms, 0,
+                    "a send rejected before handshake must not advance last_sent_ms"
+                );
             })
             .expect("spawn")
             .join()
