@@ -70,18 +70,14 @@ impl PeerManager {
 
                         // Check whether the contact has a Tunnel address — if so, prefer it.
                         let tunnel_action = contacts.get(&identity_hash).and_then(|contact| {
-                            contact.addresses.iter().find_map(|addr| {
-                                if let ContactAddress::Tunnel {
+                            contact.addresses.first().map(|addr| {
+                                let ContactAddress::Tunnel {
                                     node_id, relay_url, ..
-                                } = addr
-                                {
-                                    Some(PeerAction::InitiateTunnel {
-                                        identity_hash,
-                                        node_id: *node_id,
-                                        relay_url: relay_url.clone(),
-                                    })
-                                } else {
-                                    None
+                                } = addr;
+                                PeerAction::InitiateTunnel {
+                                    identity_hash,
+                                    node_id: *node_id,
+                                    relay_url: relay_url.clone(),
                                 }
                             })
                         });
@@ -106,21 +102,17 @@ impl PeerManager {
                                 .get(&identity_hash)
                                 .and_then(|c| {
                                     c.addresses.iter().find_map(|addr| {
-                                        if let ContactAddress::Tunnel {
+                                        let ContactAddress::Tunnel {
                                             node_id: addr_node_id,
                                             relay_url,
                                             ..
-                                        } = addr
-                                        {
-                                            if *addr_node_id == node_id {
-                                                // TODO: This infers relayed from the stored
-                                                // config, not the actual connection path. Once
-                                                // TunnelBridgeEvent carries the real relay status
-                                                // from iroh-net, pass it through TunnelEstablished.
-                                                Some(relay_url.is_some())
-                                            } else {
-                                                None
-                                            }
+                                        } = addr;
+                                        if *addr_node_id == node_id {
+                                            // TODO: This infers relayed from the stored
+                                            // config, not the actual connection path. Once
+                                            // TunnelBridgeEvent carries the real relay status
+                                            // from iroh-net, pass it through TunnelEstablished.
+                                            Some(relay_url.is_some())
                                         } else {
                                             None
                                         }

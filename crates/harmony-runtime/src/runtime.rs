@@ -4,7 +4,6 @@
 // wired. Per-item #[allow(dead_code)] is applied below rather than crate-wide.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 
 use harmony_compute::InstructionBudget;
 use harmony_contacts::ContactStore;
@@ -1365,15 +1364,11 @@ impl<B: BookStore> NodeRuntime<B> {
 
         // Find the first tunnel address on the contact.
         let tunnel_addr = match self.contact_store.get(&identity_hash) {
-            Some(contact) => contact.addresses.iter().find_map(|addr| {
-                if let ContactAddress::Tunnel {
+            Some(contact) => contact.addresses.first().map(|addr| {
+                let ContactAddress::Tunnel {
                     node_id, relay_url, ..
-                } = addr
-                {
-                    Some((*node_id, relay_url.clone()))
-                } else {
-                    None
-                }
+                } = addr;
+                (*node_id, relay_url.clone())
             }),
             None => return,
         };
