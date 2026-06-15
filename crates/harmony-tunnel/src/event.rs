@@ -11,6 +11,8 @@ pub enum TunnelEvent {
     SendZenoh { message: Vec<u8>, now_ms: u64 },
     /// Send a replication message through this tunnel.
     SendReplication { message: Vec<u8>, now_ms: u64 },
+    /// ZEB-472: send an opaque (already sealed+signed) 1:1 DM body through this tunnel.
+    SendDm { payload: Vec<u8>, now_ms: u64 },
     /// Periodic timer tick for keepalive management.
     Tick { now_ms: u64 },
     /// Request graceful tunnel shutdown.
@@ -28,6 +30,9 @@ pub enum TunnelAction {
     ZenohReceived { message: Vec<u8> },
     /// A decrypted replication message received from the tunnel peer.
     ReplicationReceived { message: Vec<u8> },
+    /// ZEB-472: a decrypted opaque DM body received from the tunnel peer (the
+    /// caller verifies/unseals it).
+    DmReceived { payload: Vec<u8> },
     /// Handshake completed — the peer's PQ identity has been authenticated.
     HandshakeComplete {
         peer_dsa_pubkey: Vec<u8>,

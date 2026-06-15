@@ -12,6 +12,9 @@ pub enum FrameTag {
     Reticulum = 0x01,
     Zenoh = 0x02,
     Replication = 0x03,
+    /// ZEB-472: opaque 1:1 DM body (already sealed+signed by the caller) carried
+    /// over the PQ tunnel. Additive — existing tags keep their wire bytes.
+    Dm = 0x04,
 }
 
 impl FrameTag {
@@ -21,6 +24,7 @@ impl FrameTag {
             0x01 => Ok(Self::Reticulum),
             0x02 => Ok(Self::Zenoh),
             0x03 => Ok(Self::Replication),
+            0x04 => Ok(Self::Dm),
             other => Err(TunnelError::UnknownFrameTag { tag: other }),
         }
     }
@@ -194,5 +198,27 @@ mod tests {
         let mut dec_counter: u64 = 0;
         let result = decrypt_frame(&encrypted, &key, &wrong_aad, &mut dec_counter);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn dm_frame_roundtrip() {
+        // ZEB-472: a DM rides as an opaque (sealed+signed) body under FrameTag::Dm.
+        let frame = Frame {
+            tag: FrameTag::Dm,
+            payload: b"sealed dm packet".to_vec(),
+        };
+        let bytes = frame.encode();
+        assert_eq!(bytes[0], 0x04); // Dm tag byte
+        let decoded = Frame::decode(&bytes).unwrap();
+        assert_eq!(decoded.tag, FrameTag::Dm);
+        assert_eq!(decoded.payload, b"sealed dm packet");
+    }
+
+    #[test]
+    fn from_byte_maps_dm_and_still_rejects_unknown() {
+        assert_eq!(FrameTag::from_byte(0x04).unwrap(), FrameTag::Dm);
+        // The set stays closed — tags beyond the known ones are still rejected.
+        assert!(FrameTag::from_byte(0x05).is_err());
+        assert!(FrameTag::from_byte(0xFF).is_err());
     }
 }

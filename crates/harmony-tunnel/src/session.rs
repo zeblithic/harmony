@@ -196,16 +196,16 @@ impl TunnelSession {
                 self.handle_inbound(data)
             }
             TunnelEvent::SendReticulum { packet, now_ms } => {
-                self.last_sent_ms = now_ms;
-                self.handle_send(FrameTag::Reticulum, packet)
+                self.handle_send(FrameTag::Reticulum, packet, now_ms)
             }
             TunnelEvent::SendZenoh { message, now_ms } => {
-                self.last_sent_ms = now_ms;
-                self.handle_send(FrameTag::Zenoh, message)
+                self.handle_send(FrameTag::Zenoh, message, now_ms)
             }
             TunnelEvent::SendReplication { message, now_ms } => {
-                self.last_sent_ms = now_ms;
-                self.handle_send(FrameTag::Replication, message)
+                self.handle_send(FrameTag::Replication, message, now_ms)
+            }
+            TunnelEvent::SendDm { payload, now_ms } => {
+                self.handle_send(FrameTag::Dm, payload, now_ms)
             }
             TunnelEvent::Tick { now_ms } => self.handle_tick(now_ms),
             TunnelEvent::Close => self.handle_close(),
@@ -278,6 +278,9 @@ impl TunnelSession {
             FrameTag::Replication => Ok(vec![TunnelAction::ReplicationReceived {
                 message: frame.payload,
             }]),
+            FrameTag::Dm => Ok(vec![TunnelAction::DmReceived {
+                payload: frame.payload,
+            }]),
         }
     }
 
@@ -285,10 +288,19 @@ impl TunnelSession {
         &mut self,
         tag: FrameTag,
         payload: Vec<u8>,
+        now_ms: u64,
     ) -> Result<Vec<TunnelAction>, TunnelError> {
         if self.state != TunnelState::Active {
             return Err(TunnelError::InvalidState);
         }
+
+        // ZEB-472 (Qodo Bug 2): advance `last_sent_ms` only AFTER the
+        // Active-state gate, so a rejected pre-handshake send doesn't push out
+        // the keepalive timer (handle_tick keys keepalives off last_sent_ms).
+        // Previously each send arm in handle_event set last_sent_ms before
+        // calling handle_send, advancing it even when this returned
+        // InvalidState. Applies to every send variant, not just Dm.
+        self.last_sent_ms = now_ms;
 
         let frame = Frame { tag, payload };
         let encrypted = encrypt_frame(
@@ -559,7 +571,7 @@ mod tests {
             _ => panic!("expected OutboundBytes"),
         };
 
-        let (mut responder, accept_actions) =
+        let (responder, accept_actions) =
             TunnelSession::new_responder(&mut OsRng, &responder_id, &init_bytes, 0).unwrap();
 
         let accept_bytes = accept_actions
@@ -824,6 +836,74 @@ mod tests {
                 assert!(
                     actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
                     "must timeout at 160001ms"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    // ── ZEB-472: DM frame over the PQ tunnel ─────────────────────────────────
+
+    #[test]
+    fn paired_machines_exchange_dm() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut initiator, mut responder, _iid, _rid) = complete_handshake();
+
+                // Initiator sends an opaque (sealed+signed) DM body to responder.
+                let actions = initiator
+                    .handle_event(TunnelEvent::SendDm {
+                        payload: b"sealed-dm-body".to_vec(),
+                        now_ms: 0,
+                    })
+                    .unwrap();
+                let encrypted = match &actions[0] {
+                    TunnelAction::OutboundBytes { data } => data.clone(),
+                    _ => panic!("expected OutboundBytes"),
+                };
+
+                let actions = responder
+                    .handle_event(TunnelEvent::InboundBytes {
+                        data: encrypted,
+                        now_ms: 0,
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    &actions[0],
+                    TunnelAction::DmReceived { payload } if payload == b"sealed-dm-body"
+                ));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn send_dm_before_handshake_fails() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (initiator_id, responder_id) = create_test_identities();
+                let responder_pub = responder_id.public_identity();
+                let (mut initiator, _) =
+                    TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub, 0)
+                        .unwrap();
+
+                // State is Initiating — sending a DM must fail like the other sends.
+                // Session was created at now_ms=0, so last_sent_ms starts at 0.
+                let result = initiator.handle_event(TunnelEvent::SendDm {
+                    payload: b"early".to_vec(),
+                    now_ms: 5_000,
+                });
+                assert!(result.is_err(), "SendDm before handshake must error");
+                assert_eq!(initiator.state(), TunnelState::Initiating);
+                // ZEB-472 Qodo Bug 2 regression: a send rejected before the
+                // handshake must NOT advance the keepalive clock.
+                assert_eq!(
+                    initiator.last_sent_ms, 0,
+                    "a send rejected before handshake must not advance last_sent_ms"
                 );
             })
             .expect("spawn")
