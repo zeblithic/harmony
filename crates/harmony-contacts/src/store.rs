@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::contact::{Contact, ContactAddress, PeeringPriority};
 use crate::error::ContactError;
 
-const FORMAT_VERSION: u8 = 3;
+const FORMAT_VERSION: u8 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactStore {
@@ -106,7 +106,7 @@ impl ContactStore {
         // CLI args or discovery on each startup.
         if data[0] != FORMAT_VERSION {
             return Err(ContactError::DeserializeError(
-                "unsupported contact store format version (expected v3)",
+                "unsupported contact store format version (expected v4)",
             ));
         }
         postcard::from_bytes(&data[1..])
@@ -282,16 +282,5 @@ mod tests {
         assert!(store.find_by_tunnel_node_id(&other_node_id).is_none());
     }
 
-    #[test]
-    fn find_by_tunnel_node_id_skips_reticulum_addresses() {
-        use crate::contact::ContactAddress;
-        let node_id = [0x11u8; 32];
-        let mut store = ContactStore::new();
-        let mut contact = make_contact(0xCC, true, PeeringPriority::Normal);
-        contact.addresses.push(ContactAddress::Reticulum {
-            destination_hash: [0x11; 16],
-        });
-        store.add(contact).unwrap();
-        assert!(store.find_by_tunnel_node_id(&node_id).is_none());
-    }
 }
+
