@@ -207,6 +207,10 @@ impl TunnelSession {
                 self.last_sent_ms = now_ms;
                 self.handle_send(FrameTag::Replication, message)
             }
+            TunnelEvent::SendDm { payload, now_ms } => {
+                self.last_sent_ms = now_ms;
+                self.handle_send(FrameTag::Dm, payload)
+            }
             TunnelEvent::Tick { now_ms } => self.handle_tick(now_ms),
             TunnelEvent::Close => self.handle_close(),
         }
@@ -277,6 +281,9 @@ impl TunnelSession {
             }]),
             FrameTag::Replication => Ok(vec![TunnelAction::ReplicationReceived {
                 message: frame.payload,
+            }]),
+            FrameTag::Dm => Ok(vec![TunnelAction::DmReceived {
+                payload: frame.payload,
             }]),
         }
     }
@@ -559,7 +566,7 @@ mod tests {
             _ => panic!("expected OutboundBytes"),
         };
 
-        let (mut responder, accept_actions) =
+        let (responder, accept_actions) =
             TunnelSession::new_responder(&mut OsRng, &responder_id, &init_bytes, 0).unwrap();
 
         let accept_bytes = accept_actions
@@ -825,6 +832,67 @@ mod tests {
                     actions.iter().any(|a| matches!(a, TunnelAction::Closed)),
                     "must timeout at 160001ms"
                 );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    // ── ZEB-472: DM frame over the PQ tunnel ─────────────────────────────────
+
+    #[test]
+    fn paired_machines_exchange_dm() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut initiator, mut responder, _iid, _rid) = complete_handshake();
+
+                // Initiator sends an opaque (sealed+signed) DM body to responder.
+                let actions = initiator
+                    .handle_event(TunnelEvent::SendDm {
+                        payload: b"sealed-dm-body".to_vec(),
+                        now_ms: 0,
+                    })
+                    .unwrap();
+                let encrypted = match &actions[0] {
+                    TunnelAction::OutboundBytes { data } => data.clone(),
+                    _ => panic!("expected OutboundBytes"),
+                };
+
+                let actions = responder
+                    .handle_event(TunnelEvent::InboundBytes {
+                        data: encrypted,
+                        now_ms: 0,
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    &actions[0],
+                    TunnelAction::DmReceived { payload } if payload == b"sealed-dm-body"
+                ));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn send_dm_before_handshake_fails() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (initiator_id, responder_id) = create_test_identities();
+                let responder_pub = responder_id.public_identity();
+                let (mut initiator, _) =
+                    TunnelSession::new_initiator(&mut OsRng, &initiator_id, responder_pub, 0)
+                        .unwrap();
+
+                // State is Initiating — sending a DM must fail like the other sends.
+                let result = initiator.handle_event(TunnelEvent::SendDm {
+                    payload: b"early".to_vec(),
+                    now_ms: 0,
+                });
+                assert!(result.is_err(), "SendDm before handshake must error");
+                assert_eq!(initiator.state(), TunnelState::Initiating);
             })
             .expect("spawn")
             .join()
