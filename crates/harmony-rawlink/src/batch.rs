@@ -1,6 +1,6 @@
 //! Batch frame encoding and decoding for the Harmony L2 protocol.
 //!
-//! Packs multiple Data/Data sub-frames into a single Ethernet broadcast
+//! Packs multiple sub-frames (Scout, Data, etc.) into a single Ethernet broadcast
 //! to reduce PHY preamble overhead on WiFi mesh (where broadcast frames cannot
 //! use A-MSDU/A-MPDU aggregation).
 //!

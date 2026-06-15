@@ -731,8 +731,8 @@ pub async fn run(
     timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     // ── Reusable UDP receive buffer ───────────────────────────────────────────
-    // Max UDP datagram size — Reticulum MTU is 500 (default) or 1024 (medium
-    // interfaces). Use 65535 to never silently truncate.
+    // Max UDP datagram size — use 65535 to never silently truncate an inbound
+    // datagram (the mDNS/discovery traffic on this socket is far smaller).
     let mut udp_buf = vec![0u8; 65535];
 
     // ── Monotonic query-id counter ────────────────────────────────────────────
@@ -1319,8 +1319,8 @@ pub async fn run(
         // Only tick on timer — counters (tick_count, ticks_since_filter_broadcast,
         // peer filter eviction) must advance at wall-clock rate, not event rate.
         // Events queue up between ticks (max ~250ms). At worst case 1 Gbps with
-        // 500-byte Reticulum frames, ~62K events queue per tick (~31 MB) — bounded
-        // by the timer interval and acceptable for 1-2 GB RAM routers.
+        // small (~500-byte) datagrams, ~62K events queue per tick (~31 MB) —
+        // bounded by the timer interval and acceptable for 1-2 GB RAM nodes.
         // A drain-without-counter-increment API would allow bounded queues under
         // flood conditions, but requires changing NodeRuntime's interface — deferred.
         if should_tick {
@@ -1970,8 +1970,8 @@ async fn dispatch_action(
         }
 
         // ── Peer lifecycle: Path request ──────────────────────────────────────
-        // Stub — announce probing will be wired when path request packets are
-        // implemented in the Reticulum router.
+        // Stub — announce probing is not wired on the surviving transports
+        // (tunnel/zenoh); kept as a no-op so the action stays exhaustively matched.
         RuntimeAction::SendPathRequest { identity_hash } => {
             tracing::debug!(
                 identity = %hex::encode(identity_hash),

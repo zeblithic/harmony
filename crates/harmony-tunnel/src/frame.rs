@@ -215,6 +215,9 @@ mod tests {
     #[test]
     fn from_byte_maps_dm_and_still_rejects_unknown() {
         assert_eq!(FrameTag::from_byte(0x04).unwrap(), FrameTag::Dm);
+        // Retired wire tag 0x01 (former FrameTag::Reticulum) must stay invalid
+        // after the ZEB-475 teardown — its byte is never re-mapped.
+        assert!(FrameTag::from_byte(0x01).is_err());
         // The set stays closed — tags beyond the known ones are still rejected.
         assert!(FrameTag::from_byte(0x05).is_err());
         assert!(FrameTag::from_byte(0xFF).is_err());

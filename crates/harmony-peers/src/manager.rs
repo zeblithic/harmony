@@ -156,8 +156,6 @@ impl PeerManager {
                     &mut self.peers,
                     identity_hash,
                     &[PeerStatus::Connecting],
-                    contacts,
-                    &mut actions,
                 );
             }
             PeerEvent::TunnelDropped { identity_hash } => {
@@ -165,8 +163,6 @@ impl PeerManager {
                     &mut self.peers,
                     identity_hash,
                     &[PeerStatus::Connected, PeerStatus::Connecting],
-                    contacts,
-                    &mut actions,
                 );
             }
             PeerEvent::LinkEstablished { identity_hash, now } => {
@@ -222,8 +218,6 @@ impl PeerManager {
         peers: &mut HashMap<IdentityHash, PeerState>,
         identity_hash: IdentityHash,
         valid_states: &[PeerStatus],
-        _contacts: &ContactStore,
-        _actions: &mut Vec<PeerAction>,
     ) {
         if let Some(peer) = peers.get_mut(&identity_hash) {
             if valid_states.contains(&peer.status) {
