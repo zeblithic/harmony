@@ -85,8 +85,8 @@ mod tests {
             2000,
             [0x01; 16],
         );
-        builder.add_routing_hint(RoutingHint::Reticulum {
-            destination_hash: [0xCC; 16],
+        builder.add_routing_hint(RoutingHint::Zenoh {
+            locator: alloc::string::String::from("tcp/127.0.0.1:7447"),
         });
 
         let payload = builder.signable_payload();
@@ -171,8 +171,8 @@ mod tests {
             2000,
             [0x01; 16],
         );
-        builder.add_routing_hint(RoutingHint::Reticulum {
-            destination_hash: [0xCC; 16],
+        builder.add_routing_hint(RoutingHint::Zenoh {
+            locator: alloc::string::String::from("tcp/127.0.0.1:7447"),
         });
         let payload = builder.signable_payload();
         let record = builder.build(private.sign(&payload).to_vec());
@@ -200,8 +200,8 @@ mod tests {
                     2000,
                     [0x05; 16],
                 );
-                builder.add_routing_hint(RoutingHint::Reticulum {
-                    destination_hash: [0xDD; 16],
+                builder.add_routing_hint(RoutingHint::Zenoh {
+                    locator: alloc::string::String::from("tcp/127.0.0.1:7447"),
                 });
 
                 let payload = builder.signable_payload();

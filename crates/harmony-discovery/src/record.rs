@@ -23,8 +23,6 @@ struct SignablePayload {
 /// A routing hint that tells peers how to reach this identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoutingHint {
-    /// Reticulum destination hash (16 bytes).
-    Reticulum { destination_hash: [u8; 16] },
     /// Zenoh locator (e.g. `"tcp/192.168.1.1:7447"`).
     Zenoh { locator: alloc::string::String },
     /// iroh-net tunnel: NodeId + optional relay + optional direct addresses.
@@ -228,8 +226,8 @@ mod tests {
 
     #[test]
     fn builder_produces_correct_fields() {
-        let hint = RoutingHint::Reticulum {
-            destination_hash: [0xDE; 16],
+        let hint = RoutingHint::Zenoh {
+            locator: alloc::string::String::from("tcp/127.0.0.1:7447"),
         };
         let mut builder = AnnounceBuilder::new(
             test_identity(),
@@ -302,8 +300,10 @@ mod tests {
             2000,
             [0x01; 16],
         );
-        builder.add_routing_hint(RoutingHint::Reticulum {
-            destination_hash: [0xAA; 16],
+        builder.add_routing_hint(RoutingHint::Tunnel {
+            node_id: [0xAA; 32],
+            relay_url: None,
+            direct_addrs: alloc::vec![],
         });
         builder.add_routing_hint(RoutingHint::Zenoh {
             locator: alloc::string::String::from("tcp/127.0.0.1:7447"),
@@ -322,8 +322,8 @@ mod tests {
             2000,
             [0x01; 16],
         );
-        builder.add_routing_hint(RoutingHint::Reticulum {
-            destination_hash: [0xBB; 16],
+        builder.add_routing_hint(RoutingHint::Zenoh {
+            locator: alloc::string::String::from("tcp/10.0.0.1:7447"),
         });
         let record = builder.build(alloc::vec![0xDE, 0xAD]);
 

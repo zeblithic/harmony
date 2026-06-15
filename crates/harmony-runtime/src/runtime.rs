@@ -7084,8 +7084,8 @@ mod tests {
             },
             public_key: vec![0u8; 32],
             encryption_key: vec![],
-            routing_hints: vec![harmony_discovery::RoutingHint::Reticulum {
-                destination_hash: [0xAA; 16],
+            routing_hints: vec![harmony_discovery::RoutingHint::Zenoh {
+                locator: "tcp/127.0.0.1:7447".to_string(),
             }],
             published_at: 1000,
             expires_at: 2000,

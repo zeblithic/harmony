@@ -302,8 +302,8 @@ mod tests {
             expires_at,
             [0x01; 16],
         );
-        builder.add_routing_hint(RoutingHint::Reticulum {
-            destination_hash: [0xCC; 16],
+        builder.add_routing_hint(RoutingHint::Zenoh {
+            locator: alloc::string::String::from("tcp/127.0.0.1:7447"),
         });
         let payload = builder.signable_payload();
         let signature = private.sign(&payload);
@@ -732,8 +732,8 @@ mod tests {
         // Set local_record with a fresher version
         let mut builder2 =
             AnnounceBuilder::new(identity_ref, pk.clone(), ek.clone(), 2000, 6000, [0x02; 16]);
-        builder2.add_routing_hint(RoutingHint::Reticulum {
-            destination_hash: [0xDD; 16],
+        builder2.add_routing_hint(RoutingHint::Zenoh {
+            locator: alloc::string::String::from("tcp/10.0.0.1:7447"),
         });
         let payload2 = builder2.signable_payload();
         let record2 = builder2.build(private.sign(&payload2).to_vec());
@@ -823,8 +823,10 @@ mod tests {
 
         let mut builder = AnnounceBuilder::new(identity_ref, pk, ek, 1000, 5000, [0x10; 16]);
         builder
-            .add_routing_hint(RoutingHint::Reticulum {
-                destination_hash: [0xAA; 16],
+            .add_routing_hint(RoutingHint::Tunnel {
+                node_id: [0xAA; 32],
+                relay_url: None,
+                direct_addrs: alloc::vec![],
             })
             .add_routing_hint(RoutingHint::Zenoh {
                 locator: alloc::string::String::from("tcp/10.0.0.1:7447"),

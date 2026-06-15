@@ -263,7 +263,6 @@ fn build_local_announce(
     pq_identity: &PqPrivateIdentity,
     node_id: [u8; 32],
     relay_url: Option<String>,
-    reticulum_addr: Option<[u8; 16]>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     use harmony_discovery::{AnnounceBuilder, AnnounceRecord, RoutingHint};
     use harmony_identity::IdentityRef;
@@ -298,13 +297,6 @@ fn build_local_announce(
         relay_url,
         direct_addrs: vec![],
     });
-
-    // Reticulum routing hint (Ed25519 destination hash for UDP mesh).
-    if let Some(dest_hash) = reticulum_addr {
-        builder.add_routing_hint(RoutingHint::Reticulum {
-            destination_hash: dest_hash,
-        });
-    }
 
     let payload = builder.signable_payload();
     let signature = pq_identity
@@ -594,7 +586,7 @@ pub async fn run(
         // the announce here (where Arc<PqPrivateIdentity> is accessible) and feed
         // the pre-serialized bytes to the runtime for Zenoh publishing.
         if let Some(ref tc) = tunnel_config {
-            match build_local_announce(&tc.local_identity, node_id_bytes, relay_url, mdns_addr) {
+            match build_local_announce(&tc.local_identity, node_id_bytes, relay_url) {
                 Ok(record_bytes) => {
                     runtime.push_event(RuntimeEvent::LocalAnnounceReady { record_bytes });
                 }
