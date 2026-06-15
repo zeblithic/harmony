@@ -7156,5 +7156,4 @@ mod tests {
         runtime.unpin_content(&cid);
         assert!(!runtime.storage_tier().cache().is_pinned(&cid));
     }
-
 }
