@@ -439,6 +439,41 @@ pub async fn run(
         runtime.disable_s3();
     }
 
+    // ── AF_PACKET rawlink bridge (Linux + rawlink feature only) ──────────────
+    // Pure Zenoh-over-L2 carrier: the bridge shuttles frames directly between the
+    // raw L2 socket and the node's zenoh session, so it needs no event-loop
+    // plumbing. (The Reticulum router that previously consumed inbound L2
+    // datagrams was removed in ZEB-475; the bridge now has no Reticulum coupling
+    // and the node simply spawns it.)
+    #[cfg(all(target_os = "linux", feature = "rawlink"))]
+    if let Some(ref iface) = rawlink_interface {
+        match harmony_rawlink::af_packet::AfPacketSocket::new(iface) {
+            Ok(socket) => {
+                let bridge_config = harmony_rawlink::BridgeConfig {
+                    identity_hash: runtime.local_pq_identity_hash(),
+                    ..harmony_rawlink::BridgeConfig::default()
+                };
+                let padded_socket =
+                    harmony_rawlink::PaddedSocket::new(socket, harmony_rawlink::DEFAULT_PAD_BLOCK);
+                let mut bridge =
+                    harmony_rawlink::Bridge::new(padded_socket, session.clone(), bridge_config);
+                tokio::spawn(async move {
+                    if let Err(e) = bridge.run().await {
+                        tracing::warn!(err = %e, "rawlink bridge stopped");
+                    }
+                });
+                tracing::info!(%iface, "rawlink AF_PACKET bridge started (Zenoh-over-L2)");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    interface = %iface,
+                    err = %e,
+                    "rawlink bridge failed to start — continuing without L2 transport"
+                );
+            }
+        }
+    }
+
     // ── mpsc channel: Zenoh tasks → select loop ───────────────────────────────
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
 
