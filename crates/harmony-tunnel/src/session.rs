@@ -196,20 +196,16 @@ impl TunnelSession {
                 self.handle_inbound(data)
             }
             TunnelEvent::SendReticulum { packet, now_ms } => {
-                self.last_sent_ms = now_ms;
-                self.handle_send(FrameTag::Reticulum, packet)
+                self.handle_send(FrameTag::Reticulum, packet, now_ms)
             }
             TunnelEvent::SendZenoh { message, now_ms } => {
-                self.last_sent_ms = now_ms;
-                self.handle_send(FrameTag::Zenoh, message)
+                self.handle_send(FrameTag::Zenoh, message, now_ms)
             }
             TunnelEvent::SendReplication { message, now_ms } => {
-                self.last_sent_ms = now_ms;
-                self.handle_send(FrameTag::Replication, message)
+                self.handle_send(FrameTag::Replication, message, now_ms)
             }
             TunnelEvent::SendDm { payload, now_ms } => {
-                self.last_sent_ms = now_ms;
-                self.handle_send(FrameTag::Dm, payload)
+                self.handle_send(FrameTag::Dm, payload, now_ms)
             }
             TunnelEvent::Tick { now_ms } => self.handle_tick(now_ms),
             TunnelEvent::Close => self.handle_close(),
@@ -292,10 +288,19 @@ impl TunnelSession {
         &mut self,
         tag: FrameTag,
         payload: Vec<u8>,
+        now_ms: u64,
     ) -> Result<Vec<TunnelAction>, TunnelError> {
         if self.state != TunnelState::Active {
             return Err(TunnelError::InvalidState);
         }
+
+        // ZEB-472 (Qodo Bug 2): advance `last_sent_ms` only AFTER the
+        // Active-state gate, so a rejected pre-handshake send doesn't push out
+        // the keepalive timer (handle_tick keys keepalives off last_sent_ms).
+        // Previously each send arm in handle_event set last_sent_ms before
+        // calling handle_send, advancing it even when this returned
+        // InvalidState. Applies to every send variant, not just Dm.
+        self.last_sent_ms = now_ms;
 
         let frame = Frame { tag, payload };
         let encrypted = encrypt_frame(

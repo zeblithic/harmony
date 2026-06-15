@@ -537,6 +537,21 @@ async fn dispatch_tunnel_actions(
                     })
                     .await;
             }
+            TunnelAction::DmReceived { payload } => {
+                // ZEB-472 (Qodo Bug 1 / CodeAnt): harmony-tunnel emits DmReceived
+                // for inbound FrameTag::Dm, but harmony-node is NOT a live DM
+                // consumer — DM delivery runs through the client's own tunnel
+                // acceptor (Move 1a / ZEB-473), not this node-side tunnel_task.
+                // There is intentionally no TunnelBridgeEvent::DmReceived. Log at
+                // debug rather than silently dropping, so an unexpected node-side
+                // DM frame stays observable (it would signal a wiring change).
+                tracing::debug!(
+                    %interface_name,
+                    connection_id,
+                    payload_len = payload.len(),
+                    "tunnel DmReceived dropped at harmony-node (DM delivery is client-side, ZEB-473)"
+                );
+            }
             // OutboundBytes, Error, Closed handled in pass 1
             _ => {}
         }
