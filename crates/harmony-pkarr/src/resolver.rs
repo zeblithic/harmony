@@ -3,7 +3,6 @@
 //!
 //! Spec Sections 5.4 + 7.1.
 
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -34,7 +33,13 @@ pub struct PkarrResolver {
     /// replaying a strictly-older (but validly-signed, still-within-TTL) record
     /// is rejected once a newer one has been seen this session. Boot-lifetime
     /// only (persisted seq is deferred to the async-DM milestone).
-    seq_highwater: Arc<Mutex<HashMap<[u8; 32], u64>>>,
+    ///
+    /// Bounded LRU (not an unbounded map): ephemeral keys rotate per epoch, so
+    /// the keyspace grows without bound over time — an unbounded map would be a
+    /// slow memory-growth / DoS vector. LRU eviction of a stale key drops only
+    /// its rollback protection, which is already best-effort (it resets on
+    /// reboot) and irrelevant once that epoch's key is no longer queried.
+    seq_highwater: Arc<Mutex<LruCache<[u8; 32], u64>>>,
 }
 
 impl PkarrResolver {
@@ -44,7 +49,9 @@ impl PkarrResolver {
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(1024).expect("nonzero"),
             ))),
-            seq_highwater: Arc::new(Mutex::new(HashMap::new())),
+            seq_highwater: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(4096).expect("nonzero"),
+            ))),
         }
     }
 
@@ -128,11 +135,17 @@ impl PkarrResolver {
                                 seen,
                                 "pkarr record seq rolled back — dropping (RPK5)"
                             );
-                            self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
+                            // Do NOT negative-cache: a rollback means a newer
+                            // record exists (highwater > seq), just not on the
+                            // relay that answered first-hit here. Caching None
+                            // would mask it for the whole negative-cache TTL,
+                            // turning one stale relay into a hard miss. Leave the
+                            // cache untouched so the next resolve (or a
+                            // resolve_freshest cross-relay sweep) can recover it.
                             return Ok(None);
                         }
                     }
-                    hw.insert(pk_bytes, seq);
+                    hw.put(pk_bytes, seq);
                 }
                 self.cache_put(pk_bytes, Some(record.clone()), POSITIVE_CACHE_TTL);
                 Ok(Some(record))
@@ -235,7 +248,7 @@ impl PkarrResolver {
                             return Ok(None);
                         }
                     }
-                    hw.insert(pk_bytes, seq);
+                    hw.put(pk_bytes, seq);
                 }
                 self.cache_put(pk_bytes, Some(record.clone()), POSITIVE_CACHE_TTL);
                 Ok(Some(record))
@@ -253,6 +266,7 @@ impl PkarrResolver {
         let futures = keys.iter().map(|pk| self.resolve_freshest(pk));
         let results = join_all(futures).await;
         let mut best: Option<PkarrRoutingRecord> = None;
+        let mut any_ok_none = false;
         let mut any_err: Option<PkarrError> = None;
         for r in results {
             match r {
@@ -264,14 +278,18 @@ impl PkarrResolver {
                         best = Some(rec);
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => any_ok_none = true,
                 Err(e) => any_err = Some(e),
             }
         }
-        match (best, any_err) {
-            (Some(rec), _) => Ok(Some(rec)),
-            (None, Some(e)) => Err(e),
-            (None, None) => Ok(None),
+        // Mirror `resolve_window`: prefer a definitive answer (a record, or a
+        // confirmed-absent Ok(None) from any key) over a transient error on a
+        // sibling key. Only surface Err when every key errored.
+        match (best, any_ok_none, any_err) {
+            (Some(rec), _, _) => Ok(Some(rec)),
+            (None, true, _) => Ok(None),
+            (None, false, Some(e)) => Err(e),
+            (None, false, None) => Ok(None),
         }
     }
 

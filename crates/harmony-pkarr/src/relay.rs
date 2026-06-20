@@ -306,14 +306,24 @@ impl RelayClient {
     /// Query every available (non-cooldown) relay and return each
     /// `(relay_url, envelope)` that served a record. Unlike `get` (first-hit),
     /// this surfaces all hits so the caller can pick the freshest — defeating a
-    /// single stale relay that holds an old-but-within-TTL record. Returns
-    /// `Err(NoRelaysAvailable)` only when every relay is on cooldown; an empty
-    /// Vec means "all reachable relays returned 404".
+    /// single stale relay that holds an old-but-within-TTL record.
+    ///
+    /// Mirrors `get`'s definitive-vs-transient distinction so an outage is
+    /// never misread as confirmed absence:
+    /// - `Ok(non-empty)` — at least one relay served a record.
+    /// - `Ok(empty)` — every reachable relay returned a definitive 404.
+    /// - `Err(NoRelaysAvailable)` — no relay served a record AND at least one
+    ///   failed transiently (cooldown / 429 / 5xx / timeout / transport), so
+    ///   absence cannot be confirmed.
     pub async fn get_all(&self, key_z32: &str) -> Result<Vec<(String, Vec<u8>)>, PkarrError> {
         let (gen, relays) = self.available_relays();
         if relays.is_empty() {
             return Err(PkarrError::NoRelaysAvailable);
         }
+        // Track whether every polled relay gave a definitive 404. Any other
+        // non-success outcome flips this false so an empty `hits` is surfaced
+        // as NoRelaysAvailable rather than a false "confirmed absent".
+        let mut all_404 = true;
         let mut hits = Vec::new();
         for base in relays {
             let url = format!("{}/{}", base, key_z32);
@@ -324,20 +334,24 @@ impl RelayClient {
                         hits.push((base, b.to_vec()));
                     }
                     Err(_) => {
+                        all_404 = false;
                         self.mark_cooldown(gen, &base);
                         self.record_outcome(gen, &base, RelayOutcome::Transport);
                     }
                 },
                 Ok(resp) if resp.status().as_u16() == 404 => continue,
                 Ok(resp) if resp.status().as_u16() == 429 => {
+                    all_404 = false;
                     self.mark_cooldown(gen, &base);
                     self.record_outcome(gen, &base, RelayOutcome::Http(429));
                 }
                 Ok(resp) => {
+                    all_404 = false;
                     self.mark_cooldown(gen, &base);
                     self.record_outcome(gen, &base, RelayOutcome::Http(resp.status().as_u16()));
                 }
                 Err(e) => {
+                    all_404 = false;
                     self.mark_cooldown(gen, &base);
                     self.record_outcome(
                         gen,
@@ -351,7 +365,15 @@ impl RelayClient {
                 }
             }
         }
-        Ok(hits)
+        if hits.is_empty() && !all_404 {
+            // No record served and at least one relay failed transiently —
+            // absence cannot be confirmed, so don't let it read as Ok(empty).
+            Err(PkarrError::NoRelaysAvailable)
+        } else {
+            // Either we have hits, or every reachable relay returned a definitive
+            // 404 (then `hits` is empty = confirmed absent).
+            Ok(hits)
+        }
     }
 
     /// Returns the current pool generation plus the subset of pool relays whose
@@ -509,6 +531,37 @@ mod tests {
             client.get("k").await,
             Err(PkarrError::NoRelaysAvailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn get_all_errors_when_all_relays_fail() {
+        // Mirror get(): an all-failed sweep must surface NoRelaysAvailable, not
+        // a false Ok(empty) "confirmed absent" (else resolve_freshest would read
+        // an outage as a definitive miss). 192.0.2.1 (TEST-NET-1) is unreachable;
+        // the short timeout keeps the test fast.
+        let cfg = RelayConfig {
+            request_timeout: Duration::from_millis(200),
+            cooldown: Duration::from_millis(0),
+        };
+        let pool = RelayPool::new(vec!["http://192.0.2.1:80".to_string()]);
+        let client = RelayClient::with_config(pool, cfg);
+        assert!(matches!(
+            client.get_all("k").await,
+            Err(PkarrError::NoRelaysAvailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_all_empty_when_key_absent() {
+        // A definitive 404 from every reachable relay is Ok(empty), not Err.
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = RelayClient::new(pool);
+        let hits = client
+            .get_all("absent-key")
+            .await
+            .expect("definitive 404 is Ok(empty)");
+        assert!(hits.is_empty());
     }
 
     #[test]
