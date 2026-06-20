@@ -19,7 +19,7 @@ use pkarr::{Keypair, PublicKey, SignedPacket};
 /// DNS label carrying the routing record's base64url payload.
 const RECORD_LABEL: &str = "_r";
 /// TTL (seconds) on the TXT record. Not load-bearing — harmony freshness is
-/// governed by PkarrRoutingRecord::verify_skew + epoch rotation, not DNS TTL.
+/// governed by PkarrRoutingRecord::verify_freshness (signed TTL), not DNS TTL.
 const RECORD_TTL: u32 = 300;
 
 /// Encode a routing record's canonical CBOR as a base64url-unpadded string.
@@ -74,19 +74,51 @@ pub(crate) fn build_relay_payload(
     Ok((keypair.to_z32(), signed.to_relay_payload().to_vec()))
 }
 
-/// Parse + outer-verify a relay GET payload back into a routing record.
-/// Verifies the BEP44 (ephemeral-key) signature against `expected_pk`; does
-/// NOT verify the inner identity signature — the caller does that.
+/// Parse + outer-verify a relay GET payload back into a routing record plus
+/// the BEP44 `seq` (the `SignedPacket` timestamp, µs since epoch — authored by
+/// the keypair holder and DHT-CAS-monotonic at PUT time). Verifies the BEP44
+/// (ephemeral-key) signature against `expected_pk`; does NOT verify the inner
+/// identity signature — the caller does that. The resolver uses `seq` for
+/// in-memory anti-rollback.
 pub(crate) fn parse_relay_payload(
     expected_pk: &[u8; 32],
     payload: &[u8],
-) -> Result<PkarrRoutingRecord, PkarrError> {
+) -> Result<(PkarrRoutingRecord, u64), PkarrError> {
     let pk = PublicKey::try_from(expected_pk).map_err(|_| PkarrError::InvalidRecord)?;
     let bytes = bytes::Bytes::copy_from_slice(payload);
     let signed = SignedPacket::from_relay_payload(&pk, &bytes)
         .map_err(|_| PkarrError::OuterSignatureInvalid)?;
+    let seq = signed.timestamp().as_u64();
     let txt = read_record_txt(&signed)?;
-    txt_string_to_routing_record(&txt)
+    let record = txt_string_to_routing_record(&txt)?;
+    Ok((record, seq))
+}
+
+/// Test-only: build a relay payload with an explicit BEP44 `seq`, so
+/// anti-rollback / freshest-across-relays tests can author deterministic
+/// older/newer records for the same key.
+#[cfg(test)]
+pub(crate) fn build_relay_payload_with_seq(
+    signing_key: &SigningKey,
+    record: &PkarrRoutingRecord,
+    seq: u64,
+) -> Result<Vec<u8>, PkarrError> {
+    use pkarr::Timestamp;
+    let keypair = Keypair::from_secret_key(&signing_key.to_bytes());
+    let b64 = routing_record_to_txt_string(record)?;
+    let mut txt = TXT::new();
+    for chunk in b64.as_bytes().chunks(255) {
+        let cs = CharacterString::new(chunk)
+            .map_err(|_| PkarrError::SerializeError("txt char-string"))?;
+        txt.add_char_string(cs);
+    }
+    let name = Name::new(RECORD_LABEL).map_err(|_| PkarrError::SerializeError("txt name"))?;
+    let signed = SignedPacket::builder()
+        .txt(name, txt, RECORD_TTL)
+        .timestamp(Timestamp::from(seq))
+        .sign(&keypair)
+        .map_err(|_| PkarrError::SerializeError("pkarr signed-packet build"))?;
+    Ok(signed.to_relay_payload().to_vec())
 }
 
 /// z-base-32 string for an ed25519 verifying key (the relay GET URL key).
@@ -130,6 +162,7 @@ mod tests {
             vec![0xCDu8; 120], // routing_blob big enough to force >255 base64
             id_pub,
             1_000_000,
+            1_000_000 + 604_800_000,
             &sk,
         )
         .expect("sign record")
@@ -154,8 +187,8 @@ mod tests {
             .expect("sign");
         let payload = signed.to_relay_payload().to_vec();
         assert_eq!(
-            parse_relay_payload(&kp.public_key().to_bytes(), &payload),
-            Err(PkarrError::InvalidRecord)
+            parse_relay_payload(&kp.public_key().to_bytes(), &payload).err(),
+            Some(PkarrError::InvalidRecord)
         );
     }
 
@@ -192,9 +225,14 @@ mod tests {
         let mut id_pub = [0u8; 64];
         id_pub[32..].copy_from_slice(&sk.verifying_key().to_bytes());
         // routing_blob far over the ~1000-byte v budget once base64'd.
-        let big =
-            crate::record::PkarrRoutingRecord::sign_new(vec![0u8; 3000], id_pub, 1_000_000, &sk)
-                .expect("sign");
+        let big = crate::record::PkarrRoutingRecord::sign_new(
+            vec![0u8; 3000],
+            id_pub,
+            1_000_000,
+            1_000_000 + 604_800_000,
+            &sk,
+        )
+        .expect("sign");
         assert_eq!(
             build_relay_payload(&sk, &big),
             Err(PkarrError::RecordTooLarge)
@@ -206,7 +244,8 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let rec = sample_record();
         let (_z32, payload) = build_relay_payload(&sk, &rec).expect("build");
-        let parsed = parse_relay_payload(&sk.verifying_key().to_bytes(), &payload).expect("parse");
+        let (parsed, _seq) =
+            parse_relay_payload(&sk.verifying_key().to_bytes(), &payload).expect("parse");
         assert_eq!(parsed, rec);
     }
 
@@ -217,8 +256,8 @@ mod tests {
         let (_z32, mut payload) = build_relay_payload(&sk, &rec).expect("build");
         payload[0] ^= 0xFF; // corrupt the signature
         assert_eq!(
-            parse_relay_payload(&sk.verifying_key().to_bytes(), &payload),
-            Err(PkarrError::OuterSignatureInvalid)
+            parse_relay_payload(&sk.verifying_key().to_bytes(), &payload).err(),
+            Some(PkarrError::OuterSignatureInvalid)
         );
     }
 
@@ -229,8 +268,8 @@ mod tests {
         let rec = sample_record();
         let (_z32, payload) = build_relay_payload(&sk, &rec).expect("build");
         assert_eq!(
-            parse_relay_payload(&other.verifying_key().to_bytes(), &payload),
-            Err(PkarrError::OuterSignatureInvalid)
+            parse_relay_payload(&other.verifying_key().to_bytes(), &payload).err(),
+            Some(PkarrError::OuterSignatureInvalid)
         );
     }
 
@@ -269,7 +308,7 @@ mod tests {
             .await
             .expect("get from live relay")
             .expect("record present on relay");
-        let parsed =
+        let (parsed, _seq) =
             parse_relay_payload(&ephemeral.verifying_key().to_bytes(), &got).expect("parse");
         assert_eq!(parsed, rec);
     }

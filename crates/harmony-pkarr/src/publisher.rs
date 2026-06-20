@@ -289,6 +289,7 @@ mod tests {
                 b"test-routing".to_vec(),
                 identity_pub,
                 at_ms,
+                at_ms + 604_800_000,
                 &identity_sk_for_builder,
             )
             .expect("sign")
@@ -335,6 +336,7 @@ mod tests {
                 b"blob".to_vec(),
                 identity_pub,
                 at_ms,
+                at_ms + 604_800_000,
                 &identity_sk_for_builder,
             )
             .expect("sign")
@@ -392,6 +394,7 @@ mod tests {
                 b"rotation-test".to_vec(),
                 identity_pub,
                 at_ms,
+                at_ms + 604_800_000,
                 &identity_sk_for_builder,
             )
             .expect("sign")
@@ -440,6 +443,7 @@ mod tests {
                 b"rotation-test".to_vec(),
                 identity_pub,
                 at_ms,
+                at_ms + 604_800_000,
                 &identity_sk_for_builder2,
             )
             .expect("sign")
@@ -493,6 +497,7 @@ mod tests {
                         b"routing".to_vec(),
                         id_pub,
                         now,
+                        now + 604_800_000,
                         &id_sk_for_builder,
                     )
                     .expect("sign record")

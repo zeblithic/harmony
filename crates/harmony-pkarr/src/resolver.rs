@@ -29,6 +29,17 @@ struct CachedResolution {
 pub struct PkarrResolver {
     relay: Arc<RelayClient>,
     cache: Arc<Mutex<LruCache<[u8; 32], CachedResolution>>>,
+    /// Per-key highest accepted BEP44 `seq`. In-memory anti-rollback: a relay
+    /// replaying a strictly-older (but validly-signed, still-within-TTL) record
+    /// is rejected once a newer one has been seen this session. Boot-lifetime
+    /// only (persisted seq is deferred to the async-DM milestone).
+    ///
+    /// Bounded LRU (not an unbounded map): ephemeral keys rotate per epoch, so
+    /// the keyspace grows without bound over time — an unbounded map would be a
+    /// slow memory-growth / DoS vector. LRU eviction of a stale key drops only
+    /// its rollback protection, which is already best-effort (it resets on
+    /// reboot) and irrelevant once that epoch's key is no longer queried.
+    seq_highwater: Arc<Mutex<LruCache<[u8; 32], u64>>>,
 }
 
 impl PkarrResolver {
@@ -37,6 +48,9 @@ impl PkarrResolver {
             relay,
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(1024).expect("nonzero"),
+            ))),
+            seq_highwater: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(4096).expect("nonzero"),
             ))),
         }
     }
@@ -62,7 +76,7 @@ impl PkarrResolver {
                 // Outer-sig failure (RPK1) OR malformed record (bad TXT/base64/
                 // CBOR) → silent-drop (cache negative). The error field carries
                 // the specific cause.
-                let record = match crate::wire::parse_relay_payload(&pk_bytes, &envelope) {
+                let (record, seq) = match crate::wire::parse_relay_payload(&pk_bytes, &envelope) {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(
@@ -84,31 +98,66 @@ impl PkarrResolver {
                     self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
                     return Ok(None);
                 }
-                // RPK4: skew check (±30 min) — silent-drop (cache negative).
-                // Don't cache positively: a record outside the skew window
-                // is invalid, and could become valid if the local clock
-                // corrects, but the publisher's next republish will land
-                // a fresh record anyway. Negative-cache so we don't spam
-                // the relay during the 60s window.
+                // RPK4: freshness check (future-strict + signed TTL) —
+                // silent-drop (cache negative). Don't cache positively: an
+                // expired/forged record is invalid, and the publisher's next
+                // republish will land a fresh record anyway. Negative-cache so
+                // we don't spam the relay during the 60s window.
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .expect("system clock < UNIX epoch is unsupported")
                     .as_millis() as u64;
-                if let Err(e) = record.verify_skew(now_ms) {
+                if let Err(e) = record.verify_freshness(now_ms) {
                     tracing::warn!(
                         key = %key_z32,
                         announced_at_ms = record.announced_at_ms,
+                        valid_until_ms = record.valid_until_ms,
                         now_ms,
                         error = ?e,
-                        "pkarr record outside ±30min skew window — dropping (RPK4)"
+                        "pkarr record failed freshness (expired or forged-future) — dropping (RPK4)"
                     );
                     self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
                     return Ok(None);
+                }
+                // RPK5: in-memory anti-rollback. Reject a strictly-older seq than
+                // the highest accepted for this key (a relay replaying a stale,
+                // still-within-TTL record). Equal seq = same signed bytes → allow
+                // (idempotent re-resolve after cache expiry). Update on accept,
+                // only after every other gate passed so a bad record can't poison
+                // the highwater.
+                {
+                    let mut hw = self.seq_highwater.lock().expect("seq_highwater poisoned");
+                    if let Some(&seen) = hw.get(&pk_bytes) {
+                        if seq < seen {
+                            tracing::warn!(
+                                key = %key_z32,
+                                seq,
+                                seen,
+                                "pkarr record seq rolled back — dropping (RPK5)"
+                            );
+                            // Do NOT negative-cache: a rollback means a newer
+                            // record exists (highwater > seq), just not on the
+                            // relay that answered first-hit here. Caching None
+                            // would mask it for the whole negative-cache TTL,
+                            // turning one stale relay into a hard miss. Leave the
+                            // cache untouched so the next resolve (or a
+                            // resolve_freshest cross-relay sweep) can recover it.
+                            return Ok(None);
+                        }
+                    }
+                    hw.put(pk_bytes, seq);
                 }
                 self.cache_put(pk_bytes, Some(record.clone()), POSITIVE_CACHE_TTL);
                 Ok(Some(record))
             }
         }
+    }
+
+    /// Test-only: drop any cached resolution for a key, forcing the next
+    /// `resolve` to hit the relay (so seq anti-rollback can be exercised).
+    #[cfg(test)]
+    pub(crate) fn invalidate_for_test(&self, pk: &[u8; 32]) {
+        self.cache.lock().expect("cache poisoned").pop(pk);
     }
 
     /// Resolve any of `keys` (the 3-key epoch tolerance window) in parallel.
@@ -152,6 +201,98 @@ impl PkarrResolver {
         }
     }
 
+    /// Cache-bypassing resolve that queries ALL relays and returns the freshest
+    /// valid record by BEP44 `seq` (ties broken by latest `announced_at` within
+    /// TTL). Used on a dial failure to cross-check relays — a single stale relay
+    /// cannot pin the resolver to an old-but-within-TTL record. Updates the
+    /// positive cache + seq highwater with the winner.
+    pub async fn resolve_freshest(
+        &self,
+        pk: &VerifyingKey,
+    ) -> Result<Option<PkarrRoutingRecord>, PkarrError> {
+        let pk_bytes = pk.to_bytes();
+        let key_z32 = crate::wire::z32_for_verifying_key(pk)?;
+        let hits = self.relay.get_all(&key_z32).await?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock < UNIX epoch is unsupported")
+            .as_millis() as u64;
+
+        // Pick the freshest valid record across every relay that answered.
+        let mut best: Option<(u64, PkarrRoutingRecord)> = None; // (seq, record)
+        for (_relay, envelope) in hits {
+            let (record, seq) = match crate::wire::parse_relay_payload(&pk_bytes, &envelope) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if record.verify_inner_sig().is_err() {
+                continue;
+            }
+            if record.verify_freshness(now_ms).is_err() {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(bseq, brec)| {
+                seq > *bseq || (seq == *bseq && record.announced_at_ms > brec.announced_at_ms)
+            }) {
+                best = Some((seq, record));
+            }
+        }
+
+        match best {
+            Some((seq, record)) => {
+                // Anti-rollback: never accept a winner older than what we've seen.
+                {
+                    let mut hw = self.seq_highwater.lock().expect("seq_highwater poisoned");
+                    if let Some(&seen) = hw.get(&pk_bytes) {
+                        if seq < seen {
+                            return Ok(None);
+                        }
+                    }
+                    hw.put(pk_bytes, seq);
+                }
+                self.cache_put(pk_bytes, Some(record.clone()), POSITIVE_CACHE_TTL);
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// `resolve_freshest` across the epoch-tolerance key window; returns the
+    /// freshest valid record found for any key.
+    pub async fn resolve_window_freshest(
+        &self,
+        keys: &[VerifyingKey],
+    ) -> Result<Option<PkarrRoutingRecord>, PkarrError> {
+        let futures = keys.iter().map(|pk| self.resolve_freshest(pk));
+        let results = join_all(futures).await;
+        let mut best: Option<PkarrRoutingRecord> = None;
+        let mut any_ok_none = false;
+        let mut any_err: Option<PkarrError> = None;
+        for r in results {
+            match r {
+                Ok(Some(rec)) => {
+                    if best
+                        .as_ref()
+                        .is_none_or(|b| rec.announced_at_ms > b.announced_at_ms)
+                    {
+                        best = Some(rec);
+                    }
+                }
+                Ok(None) => any_ok_none = true,
+                Err(e) => any_err = Some(e),
+            }
+        }
+        // Mirror `resolve_window`: prefer a definitive answer (a record, or a
+        // confirmed-absent Ok(None) from any key) over a transient error on a
+        // sibling key. Only surface Err when every key errored.
+        match (best, any_ok_none, any_err) {
+            (Some(rec), _, _) => Ok(Some(rec)),
+            (None, true, _) => Ok(None),
+            (None, false, Some(e)) => Err(e),
+            (None, false, None) => Ok(None),
+        }
+    }
+
     fn cache_get(&self, pk: &[u8; 32]) -> Option<CachedResolution> {
         let mut cache = self.cache.lock().expect("cache poisoned");
         let entry = cache.get(pk)?;
@@ -159,18 +300,17 @@ impl PkarrResolver {
             cache.pop(pk);
             return None;
         }
-        // RPK4 re-verification on cache hit: a record cached near the +30min
-        // skew edge could otherwise be served from the 15min positive cache
-        // up to 14min after it falls outside the skew window. Re-check on
-        // every lookup; on skew failure, evict + treat as miss (the next
-        // resolve will go to the relay and either negative-cache or refetch
-        // a fresh record).
+        // RPK4 re-verification on cache hit: a record whose signed TTL expires
+        // during the 15min positive-cache window must not keep being served.
+        // Re-check freshness on every lookup; on failure, evict + treat as miss
+        // (the next resolve will go to the relay and either negative-cache or
+        // refetch a fresh record).
         if let Some(rec) = entry.record.as_ref() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock < UNIX epoch is unsupported")
                 .as_millis() as u64;
-            if rec.verify_skew(now_ms).is_err() {
+            if rec.verify_freshness(now_ms).is_err() {
                 cache.pop(pk);
                 return None;
             }
@@ -226,6 +366,7 @@ mod tests {
                 b"r-blob".to_vec(),
                 identity_pub,
                 now_ms,
+                now_ms + 604_800_000,
                 &identity_sk_clone,
             )
             .expect("sign")
@@ -282,6 +423,7 @@ mod tests {
                 b"cached".to_vec(),
                 identity_pub,
                 now_ms,
+                now_ms + 604_800_000,
                 &identity_sk_clone,
             )
             .expect("sign")
@@ -325,6 +467,7 @@ mod tests {
             b"iroh-routing".to_vec(),
             id_pub,
             now_ms,
+            now_ms + 604_800_000,
             &id_sk,
         )
         .expect("sign");
@@ -338,5 +481,106 @@ mod tests {
             .expect("resolve")
             .expect("present");
         assert_eq!(got.routing_blob, b"iroh-routing".to_vec());
+    }
+
+    #[tokio::test]
+    async fn rejects_rolled_back_seq() {
+        let relay = MockPkarrRelay::start().await;
+        let pool = crate::relay::RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(crate::relay::RelayClient::new(pool));
+        let resolver = PkarrResolver::new(Arc::clone(&client));
+
+        let ephemeral = SigningKey::generate(&mut OsRng);
+        let vk = ephemeral.verifying_key();
+        let identity_sk = SigningKey::generate(&mut OsRng);
+        let identity_pub = fixture_identity_pubkey(&identity_sk);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let rec = PkarrRoutingRecord::sign_new(
+            b"r".to_vec(),
+            identity_pub,
+            now,
+            now + 604_800_000,
+            &identity_sk,
+        )
+        .expect("sign");
+
+        let key_z32 = crate::wire::z32_for_verifying_key(&vk).unwrap();
+
+        // Publish with a HIGH seq, resolve → accepted, highwater = 200.
+        let hi = crate::wire::build_relay_payload_with_seq(&ephemeral, &rec, 200).unwrap();
+        client.put(&key_z32, &hi).await.unwrap();
+        assert!(resolver.resolve(&vk).await.unwrap().is_some());
+
+        // A relay now serves an OLDER seq for the same key → rolled back → drop.
+        let lo = crate::wire::build_relay_payload_with_seq(&ephemeral, &rec, 100).unwrap();
+        client.put(&key_z32, &lo).await.unwrap();
+        // Bypass the positive cache to force a fresh GET + seq check.
+        resolver.invalidate_for_test(&vk.to_bytes());
+        assert!(
+            resolver.resolve(&vk).await.unwrap().is_none(),
+            "older seq must be rejected as rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_freshest_beats_stale_relay() {
+        // Two relays: one holds an OLD seq, one holds a NEW seq. resolve_freshest
+        // must return the new one regardless of pool order (stale listed first).
+        let stale = MockPkarrRelay::start().await;
+        let fresh = MockPkarrRelay::start().await;
+        let pool = crate::relay::RelayPool::new(vec![
+            stale.base_url.clone(), // stale FIRST — first-hit `get` would pick this
+            fresh.base_url.clone(),
+        ]);
+        let client = Arc::new(crate::relay::RelayClient::new(pool));
+        let resolver = PkarrResolver::new(Arc::clone(&client));
+
+        let ephemeral = SigningKey::generate(&mut OsRng);
+        let vk = ephemeral.verifying_key();
+        let id_sk = SigningKey::generate(&mut OsRng);
+        let id_pub = fixture_identity_pubkey(&id_sk);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let old_rec =
+            PkarrRoutingRecord::sign_new(b"old".to_vec(), id_pub, now, now + 604_800_000, &id_sk)
+                .unwrap();
+        let new_rec =
+            PkarrRoutingRecord::sign_new(b"new".to_vec(), id_pub, now, now + 604_800_000, &id_sk)
+                .unwrap();
+
+        let key_z32 = crate::wire::z32_for_verifying_key(&vk).unwrap();
+        // Put directly to each relay via single-relay clients.
+        let stale_c = crate::relay::RelayClient::new(crate::relay::RelayPool::new(vec![stale
+            .base_url
+            .clone()]));
+        let fresh_c = crate::relay::RelayClient::new(crate::relay::RelayPool::new(vec![fresh
+            .base_url
+            .clone()]));
+        stale_c
+            .put(
+                &key_z32,
+                &crate::wire::build_relay_payload_with_seq(&ephemeral, &old_rec, 100).unwrap(),
+            )
+            .await
+            .unwrap();
+        fresh_c
+            .put(
+                &key_z32,
+                &crate::wire::build_relay_payload_with_seq(&ephemeral, &new_rec, 200).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let got = resolver
+            .resolve_freshest(&vk)
+            .await
+            .unwrap()
+            .expect("present");
+        assert_eq!(got.routing_blob, b"new", "freshest-by-seq must win");
     }
 }
