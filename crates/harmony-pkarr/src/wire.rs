@@ -97,8 +97,8 @@ pub(crate) fn parse_relay_payload(
 /// Test-only: build a relay payload with an explicit BEP44 `seq`, so
 /// anti-rollback / freshest-across-relays tests can author deterministic
 /// older/newer records for the same key.
-#[cfg(any(test, feature = "test-fixtures"))]
-pub fn build_relay_payload_with_seq(
+#[cfg(test)]
+pub(crate) fn build_relay_payload_with_seq(
     signing_key: &SigningKey,
     record: &PkarrRoutingRecord,
     seq: u64,

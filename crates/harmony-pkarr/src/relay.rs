@@ -303,6 +303,57 @@ impl RelayClient {
         }
     }
 
+    /// Query every available (non-cooldown) relay and return each
+    /// `(relay_url, envelope)` that served a record. Unlike `get` (first-hit),
+    /// this surfaces all hits so the caller can pick the freshest — defeating a
+    /// single stale relay that holds an old-but-within-TTL record. Returns
+    /// `Err(NoRelaysAvailable)` only when every relay is on cooldown; an empty
+    /// Vec means "all reachable relays returned 404".
+    pub async fn get_all(&self, key_z32: &str) -> Result<Vec<(String, Vec<u8>)>, PkarrError> {
+        let (gen, relays) = self.available_relays();
+        if relays.is_empty() {
+            return Err(PkarrError::NoRelaysAvailable);
+        }
+        let mut hits = Vec::new();
+        for base in relays {
+            let url = format!("{}/{}", base, key_z32);
+            match self.http.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                    Ok(b) => {
+                        self.record_outcome(gen, &base, RelayOutcome::Success);
+                        hits.push((base, b.to_vec()));
+                    }
+                    Err(_) => {
+                        self.mark_cooldown(gen, &base);
+                        self.record_outcome(gen, &base, RelayOutcome::Transport);
+                    }
+                },
+                Ok(resp) if resp.status().as_u16() == 404 => continue,
+                Ok(resp) if resp.status().as_u16() == 429 => {
+                    self.mark_cooldown(gen, &base);
+                    self.record_outcome(gen, &base, RelayOutcome::Http(429));
+                }
+                Ok(resp) => {
+                    self.mark_cooldown(gen, &base);
+                    self.record_outcome(gen, &base, RelayOutcome::Http(resp.status().as_u16()));
+                }
+                Err(e) => {
+                    self.mark_cooldown(gen, &base);
+                    self.record_outcome(
+                        gen,
+                        &base,
+                        if e.is_timeout() {
+                            RelayOutcome::Timeout
+                        } else {
+                            RelayOutcome::Transport
+                        },
+                    );
+                }
+            }
+        }
+        Ok(hits)
+    }
+
     /// Returns the current pool generation plus the subset of pool relays whose
     /// cooldown has expired (or never started). Order is preserved so the caller
     /// iterates in pool order. The generation is captured under the same critical

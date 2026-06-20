@@ -142,8 +142,8 @@ impl PkarrResolver {
 
     /// Test-only: drop any cached resolution for a key, forcing the next
     /// `resolve` to hit the relay (so seq anti-rollback can be exercised).
-    #[cfg(any(test, feature = "test-fixtures"))]
-    pub fn invalidate_for_test(&self, pk: &[u8; 32]) {
+    #[cfg(test)]
+    pub(crate) fn invalidate_for_test(&self, pk: &[u8; 32]) {
         self.cache.lock().expect("cache poisoned").pop(pk);
     }
 
@@ -185,6 +185,93 @@ impl PkarrResolver {
             (None, true, _) => Ok(None),
             (None, false, Some(e)) => Err(e),
             (None, false, None) => Ok(None),
+        }
+    }
+
+    /// Cache-bypassing resolve that queries ALL relays and returns the freshest
+    /// valid record by BEP44 `seq` (ties broken by latest `announced_at` within
+    /// TTL). Used on a dial failure to cross-check relays — a single stale relay
+    /// cannot pin the resolver to an old-but-within-TTL record. Updates the
+    /// positive cache + seq highwater with the winner.
+    pub async fn resolve_freshest(
+        &self,
+        pk: &VerifyingKey,
+    ) -> Result<Option<PkarrRoutingRecord>, PkarrError> {
+        let pk_bytes = pk.to_bytes();
+        let key_z32 = crate::wire::z32_for_verifying_key(pk)?;
+        let hits = self.relay.get_all(&key_z32).await?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock < UNIX epoch is unsupported")
+            .as_millis() as u64;
+
+        // Pick the freshest valid record across every relay that answered.
+        let mut best: Option<(u64, PkarrRoutingRecord)> = None; // (seq, record)
+        for (_relay, envelope) in hits {
+            let (record, seq) = match crate::wire::parse_relay_payload(&pk_bytes, &envelope) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if record.verify_inner_sig().is_err() {
+                continue;
+            }
+            if record.verify_freshness(now_ms).is_err() {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(bseq, brec)| {
+                seq > *bseq || (seq == *bseq && record.announced_at_ms > brec.announced_at_ms)
+            }) {
+                best = Some((seq, record));
+            }
+        }
+
+        match best {
+            Some((seq, record)) => {
+                // Anti-rollback: never accept a winner older than what we've seen.
+                {
+                    let mut hw = self.seq_highwater.lock().expect("seq_highwater poisoned");
+                    if let Some(&seen) = hw.get(&pk_bytes) {
+                        if seq < seen {
+                            return Ok(None);
+                        }
+                    }
+                    hw.insert(pk_bytes, seq);
+                }
+                self.cache_put(pk_bytes, Some(record.clone()), POSITIVE_CACHE_TTL);
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// `resolve_freshest` across the epoch-tolerance key window; returns the
+    /// freshest valid record found for any key.
+    pub async fn resolve_window_freshest(
+        &self,
+        keys: &[VerifyingKey],
+    ) -> Result<Option<PkarrRoutingRecord>, PkarrError> {
+        let futures = keys.iter().map(|pk| self.resolve_freshest(pk));
+        let results = join_all(futures).await;
+        let mut best: Option<PkarrRoutingRecord> = None;
+        let mut any_err: Option<PkarrError> = None;
+        for r in results {
+            match r {
+                Ok(Some(rec)) => {
+                    if best
+                        .as_ref()
+                        .is_none_or(|b| rec.announced_at_ms > b.announced_at_ms)
+                    {
+                        best = Some(rec);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => any_err = Some(e),
+            }
+        }
+        match (best, any_err) {
+            (Some(rec), _) => Ok(Some(rec)),
+            (None, Some(e)) => Err(e),
+            (None, None) => Ok(None),
         }
     }
 
@@ -418,5 +505,64 @@ mod tests {
             resolver.resolve(&vk).await.unwrap().is_none(),
             "older seq must be rejected as rollback"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_freshest_beats_stale_relay() {
+        // Two relays: one holds an OLD seq, one holds a NEW seq. resolve_freshest
+        // must return the new one regardless of pool order (stale listed first).
+        let stale = MockPkarrRelay::start().await;
+        let fresh = MockPkarrRelay::start().await;
+        let pool = crate::relay::RelayPool::new(vec![
+            stale.base_url.clone(), // stale FIRST — first-hit `get` would pick this
+            fresh.base_url.clone(),
+        ]);
+        let client = Arc::new(crate::relay::RelayClient::new(pool));
+        let resolver = PkarrResolver::new(Arc::clone(&client));
+
+        let ephemeral = SigningKey::generate(&mut OsRng);
+        let vk = ephemeral.verifying_key();
+        let id_sk = SigningKey::generate(&mut OsRng);
+        let id_pub = fixture_identity_pubkey(&id_sk);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let old_rec =
+            PkarrRoutingRecord::sign_new(b"old".to_vec(), id_pub, now, now + 604_800_000, &id_sk)
+                .unwrap();
+        let new_rec =
+            PkarrRoutingRecord::sign_new(b"new".to_vec(), id_pub, now, now + 604_800_000, &id_sk)
+                .unwrap();
+
+        let key_z32 = crate::wire::z32_for_verifying_key(&vk).unwrap();
+        // Put directly to each relay via single-relay clients.
+        let stale_c = crate::relay::RelayClient::new(crate::relay::RelayPool::new(vec![stale
+            .base_url
+            .clone()]));
+        let fresh_c = crate::relay::RelayClient::new(crate::relay::RelayPool::new(vec![fresh
+            .base_url
+            .clone()]));
+        stale_c
+            .put(
+                &key_z32,
+                &crate::wire::build_relay_payload_with_seq(&ephemeral, &old_rec, 100).unwrap(),
+            )
+            .await
+            .unwrap();
+        fresh_c
+            .put(
+                &key_z32,
+                &crate::wire::build_relay_payload_with_seq(&ephemeral, &new_rec, 200).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let got = resolver
+            .resolve_freshest(&vk)
+            .await
+            .unwrap()
+            .expect("present");
+        assert_eq!(got.routing_blob, b"new", "freshest-by-seq must win");
     }
 }
