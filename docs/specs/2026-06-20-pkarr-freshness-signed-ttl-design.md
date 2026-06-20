@@ -60,7 +60,7 @@ But the publisher only republishes on the **7-day BEP44 epoch lifecycle**:
 
 ### 3.3 seq anti-rollback — in-memory (v1)
 - Surface the BEP44 `seq` from the parsed `SignedPacket` (`wire::parse_relay_payload`) up to the resolver (e.g., return it alongside the `PkarrRoutingRecord`, or attach to the resolution).
-- The resolver keeps a per-key highest-`seq`-seen map **in memory** (alongside the LRU; e.g. `Arc<Mutex<HashMap<[u8;32], u64>>>`). On resolve: reject a record whose `seq <= stored_highwater`; on accept, update the highwater.
+- The resolver keeps a per-key highest-`seq`-seen map **in memory**. It **must be bounded** — ephemeral keys rotate per epoch, so the keyspace grows without bound over time; an unbounded map would be a slow memory-growth / DoS vector. Use a bounded `LruCache<[u8;32], u64>` (eviction of a stale key only drops its best-effort rollback protection, which already resets on reboot). On resolve: reject a record whose `seq < stored_highwater` (strictly-older — equal `seq` is the same signed bytes, accepted so an idempotent re-resolve after cache expiry isn't falsely dropped); on accept, update the highwater (only after all other gates pass).
 - **Not** in the signed preimage and **no wire change** — `seq` already rides the BEP44 envelope (DHT-CAS-enforced monotonic at PUT time). This adds resolver-side defense against a relay replaying an older (validly-signed, still-within-TTL) record *within a session*.
 
 ### 3.4 Diverse-relay re-resolve on dial-fail (DoD condition)

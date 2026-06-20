@@ -312,9 +312,11 @@ git commit -m "feat(pkarr): replace ±30min skew with signed-TTL verify_freshnes
 
 ### Task A3: Surface BEP44 `seq` + in-memory anti-rollback highwater
 
+> **As-shipped note (post bot-review, commit `8e8d07f`):** the highwater is a **bounded `LruCache<[u8;32], u64>` (cap 4096)** with `.put()` / `.get()`, NOT the `HashMap` / `.insert()` shown in the Step-4 code block below. Ephemeral keys rotate per epoch, so the keyspace is unbounded over time — an unbounded map would be a slow memory-growth / DoS vector. LRU eviction only drops best-effort rollback protection for stale keys (which already resets on reboot). Treat the LruCache form as authoritative; the `HashMap` blocks below are the original pre-review sketch.
+
 **Files:**
 - Modify: `crates/harmony-pkarr/src/wire.rs` (return `seq`; add explicit-`seq` test helper)
-- Modify: `crates/harmony-pkarr/src/resolver.rs` (thread `seq`; highwater map + check)
+- Modify: `crates/harmony-pkarr/src/resolver.rs` (thread `seq`; bounded-LRU highwater + check)
 
 **Step 1 — Write the failing test.** Add to the `tests` module in `resolver.rs`:
 
