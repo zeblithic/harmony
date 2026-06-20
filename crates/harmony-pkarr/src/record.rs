@@ -26,14 +26,23 @@ pub struct PkarrRoutingRecord {
     #[serde(rename = "at")]
     pub announced_at_ms: u64,
 
+    /// Signed validity horizon, ms since unix epoch. The record is honored
+    /// while `now <= valid_until_ms`. Covered by `inner_sig`, so it cannot be
+    /// forged or extended by a relay/attacker. No `serde(default)`: a record
+    /// without this field (old wire format, or a stripped field) fails to
+    /// decode and is dropped — the hard cutover that prevents downgrade.
+    #[serde(rename = "vu")]
+    pub valid_until_ms: u64,
+
     /// Ed25519 sig over canonical-CBOR((routing_blob, harmony_identity_pub,
-    /// announced_at_ms)) using the harmony identity Ed25519 key.
+    /// announced_at_ms, valid_until_ms)) using the harmony identity Ed25519 key.
     #[serde(rename = "sg", with = "serde_bytes")]
     pub inner_sig: [u8; 64],
 }
 
-/// Maximum permitted skew between `announced_at_ms` and verifier's `now_ms`.
-pub const SKEW_TOLERANCE_MS: u64 = 30 * 60 * 1000;
+/// Clock-skew allowance for the future-strict lower bound. A record whose
+/// `announced_at_ms` is more than this far in the future is rejected as forged.
+pub const FUTURE_TOLERANCE_MS: u64 = 5 * 60 * 1000;
 
 impl PkarrRoutingRecord {
     /// Build + inner-sign a record. `identity_signing_key` is the harmony
@@ -49,6 +58,7 @@ impl PkarrRoutingRecord {
         routing_blob: alloc::vec::Vec<u8>,
         harmony_identity_pub: [u8; 64],
         announced_at_ms: u64,
+        valid_until_ms: u64,
         identity_signing_key: &SigningKey,
     ) -> Result<Self, PkarrError> {
         // Key-match guard: verifying key from signing key must match the Ed25519
@@ -60,13 +70,18 @@ impl PkarrRoutingRecord {
         if derived_vk.as_bytes() != expected_ed_bytes {
             return Err(PkarrError::IdentityMismatch);
         }
-        let to_sign =
-            canonical_signed_bytes(&routing_blob, &harmony_identity_pub, announced_at_ms)?;
+        let to_sign = canonical_signed_bytes(
+            &routing_blob,
+            &harmony_identity_pub,
+            announced_at_ms,
+            valid_until_ms,
+        )?;
         let sig = identity_signing_key.sign(&to_sign);
         Ok(Self {
             routing_blob,
             harmony_identity_pub,
             announced_at_ms,
+            valid_until_ms,
             inner_sig: sig.to_bytes(),
         })
     }
@@ -84,20 +99,25 @@ impl PkarrRoutingRecord {
             &self.routing_blob,
             &self.harmony_identity_pub,
             self.announced_at_ms,
+            self.valid_until_ms,
         )?;
         vk.verify(&to_verify, &sig)
             .map_err(|_| PkarrError::InnerSignatureInvalid)
     }
 
-    /// Check `announced_at_ms` is within ±SKEW_TOLERANCE_MS of `now_ms`.
-    /// RPK4 silent-drop on failure.
-    pub fn verify_skew(&self, now_ms: u64) -> Result<(), PkarrError> {
-        let diff = self.announced_at_ms.abs_diff(now_ms);
-        if diff > SKEW_TOLERANCE_MS {
-            Err(PkarrError::StaleOrSkewed)
-        } else {
-            Ok(())
+    /// Freshness check (RPK4): reject a record that is forged-future
+    /// (`announced_at_ms > now + FUTURE_TOLERANCE_MS`) or expired
+    /// (`now > valid_until_ms`). The upper bound is the publisher's signed TTL,
+    /// not a wall-clock window — so a valid record stays resolvable for its
+    /// whole committed validity period regardless of republish cadence.
+    pub fn verify_freshness(&self, now_ms: u64) -> Result<(), PkarrError> {
+        if self.announced_at_ms > now_ms.saturating_add(FUTURE_TOLERANCE_MS) {
+            return Err(PkarrError::StaleOrSkewed);
         }
+        if now_ms > self.valid_until_ms {
+            return Err(PkarrError::StaleOrSkewed);
+        }
+        Ok(())
     }
 
     /// Check `harmony_identity_pub` matches an expected identity.
@@ -131,6 +151,7 @@ fn canonical_signed_bytes(
     routing_blob: &[u8],
     harmony_identity_pub: &[u8; 64],
     announced_at_ms: u64,
+    valid_until_ms: u64,
 ) -> Result<alloc::vec::Vec<u8>, PkarrError> {
     // Tuple-as-array: deterministic CBOR ordering. ciborium encodes tuples
     // as CBOR arrays.
@@ -140,6 +161,7 @@ fn canonical_signed_bytes(
             serde_bytes::Bytes::new(routing_blob),
             serde_bytes::Bytes::new(harmony_identity_pub.as_ref()),
             announced_at_ms,
+            valid_until_ms,
         ),
         &mut out,
     )
@@ -169,6 +191,7 @@ mod tests {
             b"opaque-routing-blob".to_vec(),
             identity_pub,
             1_000_000,
+            1_000_000 + 604_800_000,
             &sk,
         )
         .expect("sign");
@@ -181,8 +204,14 @@ mod tests {
     fn verify_inner_sig_accepts_valid() {
         let sk = SigningKey::generate(&mut OsRng);
         let identity_pub = fixture_identity_pubkey(&sk);
-        let rec = PkarrRoutingRecord::sign_new(b"blob".to_vec(), identity_pub, 1_000_000, &sk)
-            .expect("sign");
+        let rec = PkarrRoutingRecord::sign_new(
+            b"blob".to_vec(),
+            identity_pub,
+            1_000_000,
+            1_000_000 + 604_800_000,
+            &sk,
+        )
+        .expect("sign");
         assert!(rec.verify_inner_sig().is_ok());
     }
 
@@ -190,8 +219,14 @@ mod tests {
     fn verify_inner_sig_rejects_tampered_blob() {
         let sk = SigningKey::generate(&mut OsRng);
         let identity_pub = fixture_identity_pubkey(&sk);
-        let mut rec = PkarrRoutingRecord::sign_new(b"blob".to_vec(), identity_pub, 1_000_000, &sk)
-            .expect("sign");
+        let mut rec = PkarrRoutingRecord::sign_new(
+            b"blob".to_vec(),
+            identity_pub,
+            1_000_000,
+            1_000_000 + 604_800_000,
+            &sk,
+        )
+        .expect("sign");
         rec.routing_blob[0] ^= 1;
         assert_eq!(
             rec.verify_inner_sig(),
@@ -203,8 +238,14 @@ mod tests {
     fn verify_inner_sig_rejects_tampered_at() {
         let sk = SigningKey::generate(&mut OsRng);
         let identity_pub = fixture_identity_pubkey(&sk);
-        let mut rec = PkarrRoutingRecord::sign_new(b"blob".to_vec(), identity_pub, 1_000_000, &sk)
-            .expect("sign");
+        let mut rec = PkarrRoutingRecord::sign_new(
+            b"blob".to_vec(),
+            identity_pub,
+            1_000_000,
+            1_000_000 + 604_800_000,
+            &sk,
+        )
+        .expect("sign");
         rec.announced_at_ms += 1;
         assert_eq!(
             rec.verify_inner_sig(),
@@ -212,32 +253,68 @@ mod tests {
         );
     }
 
-    #[test]
-    fn verify_skew_accepts_within_window() {
+    fn signed(at: u64, valid_until: u64) -> PkarrRoutingRecord {
         let sk = SigningKey::generate(&mut OsRng);
         let identity_pub = fixture_identity_pubkey(&sk);
-        // Use 10_000_000 so that subtracting SKEW_TOLERANCE_MS (1_800_000)
-        // does not underflow the u64.
-        let rec = PkarrRoutingRecord::sign_new(b"blob".to_vec(), identity_pub, 10_000_000, &sk)
-            .expect("sign");
-        assert!(rec.verify_skew(10_000_000 + SKEW_TOLERANCE_MS).is_ok());
-        assert!(rec.verify_skew(10_000_000 - SKEW_TOLERANCE_MS).is_ok());
+        PkarrRoutingRecord::sign_new(b"blob".to_vec(), identity_pub, at, valid_until, &sk)
+            .expect("sign")
     }
 
     #[test]
-    fn verify_skew_rejects_outside_window() {
+    fn valid_until_is_signed_and_tamper_proof() {
         let sk = SigningKey::generate(&mut OsRng);
         let identity_pub = fixture_identity_pubkey(&sk);
-        let rec = PkarrRoutingRecord::sign_new(b"blob".to_vec(), identity_pub, 10_000_000, &sk)
-            .expect("sign");
+        let rec = PkarrRoutingRecord::sign_new(
+            b"blob".to_vec(),
+            identity_pub,
+            1_000_000,
+            1_000_000 + 604_800_000, // valid_until = announced + 7d
+            &sk,
+        )
+        .expect("sign");
+        assert_eq!(rec.valid_until_ms, 1_000_000 + 604_800_000);
+        assert!(rec.verify_inner_sig().is_ok());
+
+        // Tampering valid_until must break the inner signature.
+        let mut tampered = rec.clone();
+        tampered.valid_until_ms += 1;
         assert_eq!(
-            rec.verify_skew(10_000_000 + SKEW_TOLERANCE_MS + 1),
-            Err(PkarrError::StaleOrSkewed)
+            tampered.verify_inner_sig(),
+            Err(PkarrError::InnerSignatureInvalid)
         );
-        assert_eq!(
-            rec.verify_skew(10_000_000 - SKEW_TOLERANCE_MS - 1),
-            Err(PkarrError::StaleOrSkewed)
-        );
+    }
+
+    #[test]
+    fn verify_freshness_accepts_old_record_within_ttl() {
+        // Published 1 hour ago, TTL 7 days → resolvable (impossible under ±30min).
+        let now = 10_000_000_000u64;
+        let at = now - 60 * 60 * 1000;
+        let rec = signed(at, at + 604_800_000);
+        assert!(rec.verify_freshness(now).is_ok());
+    }
+
+    #[test]
+    fn verify_freshness_rejects_expired() {
+        let now = 10_000_000_000u64;
+        let at = now - 8 * 24 * 60 * 60 * 1000; // 8 days ago
+        let rec = signed(at, at + 604_800_000); // expired 1 day ago
+        assert_eq!(rec.verify_freshness(now), Err(PkarrError::StaleOrSkewed));
+    }
+
+    #[test]
+    fn verify_freshness_rejects_forged_future() {
+        let now = 10_000_000_000u64;
+        let at = now + FUTURE_TOLERANCE_MS + 1; // beyond skew allowance
+        let rec = signed(at, at + 604_800_000);
+        assert_eq!(rec.verify_freshness(now), Err(PkarrError::StaleOrSkewed));
+    }
+
+    #[test]
+    fn verify_freshness_allows_small_future_skew() {
+        let now = 10_000_000_000u64;
+        let at = now + FUTURE_TOLERANCE_MS - 1; // within allowance
+        let rec = signed(at, at + 604_800_000);
+        assert!(rec.verify_freshness(now).is_ok());
     }
 
     #[test]
@@ -246,8 +323,13 @@ mod tests {
         let other_sk = SigningKey::generate(&mut OsRng);
         // identity_pub encodes `sk`'s verifying key, but we pass `other_sk` as signer.
         let identity_pub = fixture_identity_pubkey(&sk);
-        let result =
-            PkarrRoutingRecord::sign_new(b"blob".to_vec(), identity_pub, 1_000_000, &other_sk);
+        let result = PkarrRoutingRecord::sign_new(
+            b"blob".to_vec(),
+            identity_pub,
+            1_000_000,
+            1_000_000 + 604_800_000,
+            &other_sk,
+        );
         assert_eq!(result, Err(PkarrError::IdentityMismatch));
     }
 
@@ -255,8 +337,14 @@ mod tests {
     fn verify_identity_match_rejects_substitution() {
         let sk = SigningKey::generate(&mut OsRng);
         let identity_pub = fixture_identity_pubkey(&sk);
-        let rec = PkarrRoutingRecord::sign_new(b"blob".to_vec(), identity_pub, 1_000_000, &sk)
-            .expect("sign");
+        let rec = PkarrRoutingRecord::sign_new(
+            b"blob".to_vec(),
+            identity_pub,
+            1_000_000,
+            1_000_000 + 604_800_000,
+            &sk,
+        )
+        .expect("sign");
         let mut wrong = identity_pub;
         wrong[32] ^= 1;
         assert_eq!(

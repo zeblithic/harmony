@@ -19,7 +19,7 @@ use pkarr::{Keypair, PublicKey, SignedPacket};
 /// DNS label carrying the routing record's base64url payload.
 const RECORD_LABEL: &str = "_r";
 /// TTL (seconds) on the TXT record. Not load-bearing — harmony freshness is
-/// governed by PkarrRoutingRecord::verify_skew + epoch rotation, not DNS TTL.
+/// governed by PkarrRoutingRecord::verify_freshness (signed TTL), not DNS TTL.
 const RECORD_TTL: u32 = 300;
 
 /// Encode a routing record's canonical CBOR as a base64url-unpadded string.
@@ -130,6 +130,7 @@ mod tests {
             vec![0xCDu8; 120], // routing_blob big enough to force >255 base64
             id_pub,
             1_000_000,
+            1_000_000 + 604_800_000,
             &sk,
         )
         .expect("sign record")
@@ -192,9 +193,14 @@ mod tests {
         let mut id_pub = [0u8; 64];
         id_pub[32..].copy_from_slice(&sk.verifying_key().to_bytes());
         // routing_blob far over the ~1000-byte v budget once base64'd.
-        let big =
-            crate::record::PkarrRoutingRecord::sign_new(vec![0u8; 3000], id_pub, 1_000_000, &sk)
-                .expect("sign");
+        let big = crate::record::PkarrRoutingRecord::sign_new(
+            vec![0u8; 3000],
+            id_pub,
+            1_000_000,
+            1_000_000 + 604_800_000,
+            &sk,
+        )
+        .expect("sign");
         assert_eq!(
             build_relay_payload(&sk, &big),
             Err(PkarrError::RecordTooLarge)

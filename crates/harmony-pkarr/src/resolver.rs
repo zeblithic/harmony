@@ -84,23 +84,23 @@ impl PkarrResolver {
                     self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
                     return Ok(None);
                 }
-                // RPK4: skew check (±30 min) — silent-drop (cache negative).
-                // Don't cache positively: a record outside the skew window
-                // is invalid, and could become valid if the local clock
-                // corrects, but the publisher's next republish will land
-                // a fresh record anyway. Negative-cache so we don't spam
-                // the relay during the 60s window.
+                // RPK4: freshness check (future-strict + signed TTL) —
+                // silent-drop (cache negative). Don't cache positively: an
+                // expired/forged record is invalid, and the publisher's next
+                // republish will land a fresh record anyway. Negative-cache so
+                // we don't spam the relay during the 60s window.
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .expect("system clock < UNIX epoch is unsupported")
                     .as_millis() as u64;
-                if let Err(e) = record.verify_skew(now_ms) {
+                if let Err(e) = record.verify_freshness(now_ms) {
                     tracing::warn!(
                         key = %key_z32,
                         announced_at_ms = record.announced_at_ms,
+                        valid_until_ms = record.valid_until_ms,
                         now_ms,
                         error = ?e,
-                        "pkarr record outside ±30min skew window — dropping (RPK4)"
+                        "pkarr record failed freshness (expired or forged-future) — dropping (RPK4)"
                     );
                     self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
                     return Ok(None);
@@ -159,18 +159,17 @@ impl PkarrResolver {
             cache.pop(pk);
             return None;
         }
-        // RPK4 re-verification on cache hit: a record cached near the +30min
-        // skew edge could otherwise be served from the 15min positive cache
-        // up to 14min after it falls outside the skew window. Re-check on
-        // every lookup; on skew failure, evict + treat as miss (the next
-        // resolve will go to the relay and either negative-cache or refetch
-        // a fresh record).
+        // RPK4 re-verification on cache hit: a record whose signed TTL expires
+        // during the 15min positive-cache window must not keep being served.
+        // Re-check freshness on every lookup; on failure, evict + treat as miss
+        // (the next resolve will go to the relay and either negative-cache or
+        // refetch a fresh record).
         if let Some(rec) = entry.record.as_ref() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock < UNIX epoch is unsupported")
                 .as_millis() as u64;
-            if rec.verify_skew(now_ms).is_err() {
+            if rec.verify_freshness(now_ms).is_err() {
                 cache.pop(pk);
                 return None;
             }
@@ -226,6 +225,7 @@ mod tests {
                 b"r-blob".to_vec(),
                 identity_pub,
                 now_ms,
+                now_ms + 604_800_000,
                 &identity_sk_clone,
             )
             .expect("sign")
@@ -282,6 +282,7 @@ mod tests {
                 b"cached".to_vec(),
                 identity_pub,
                 now_ms,
+                now_ms + 604_800_000,
                 &identity_sk_clone,
             )
             .expect("sign")
@@ -325,6 +326,7 @@ mod tests {
             b"iroh-routing".to_vec(),
             id_pub,
             now_ms,
+            now_ms + 604_800_000,
             &id_sk,
         )
         .expect("sign");
