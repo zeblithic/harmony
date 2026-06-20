@@ -2,8 +2,9 @@
 //!
 //! Spec Section 5.1. 2-char field keys per harmony convention.
 //! Inner signature binds `(routing_blob, harmony_identity_pub,
-//! announced_at_ms)` to the publisher's harmony Ed25519 identity key —
-//! verified independently of the BEP44 outer (ephemeral) signature.
+//! announced_at_ms, valid_until_ms)` to the publisher's harmony Ed25519
+//! identity key — verified independently of the BEP44 outer (ephemeral)
+//! signature.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};

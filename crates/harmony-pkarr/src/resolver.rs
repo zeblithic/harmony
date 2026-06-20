@@ -3,6 +3,7 @@
 //!
 //! Spec Sections 5.4 + 7.1.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -29,6 +30,11 @@ struct CachedResolution {
 pub struct PkarrResolver {
     relay: Arc<RelayClient>,
     cache: Arc<Mutex<LruCache<[u8; 32], CachedResolution>>>,
+    /// Per-key highest accepted BEP44 `seq`. In-memory anti-rollback: a relay
+    /// replaying a strictly-older (but validly-signed, still-within-TTL) record
+    /// is rejected once a newer one has been seen this session. Boot-lifetime
+    /// only (persisted seq is deferred to the async-DM milestone).
+    seq_highwater: Arc<Mutex<HashMap<[u8; 32], u64>>>,
 }
 
 impl PkarrResolver {
@@ -38,6 +44,7 @@ impl PkarrResolver {
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(1024).expect("nonzero"),
             ))),
+            seq_highwater: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -62,7 +69,7 @@ impl PkarrResolver {
                 // Outer-sig failure (RPK1) OR malformed record (bad TXT/base64/
                 // CBOR) → silent-drop (cache negative). The error field carries
                 // the specific cause.
-                let record = match crate::wire::parse_relay_payload(&pk_bytes, &envelope) {
+                let (record, seq) = match crate::wire::parse_relay_payload(&pk_bytes, &envelope) {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(
@@ -105,10 +112,39 @@ impl PkarrResolver {
                     self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
                     return Ok(None);
                 }
+                // RPK5: in-memory anti-rollback. Reject a strictly-older seq than
+                // the highest accepted for this key (a relay replaying a stale,
+                // still-within-TTL record). Equal seq = same signed bytes → allow
+                // (idempotent re-resolve after cache expiry). Update on accept,
+                // only after every other gate passed so a bad record can't poison
+                // the highwater.
+                {
+                    let mut hw = self.seq_highwater.lock().expect("seq_highwater poisoned");
+                    if let Some(&seen) = hw.get(&pk_bytes) {
+                        if seq < seen {
+                            tracing::warn!(
+                                key = %key_z32,
+                                seq,
+                                seen,
+                                "pkarr record seq rolled back — dropping (RPK5)"
+                            );
+                            self.cache_put(pk_bytes, None, NEGATIVE_CACHE_TTL);
+                            return Ok(None);
+                        }
+                    }
+                    hw.insert(pk_bytes, seq);
+                }
                 self.cache_put(pk_bytes, Some(record.clone()), POSITIVE_CACHE_TTL);
                 Ok(Some(record))
             }
         }
+    }
+
+    /// Test-only: drop any cached resolution for a key, forcing the next
+    /// `resolve` to hit the relay (so seq anti-rollback can be exercised).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn invalidate_for_test(&self, pk: &[u8; 32]) {
+        self.cache.lock().expect("cache poisoned").pop(pk);
     }
 
     /// Resolve any of `keys` (the 3-key epoch tolerance window) in parallel.
@@ -340,5 +376,47 @@ mod tests {
             .expect("resolve")
             .expect("present");
         assert_eq!(got.routing_blob, b"iroh-routing".to_vec());
+    }
+
+    #[tokio::test]
+    async fn rejects_rolled_back_seq() {
+        let relay = MockPkarrRelay::start().await;
+        let pool = crate::relay::RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(crate::relay::RelayClient::new(pool));
+        let resolver = PkarrResolver::new(Arc::clone(&client));
+
+        let ephemeral = SigningKey::generate(&mut OsRng);
+        let vk = ephemeral.verifying_key();
+        let identity_sk = SigningKey::generate(&mut OsRng);
+        let identity_pub = fixture_identity_pubkey(&identity_sk);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let rec = PkarrRoutingRecord::sign_new(
+            b"r".to_vec(),
+            identity_pub,
+            now,
+            now + 604_800_000,
+            &identity_sk,
+        )
+        .expect("sign");
+
+        let key_z32 = crate::wire::z32_for_verifying_key(&vk).unwrap();
+
+        // Publish with a HIGH seq, resolve → accepted, highwater = 200.
+        let hi = crate::wire::build_relay_payload_with_seq(&ephemeral, &rec, 200).unwrap();
+        client.put(&key_z32, &hi).await.unwrap();
+        assert!(resolver.resolve(&vk).await.unwrap().is_some());
+
+        // A relay now serves an OLDER seq for the same key → rolled back → drop.
+        let lo = crate::wire::build_relay_payload_with_seq(&ephemeral, &rec, 100).unwrap();
+        client.put(&key_z32, &lo).await.unwrap();
+        // Bypass the positive cache to force a fresh GET + seq check.
+        resolver.invalidate_for_test(&vk.to_bytes());
+        assert!(
+            resolver.resolve(&vk).await.unwrap().is_none(),
+            "older seq must be rejected as rollback"
+        );
     }
 }
