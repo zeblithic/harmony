@@ -62,7 +62,11 @@ struct ActivePublication {
 /// [`unregister`][PkarrPublisher::unregister] to manage publications.
 pub struct PkarrPublisher {
     relay: Arc<RelayClient>,
-    /// `tokio::sync::Mutex` — held across await points in `drive_pending`.
+    /// `tokio::sync::Mutex`. `drive_pending` acquires it only for brief
+    /// synchronous critical sections — snapshotting the due set, then (after
+    /// each network PUT completes) updating that entry's schedule — and never
+    /// holds it across an `.await`. `try_active_handles`'s `try_lock` therefore
+    /// contends only during those sub-millisecond windows.
     state: Arc<Mutex<HashMap<String, ActivePublication>>>,
     /// Poked from `register` so the background loop wakes immediately for
     /// new publications rather than waiting out the current sleep.
@@ -140,10 +144,13 @@ impl PkarrPublisher {
     /// each network PUT — so contention windows are sub-millisecond and `None`
     /// is rare; callers treat it as "unknown, fall back".
     pub fn try_active_handles(&self) -> Option<Vec<String>> {
-        self.state
-            .try_lock()
-            .ok()
-            .map(|state| state.keys().cloned().collect())
+        self.state.try_lock().ok().map(|state| {
+            // Sorted so synchronous snapshots / equality assertions over the
+            // returned Vec are deterministic (HashMap iteration order is not).
+            let mut handles: Vec<String> = state.keys().cloned().collect();
+            handles.sort();
+            handles
+        })
     }
 
     /// Spawn the background driver. Caller keeps the returned `JoinHandle` so
@@ -367,9 +374,10 @@ mod tests {
 
     /// `try_active_handles` returns the registered handle set without awaiting,
     /// so a synchronous caller (e.g. the Network Health snapshot) can read
-    /// publish state. It returns `Some` whenever the state mutex is uncontended.
+    /// publish state. Returns `Some` whenever the state mutex is uncontended,
+    /// and the handles are sorted for deterministic snapshot output.
     #[tokio::test]
-    async fn try_active_handles_returns_registered_handles() {
+    async fn try_active_handles_returns_sorted_registered_handles() {
         let relay = MockPkarrRelay::start().await;
         let pool = crate::relay::RelayPool::new(vec![relay.base_url.clone()]);
         let client = Arc::new(crate::relay::RelayClient::new(pool));
@@ -394,12 +402,22 @@ mod tests {
             )
             .expect("sign")
         });
+
+        // Register two handles out of sorted order; the accessor returns them
+        // deterministically sorted regardless of HashMap iteration order.
+        publisher
+            .register(
+                "z-last".to_string(),
+                Arc::clone(&key_builder),
+                Arc::clone(&builder),
+            )
+            .await;
         publisher
             .register("identity".to_string(), key_builder, builder)
             .await;
 
         let handles = publisher.try_active_handles().expect("uncontended");
-        assert_eq!(handles, vec!["identity".to_string()]);
+        assert_eq!(handles, vec!["identity".to_string(), "z-last".to_string()]);
     }
 
     /// Regression: every publish must invoke `ephemeral_key_builder` so the
