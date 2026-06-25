@@ -144,13 +144,12 @@ impl PkarrPublisher {
     /// each network PUT — so contention windows are sub-millisecond and `None`
     /// is rare; callers treat it as "unknown, fall back".
     pub fn try_active_handles(&self) -> Option<Vec<String>> {
-        self.state.try_lock().ok().map(|state| {
-            // Sorted so synchronous snapshots / equality assertions over the
-            // returned Vec are deterministic (HashMap iteration order is not).
-            let mut handles: Vec<String> = state.keys().cloned().collect();
-            handles.sort();
-            handles
-        })
+        // Collect under the lock, then release the guard before sorting so the
+        // critical section stays minimal. Sorted output keeps synchronous
+        // snapshots / equality assertions deterministic (HashMap order isn't).
+        let mut handles: Vec<String> = self.state.try_lock().ok()?.keys().cloned().collect();
+        handles.sort();
+        Some(handles)
     }
 
     /// Spawn the background driver. Caller keeps the returned `JoinHandle` so
