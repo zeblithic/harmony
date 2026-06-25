@@ -62,7 +62,11 @@ struct ActivePublication {
 /// [`unregister`][PkarrPublisher::unregister] to manage publications.
 pub struct PkarrPublisher {
     relay: Arc<RelayClient>,
-    /// `tokio::sync::Mutex` — held across await points in `drive_pending`.
+    /// `tokio::sync::Mutex`. `drive_pending` acquires it only for brief
+    /// synchronous critical sections — snapshotting the due set, then (after
+    /// each network PUT completes) updating that entry's schedule — and never
+    /// holds it across an `.await`. `try_active_handles`'s `try_lock` therefore
+    /// contends only during those sub-millisecond windows.
     state: Arc<Mutex<HashMap<String, ActivePublication>>>,
     /// Poked from `register` so the background loop wakes immediately for
     /// new publications rather than waiting out the current sleep.
@@ -129,6 +133,23 @@ impl PkarrPublisher {
     /// Returns the handles of all currently-registered publications.
     pub async fn active_handles(&self) -> Vec<String> {
         self.state.lock().await.keys().cloned().collect()
+    }
+
+    /// Non-blocking variant of [`active_handles`][Self::active_handles] for
+    /// synchronous callers (e.g. `network_health`'s `PkarrSnapshot`, which is a
+    /// sync trait and cannot await). Returns `Some(handles)` when the state
+    /// mutex is uncontended, or `None` if it is momentarily locked by the
+    /// background driver. `drive_pending` never holds this lock across an
+    /// `await` — it clones the due set under the lock, then drops it before
+    /// each network PUT — so contention windows are sub-millisecond and `None`
+    /// is rare; callers treat it as "unknown, fall back".
+    pub fn try_active_handles(&self) -> Option<Vec<String>> {
+        // Collect under the lock, then release the guard before sorting so the
+        // critical section stays minimal. Sorted output keeps synchronous
+        // snapshots / equality assertions deterministic (HashMap order isn't).
+        let mut handles: Vec<String> = self.state.try_lock().ok()?.keys().cloned().collect();
+        handles.sort();
+        Some(handles)
     }
 
     /// Spawn the background driver. Caller keeps the returned `JoinHandle` so
@@ -348,6 +369,54 @@ mod tests {
         publisher.unregister("to-remove").await;
 
         assert!(publisher.active_handles().await.is_empty());
+    }
+
+    /// `try_active_handles` returns the registered handle set without awaiting,
+    /// so a synchronous caller (e.g. the Network Health snapshot) can read
+    /// publish state. Returns `Some` whenever the state mutex is uncontended,
+    /// and the handles are sorted for deterministic snapshot output.
+    #[tokio::test]
+    async fn try_active_handles_returns_sorted_registered_handles() {
+        let relay = MockPkarrRelay::start().await;
+        let pool = crate::relay::RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(crate::relay::RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(Arc::clone(&client)));
+
+        // Empty (but readable) before any registration.
+        assert_eq!(publisher.try_active_handles(), Some(Vec::new()));
+
+        let key_builder: EphemeralKeyBuilder =
+            Arc::new(move |_at_ms| SigningKey::generate(&mut OsRng));
+        let identity_sk = SigningKey::generate(&mut OsRng);
+        let mut identity_pub = [0u8; 64];
+        identity_pub[32..].copy_from_slice(&identity_sk.verifying_key().to_bytes());
+        let id_sk = identity_sk.clone();
+        let builder: RecordBuilder = Arc::new(move |at_ms| {
+            PkarrRoutingRecord::sign_new(
+                b"blob".to_vec(),
+                identity_pub,
+                at_ms,
+                at_ms + 604_800_000,
+                &id_sk,
+            )
+            .expect("sign")
+        });
+
+        // Register two handles out of sorted order; the accessor returns them
+        // deterministically sorted regardless of HashMap iteration order.
+        publisher
+            .register(
+                "z-last".to_string(),
+                Arc::clone(&key_builder),
+                Arc::clone(&builder),
+            )
+            .await;
+        publisher
+            .register("identity".to_string(), key_builder, builder)
+            .await;
+
+        let handles = publisher.try_active_handles().expect("uncontended");
+        assert_eq!(handles, vec!["identity".to_string(), "z-last".to_string()]);
     }
 
     /// Regression: every publish must invoke `ephemeral_key_builder` so the
