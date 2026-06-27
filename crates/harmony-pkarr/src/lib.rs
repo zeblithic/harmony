@@ -23,6 +23,7 @@ pub mod error;
 pub mod publisher;
 pub mod record;
 pub mod relay;
+pub mod rendezvous;
 pub mod resolver;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod testing;
@@ -34,4 +35,8 @@ pub use error::PkarrError;
 pub use publisher::{EphemeralKeyBuilder, PkarrPublisher, RecordBuilder};
 pub use record::{PkarrRoutingRecord, FUTURE_TOLERANCE_MS};
 pub use relay::{RelayClient, RelayConfig, RelayHealth, RelayOutcome, RelayPool, RelayState};
+pub use rendezvous::{
+    resolve_rendezvous_with, slot_for_advertiser, PkarrSlotResolver, RendezvousResolveConfig,
+    RendezvousResolveOutcome, SlotResolver,
+};
 pub use resolver::PkarrResolver;
