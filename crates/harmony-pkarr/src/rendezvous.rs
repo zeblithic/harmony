@@ -15,6 +15,7 @@ use crate::epoch::epoch_tolerance_window;
 use crate::resolver::PkarrResolver;
 use std::sync::Arc;
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 /// Widening schedule + per-batch deadline for an escalating rendezvous resolve.
 pub struct RendezvousResolveConfig {
@@ -66,8 +67,13 @@ impl<P> Default for RendezvousResolveOutcome<P> {
 /// freshness-valid record decoded into `P`. The production impl
 /// ([`PkarrSlotResolver`]) derives the slot verifying-key and queries pkarr;
 /// tests inject a deterministic stub.
+///
+/// `P: Send` is part of the contract: the `#[async_trait]` futures are
+/// `Send`-boxed and the driver runs them in a `Send` task, so any payload type
+/// must cross threads — declaring it here makes the requirement explicit instead
+/// of surfacing as a confusing impl-site error.
 #[async_trait::async_trait]
-pub trait SlotResolver<P> {
+pub trait SlotResolver<P: Send> {
     async fn resolve_slot(&self, slot_index: u16, epoch_id: u64) -> Option<P>;
 }
 
@@ -79,7 +85,7 @@ pub trait SlotResolver<P> {
 /// can never stall discovery. Each batch is bounded by `cfg.per_batch_deadline`:
 /// on the deadline elapsing OR all probes returning `None`, widen to the next
 /// width. Returns an empty outcome (cold start) if no slot answers.
-pub async fn resolve_rendezvous_with<P, R: SlotResolver<P> + Sync>(
+pub async fn resolve_rendezvous_with<P: Send, R: SlotResolver<P> + Sync>(
     resolver: &R,
     now_ms: u64,
     cfg: &RendezvousResolveConfig,
@@ -92,11 +98,17 @@ pub async fn resolve_rendezvous_with<P, R: SlotResolver<P> + Sync>(
 
     for &width in &cfg.batch_curve {
         outcome.batches_tried += 1;
+        // Clamp the batch width into the u16 slot space before casting: a width
+        // at/above 65_536 would wrap `width as u16` (65_536 -> 0) and silently
+        // probe an empty range. Consumers are expected to clamp to their own slot
+        // count, but the kernel defends itself against a misconfigured curve.
+        let slot_count = width.min(usize::from(u16::MAX) + 1);
         // Probe every (slot, epoch) pair in this batch concurrently, draining
         // them as they complete so the FIRST live slot wins without waiting on
         // slower/hung probes. Bounded by the per-batch deadline.
-        let mut probes: FuturesUnordered<_> = (0..width as u16)
+        let mut probes: FuturesUnordered<_> = (0..slot_count)
             .flat_map(|slot| {
+                let slot = slot as u16;
                 epoch_window.iter().map(move |&epoch_id| async move {
                     resolver
                         .resolve_slot(slot, epoch_id)
@@ -145,16 +157,24 @@ pub async fn resolve_rendezvous_with<P, R: SlotResolver<P> + Sync>(
 /// Production [`SlotResolver`]: derives the per-slot verifying-key from `ikm`
 /// under `case` + the consumer's `info_for(slot, epoch)` layout, queries pkarr,
 /// re-samples freshness AFTER the await, and decodes the routing blob into `P`.
-/// The BEP44 envelope already proves the writer held the shared secret, so the
-/// inner identity signature is intentionally NOT verified here — trust is
-/// established at the consumer's handshake/admission layer.
+///
+/// [`PkarrResolver::resolve`] already verifies the outer BEP44 envelope (proving
+/// the writer held the per-slot key derived from `ikm`) AND the record's inner
+/// identity signature. What this layer does NOT do is bind that identity to a
+/// *trusted* beacon: a rendezvous joiner may not know the beacon's identity in
+/// advance, so the trust decision is deferred to the consumer's
+/// handshake/admission layer.
+///
+/// `ikm` is held in a [`Zeroizing`] buffer — for shared-secret cases (e.g.
+/// [`PkarrCase::Friend`]) it is sensitive key material that should not linger in
+/// freed memory.
 pub struct PkarrSlotResolver<P, F>
 where
     F: Fn(&[u8]) -> Option<P>,
 {
     pub pkarr: Arc<PkarrResolver>,
     pub case: PkarrCase,
-    pub ikm: Vec<u8>,
+    pub ikm: Zeroizing<Vec<u8>>,
     pub info_for: Arc<dyn Fn(u16, u64) -> Vec<u8> + Send + Sync>,
     pub decode: F,
 }
@@ -168,7 +188,18 @@ where
     async fn resolve_slot(&self, slot_index: u16, epoch_id: u64) -> Option<P> {
         let info = (self.info_for)(slot_index, epoch_id);
         let vk = derive_ephemeral_key(self.case, &self.ikm, &info).verifying_key();
-        let rec = self.pkarr.resolve(&vk).await.ok()??;
+        // Both a hard backend error and a clean miss yield `None` (a failed probe
+        // is "no beacon at this slot — widen/retry"), but log the error case so a
+        // DHT/relay outage is diagnosable instead of silently looking like an
+        // empty slot.
+        let rec = match self.pkarr.resolve(&vk).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::debug!(slot = slot_index, error = ?e, "rendezvous slot probe errored — treating as a miss");
+                return None;
+            }
+        };
         // Re-sample the wall clock AFTER the awaited resolve so freshness is
         // checked against "now", not a timestamp captured before a possibly long
         // network round-trip (the stale-clock bug fixed in PR#306).
@@ -191,7 +222,10 @@ pub fn slot_for_advertiser<A: Ord + Copy>(advertisers: &[A], me: &A, cap: usize)
     sorted.sort_unstable();
     sorted.dedup();
     let rank = sorted.iter().position(|a| a == me)?;
-    if rank >= cap {
+    // Reject ranks at/beyond the cap, and any rank not representable as a u16
+    // slot index — truncating `rank as u16` would alias two advertisers onto the
+    // same slot, breaking the one-writer-per-slot guarantee.
+    if rank >= cap || rank > usize::from(u16::MAX) {
         return None;
     }
     Some(rank as u16)
