@@ -21,8 +21,11 @@ use zeroize::Zeroizing;
 pub struct RendezvousResolveConfig {
     /// Widening curve of batch widths, e.g. `[1, 2, 4]`: probe slot 0, then
     /// slots 0..1, then slots 0..3. `[1]` is the degenerate single-slot resolve
-    /// (the friend Case-D shape). Each width should already be clamped to the
-    /// consumer's slot count — the driver probes `0..width` verbatim.
+    /// (the friend Case-D shape). Each width should be clamped to the consumer's
+    /// slot count: the driver fans out one concurrent probe per (slot, epoch)
+    /// pair across `0..width`, so realistic curves are a handful of slots, not
+    /// thousands. The kernel additionally caps each width to the u16 slot space
+    /// as a backstop against a wrapped cast.
     pub batch_curve: Vec<usize>,
     /// Per-batch resolve deadline: on it elapsing, widen to the next batch
     /// rather than hanging on a slow/stuck probe.
@@ -72,6 +75,11 @@ impl<P> Default for RendezvousResolveOutcome<P> {
 /// `Send`-boxed and the driver runs them in a `Send` task, so any payload type
 /// must cross threads — declaring it here makes the requirement explicit instead
 /// of surfacing as a confusing impl-site error.
+///
+/// Implementations should be **cancellation-safe**: the driver drops in-flight
+/// `resolve_slot` futures when another slot wins the batch or when the per-batch
+/// deadline elapses, so avoid non-idempotent side effects that can't be safely
+/// abandoned mid-probe.
 #[async_trait::async_trait]
 pub trait SlotResolver<P: Send> {
     async fn resolve_slot(&self, slot_index: u16, epoch_id: u64) -> Option<P>;
@@ -217,11 +225,13 @@ where
 /// at/beyond `cap`. Because the advertiser set is consumer-replicated (e.g. a
 /// CRDT), every member computes the same ordering, so each slot has exactly one
 /// writer.
-pub fn slot_for_advertiser<A: Ord + Copy>(advertisers: &[A], me: &A, cap: usize) -> Option<u16> {
-    let mut sorted: Vec<A> = advertisers.to_vec();
+pub fn slot_for_advertiser<A: Ord>(advertisers: &[A], me: &A, cap: usize) -> Option<u16> {
+    // Borrow rather than copy so non-`Copy` ordered identifiers (e.g. `String`,
+    // `Vec<u8>`) work, not just fixed-size keys.
+    let mut sorted: Vec<&A> = advertisers.iter().collect();
     sorted.sort_unstable();
     sorted.dedup();
-    let rank = sorted.iter().position(|a| a == me)?;
+    let rank = sorted.iter().position(|a| *a == me)?;
     // Reject ranks at/beyond the cap, and any rank not representable as a u16
     // slot index — truncating `rank as u16` would alias two advertisers onto the
     // same slot, breaking the one-writer-per-slot guarantee.
