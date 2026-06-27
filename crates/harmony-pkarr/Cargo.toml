@@ -28,6 +28,9 @@ tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 tracing = { workspace = true }
 lru = { workspace = true }
 futures = { workspace = true }
+# async-trait: the rendezvous SlotResolver is an async trait (the rest of the
+# crate uses inherent async fns; this is the one trait that needs it).
+async-trait = { workspace = true }
 pkarr = { workspace = true }
 base64 = { workspace = true, default-features = false, features = ["alloc"] }
 bytes = { workspace = true }
