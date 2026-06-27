@@ -173,18 +173,44 @@ pub async fn resolve_rendezvous_with<P: Send, R: SlotResolver<P> + Sync>(
 /// advance, so the trust decision is deferred to the consumer's
 /// handshake/admission layer.
 ///
-/// `ikm` is held in a [`Zeroizing`] buffer — for shared-secret cases (e.g.
-/// [`PkarrCase::Friend`]) it is sensitive key material that should not linger in
-/// freed memory.
+/// Construct with [`PkarrSlotResolver::new`]. `ikm` is held in a private
+/// [`Zeroizing`] buffer and never exposed as a public field — for shared-secret
+/// cases (e.g. [`PkarrCase::Friend`]) it is sensitive key material, and keeping
+/// it private prevents callers from cloning the raw bytes out of the resolver or
+/// leaving an un-zeroized copy behind.
 pub struct PkarrSlotResolver<P, F>
 where
     F: Fn(&[u8]) -> Option<P>,
 {
-    pub pkarr: Arc<PkarrResolver>,
-    pub case: PkarrCase,
-    pub ikm: Zeroizing<Vec<u8>>,
-    pub info_for: Arc<dyn Fn(u16, u64) -> Vec<u8> + Send + Sync>,
-    pub decode: F,
+    pkarr: Arc<PkarrResolver>,
+    case: PkarrCase,
+    ikm: Zeroizing<Vec<u8>>,
+    info_for: Arc<dyn Fn(u16, u64) -> Vec<u8> + Send + Sync>,
+    decode: F,
+}
+
+impl<P, F> PkarrSlotResolver<P, F>
+where
+    F: Fn(&[u8]) -> Option<P>,
+{
+    /// Build a pkarr-backed slot resolver. `ikm` is taken by value and wrapped
+    /// in a [`Zeroizing`] buffer internally, so the secret never lives in a
+    /// public field the caller could clone or read back.
+    pub fn new(
+        pkarr: Arc<PkarrResolver>,
+        case: PkarrCase,
+        ikm: Vec<u8>,
+        info_for: Arc<dyn Fn(u16, u64) -> Vec<u8> + Send + Sync>,
+        decode: F,
+    ) -> Self {
+        Self {
+            pkarr,
+            case,
+            ikm: Zeroizing::new(ikm),
+            info_for,
+            decode,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -304,6 +330,12 @@ mod tests {
         }
     }
 
+    // A `now_ms` deep inside a non-zero epoch so `epoch_tolerance_window` returns
+    // three DISTINCT epoch ids ([e-1, e, e+1]) instead of a saturated window with
+    // epoch 0 duplicated ([0, 0, 1]) — the per-epoch probe fan-out is then
+    // exercised honestly even though the stub ignores `epoch_id`.
+    const TEST_NOW_MS: u64 = 1_000_000_000_000;
+
     fn community_curve() -> RendezvousResolveConfig {
         RendezvousResolveConfig {
             batch_curve: vec![1, 2, 4],
@@ -314,7 +346,7 @@ mod tests {
     #[tokio::test]
     async fn returns_slot0_without_widening_when_slot0_is_live() {
         let stub = StubResolver { live_slot: Some(0) };
-        let out = resolve_rendezvous_with(&stub, 1_000_000, &community_curve()).await;
+        let out = resolve_rendezvous_with(&stub, TEST_NOW_MS, &community_curve()).await;
         assert_eq!(out.winning_slot, Some(0));
         assert_eq!(
             out.batches_tried, 1,
@@ -326,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn widens_to_find_a_live_slot_when_slot0_is_dead() {
         let stub = StubResolver { live_slot: Some(2) }; // only slot 2 answers
-        let out = resolve_rendezvous_with(&stub, 1_000_000, &community_curve()).await;
+        let out = resolve_rendezvous_with(&stub, TEST_NOW_MS, &community_curve()).await;
         assert_eq!(out.winning_slot, Some(2));
         assert!(out.batches_tried >= 3, "had to widen to the full set");
         assert_eq!(out.payload, Some(Beacon(2)));
@@ -335,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn cold_start_returns_none() {
         let stub = StubResolver { live_slot: None };
-        let out = resolve_rendezvous_with(&stub, 1_000_000, &community_curve()).await;
+        let out = resolve_rendezvous_with(&stub, TEST_NOW_MS, &community_curve()).await;
         assert_eq!(out.payload, None);
         assert_eq!(out.winning_slot, None);
     }
@@ -360,7 +392,7 @@ mod tests {
     async fn hung_probe_does_not_block_a_live_higher_slot() {
         let out = tokio::time::timeout(
             Duration::from_secs(10),
-            resolve_rendezvous_with(&HungSlot0Resolver, 1_000_000, &community_curve()),
+            resolve_rendezvous_with(&HungSlot0Resolver, TEST_NOW_MS, &community_curve()),
         )
         .await
         .expect("resolve must not hang on a stuck slot-0 probe");
@@ -378,13 +410,13 @@ mod tests {
             per_batch_deadline: Duration::from_millis(2_500),
         };
         let live = StubResolver { live_slot: Some(0) };
-        let out = resolve_rendezvous_with(&live, 1_000_000, &cfg).await;
+        let out = resolve_rendezvous_with(&live, TEST_NOW_MS, &cfg).await;
         assert_eq!(out.winning_slot, Some(0));
         assert_eq!(out.batches_tried, 1);
         assert_eq!(out.payload, Some(Beacon(0)));
         // A single-slot curve must NOT probe slot 1 even if slot 1 is "live".
         let only_slot1 = StubResolver { live_slot: Some(1) };
-        let out2 = resolve_rendezvous_with(&only_slot1, 1_000_000, &cfg).await;
+        let out2 = resolve_rendezvous_with(&only_slot1, TEST_NOW_MS, &cfg).await;
         assert_eq!(
             out2.payload, None,
             "single-slot curve must not probe slot 1"
