@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn single_genesis() {
         let g = make_genesis([0x01; 16], [0xAA; 16], 1000);
-        let dag = Dag::build(&[g.clone()]).unwrap();
+        let dag = Dag::build(std::slice::from_ref(&g)).unwrap();
         assert_eq!(dag.genesis, g.id);
         assert_eq!(dag.ops.len(), 1);
     }

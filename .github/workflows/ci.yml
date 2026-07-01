@@ -1,0 +1,75 @@
+name: CI
+
+# ZEB-479: first CI for the harmony workspace. Two parallel jobs mirroring
+# harmony-client's proven split (fmt+clippy / nextest), minus the Tauri and
+# frontend machinery this repo doesn't have. An MSRV job (workspace declares
+# rust-version = "1.85") is deliberately deferred until the claim is verified
+# locally — see the ZEB-479 PR discussion.
+on:
+  push:
+
+# push-only trigger (matches harmony-client; solo-org repo, no fork PRs), so
+# the concurrency key is the ref — there is no pull_request event to read.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust-check:
+    name: Rust — fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Build scripts / tests from third-party crates run in these jobs;
+          # don't leave the GITHUB_TOKEN persisted in git config for them.
+          persist-credentials: false
+
+      # mold: link-time is a large share of --all-targets builds.
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      # The ZEB-479 gate: the whole point of that sweep is that this stays 0.
+      # --locked so CI tests the same dep graph contributors run locally.
+      - name: clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  rust-test:
+    name: Rust — test (nextest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Build scripts / tests from third-party crates run in these jobs;
+          # don't leave the GITHUB_TOKEN persisted in git config for them.
+          persist-credentials: false
+
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+
+      # Precompiled nextest binary in ~5s vs ~3min for cargo install.
+      - uses: taiki-e/install-action@ec28e287910af896fd98e04056d31fa68607e7ad # v2.77.4
+        with:
+          tool: cargo-nextest
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: nextest
+        run: cargo nextest run --locked --workspace --all-targets --no-fail-fast

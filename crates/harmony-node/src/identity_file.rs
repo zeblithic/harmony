@@ -207,7 +207,7 @@ mod tests {
     fn load_truncated_file_fails() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("identity.key");
-        std::fs::write(&path, &[VERSION; 10]).unwrap();
+        std::fs::write(&path, [VERSION; 10]).unwrap();
         let err = load(&path).unwrap_err();
         assert!(err.contains("161"), "expected length error, got: {err}");
     }
@@ -216,7 +216,7 @@ mod tests {
     fn load_empty_file_fails() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("identity.key");
-        std::fs::write(&path, &[]).unwrap();
+        std::fs::write(&path, []).unwrap();
         let err = load(&path).unwrap_err();
         assert!(err.contains("161"), "expected length error, got: {err}");
     }
@@ -225,7 +225,7 @@ mod tests {
     fn load_oversized_file_fails() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("identity.key");
-        std::fs::write(&path, &[VERSION; 200]).unwrap();
+        std::fs::write(&path, [VERSION; 200]).unwrap();
         let err = load(&path).unwrap_err();
         assert!(err.contains("161"), "expected length error, got: {err}");
     }

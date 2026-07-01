@@ -413,7 +413,7 @@ mod tests {
         let bf = BloomFilter::new(100_000, 0.001);
         let m = bf.num_bits();
         assert!(
-            m >= 1_400_000 && m <= 1_500_000,
+            (1_400_000..=1_500_000).contains(&m),
             "expected m in 1.4M-1.5M, got {m}"
         );
         assert_eq!(bf.num_hashes(), 10, "expected k=10 for 0.1% FP rate");
@@ -423,7 +423,10 @@ mod tests {
     fn new_sizes_correctly_for_1k_items() {
         let bf = BloomFilter::new(1_000, 0.001);
         let m = bf.num_bits();
-        assert!(m >= 14_000 && m <= 15_000, "expected m in 14K-15K, got {m}");
+        assert!(
+            (14_000..=15_000).contains(&m),
+            "expected m in 14K-15K, got {m}"
+        );
         assert_eq!(bf.num_hashes(), 10, "expected k=10 for 0.1% FP rate");
     }
 

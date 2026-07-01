@@ -787,12 +787,12 @@ mod tests {
 
     #[test]
     fn folder_kind_roundtrip() {
-        for i in 0..FOLDER_COUNT {
+        for (i, name) in FOLDER_NAMES.iter().enumerate() {
             let kind = FolderKind::from_u8(i as u8).unwrap();
             assert_eq!(kind as u8, i as u8);
-            assert_eq!(kind.name(), FOLDER_NAMES[i]);
+            assert_eq!(kind.name(), *name);
         }
-        assert!(FolderKind::from_u8(4).is_none());
+        assert!(FolderKind::from_u8(FOLDER_COUNT as u8).is_none());
     }
 
     #[test]

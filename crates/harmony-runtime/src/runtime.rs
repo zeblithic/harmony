@@ -2311,8 +2311,13 @@ impl<B: BookStore> NodeRuntime<B> {
     fn dispatch_discovery_actions(&mut self, actions: Vec<harmony_discovery::DiscoveryAction>) {
         use harmony_discovery::DiscoveryAction;
         for action in actions {
-            match action {
-                DiscoveryAction::PublishAnnounce { record } => match record.serialize() {
+            // Only PublishAnnounce is handled here. SetLiveliness requires
+            // Zenoh liveliness token wiring (future work). Tunnel hint
+            // processing is done at the call site (after staleness check)
+            // rather than here via IdentityDiscovered, because
+            // IdentityDiscovered requires Zenoh liveliness tokens (not wired).
+            if let DiscoveryAction::PublishAnnounce { record } = action {
+                match record.serialize() {
                     Ok(bytes) => {
                         let identity_hex = hex::encode(self.local_pq_identity_hash);
                         let key_expr =
@@ -2325,12 +2330,7 @@ impl<B: BookStore> NodeRuntime<B> {
                     Err(e) => {
                         tracing::warn!(?e, "failed to serialize local announce record");
                     }
-                },
-                // SetLiveliness requires Zenoh liveliness token wiring (future work).
-                // Tunnel hint processing is done at the call site (after staleness
-                // check) rather than here via IdentityDiscovered, because
-                // IdentityDiscovered requires Zenoh liveliness tokens (not wired).
-                _ => {}
+                }
             }
         }
     }
@@ -4335,6 +4335,10 @@ enum ParsedCompute {
 }
 
 #[cfg(test)]
+// ZEB-479: tests below build configs by tweaking single knobs off Default —
+// the incremental form keeps the knob under test visible; the struct-literal
+// form the lint suggests can't express the nested `schedule.*` fields anyway.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -5898,7 +5902,6 @@ mod tests {
         harmony_identity::PqPrivateIdentity,
         [u8; 32],
     ) {
-        use harmony_content::replica::ReplicaStore;
         use rand::rngs::OsRng;
 
         let (mut rt, _) = make_runtime();
@@ -6036,11 +6039,11 @@ mod tests {
     fn pull_with_token_unknown_issuer_rejected() {
         use rand::rngs::OsRng;
 
-        let (mut rt, _owner, cid) = setup_pull_with_token_runtime();
+        let (rt, _owner, cid) = setup_pull_with_token_runtime();
 
         // Create a different identity not known to the runtime.
         let stranger = harmony_identity::PqPrivateIdentity::generate(&mut OsRng);
-        let stranger_hash = stranger.public_identity().address_hash;
+        let _stranger_hash = stranger.public_identity().address_hash;
 
         let requester_hash = [0x42; 16];
         let token = stranger

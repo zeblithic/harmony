@@ -464,7 +464,7 @@ mod tests {
         // Convex combination must be in [0, 2] for each element
         for (i, &v) in result_vals.iter().enumerate() {
             assert!(
-                v >= -0.01 && v <= 2.01,
+                (-0.01..=2.01).contains(&v),
                 "element {i} = {v} is outside convex hull [0, 2]"
             );
         }

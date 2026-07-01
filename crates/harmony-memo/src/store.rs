@@ -167,8 +167,8 @@ impl MemoStore {
         let entries: Vec<(MemoKey, u32)> = postcard::from_bytes(data)?;
         let mut loaded = 0;
         for (key, count) in entries {
-            if self.lfu_counts.contains_key(&key) {
-                self.lfu_counts.insert(key, count);
+            if let std::collections::hash_map::Entry::Occupied(mut e) = self.lfu_counts.entry(key) {
+                e.insert(count);
                 loaded += 1;
             }
         }

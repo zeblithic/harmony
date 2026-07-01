@@ -144,7 +144,7 @@ mod tests {
         let data = b"encrypted payload";
         let cid = store.insert_with_flags(data, flags).unwrap();
         assert_eq!(cid.cid_type(), CidType::Book);
-        assert_eq!(cid.flags().encrypted, true);
+        assert!(cid.flags().encrypted);
         assert_eq!(store.get(&cid).unwrap(), data);
         assert!(store.contains(&cid));
     }

@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn kitri_result_alias_works() {
         let ok: KitriResult<u32> = Ok(42);
-        assert_eq!(ok.unwrap(), 42);
+        assert!(matches!(ok, Ok(42)));
 
         let err: KitriResult<u32> = Err(KitriError::IntegrityViolation);
         assert!(err.is_err());

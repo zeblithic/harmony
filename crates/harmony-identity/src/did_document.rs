@@ -285,7 +285,7 @@ mod tests {
         #[test]
         fn parse_ed25519_jwk_document() {
             let key_bytes = [42u8; 32];
-            let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key_bytes);
+            let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_bytes);
             let did = "did:web:example.com";
             let json = ed25519_jwk_document(did, &key_b64);
             let doc = parse_did_document(did, json.as_bytes()).unwrap();
@@ -423,7 +423,7 @@ mod tests {
         #[test]
         fn web_resolver_resolves_did_web() {
             let key_bytes = [42u8; 32];
-            let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key_bytes);
+            let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_bytes);
             let did = "did:web:example.com";
             let json = alloc::format!(
                 r#"{{
@@ -450,8 +450,8 @@ mod tests {
         fn web_resolver_resolve_document_returns_all_keys() {
             let key1 = [1u8; 32];
             let key2 = [2u8; 32];
-            let b64_1 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key1);
-            let b64_2 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&key2);
+            let b64_1 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key1);
+            let b64_2 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key2);
             let did = "did:web:example.com";
             let json = alloc::format!(
                 r#"{{

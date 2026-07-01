@@ -121,6 +121,11 @@ pub struct ArchivistConfig {
 
 /// Speculation thresholds for UQ-gated speculative decoding.
 /// All fields are optional — defaults come from `SpecDecConfig::default()`.
+// ZEB-479: fields are read only under `--features inference` (the
+// spec_dec_config wiring in event_loop.rs). They must stay in default builds
+// too: this struct is `deny_unknown_fields` config-file surface, so dropping
+// them would reject configs that set speculation knobs.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct SpeculationConfig {

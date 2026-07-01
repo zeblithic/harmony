@@ -529,6 +529,10 @@ impl ModelWeights {
     ///
     /// The caller owns the [`InferenceCache`] and passes it in on every call.
     /// This method advances `cache.position` by the number of input tokens.
+    // ZEB-479: no caller today — production paths go through
+    // forward_with_engram — but this is the canonical non-Engram entry point;
+    // kept for API symmetry with the Engram research harness (ZEB-102 lineage).
+    #[allow(dead_code)]
     pub(crate) fn forward(&self, input: &Tensor, cache: &mut InferenceCache) -> Result<Tensor> {
         self.forward_with_engram(input, cache, None)
     }

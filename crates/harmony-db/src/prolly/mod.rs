@@ -5,9 +5,15 @@ pub(crate) mod node;
 
 use crate::error::DbError;
 use crate::types::Entry;
-use chunker::{chunk_items, ChunkerConfig};
+// chunk_items + BranchEntry are only consumed by the test-only build_tree
+// reference implementation below.
+#[cfg(test)]
+use chunker::chunk_items;
+use chunker::ChunkerConfig;
 use harmony_content::ContentId;
-use node::{BranchEntry, LeafEntry, Node};
+#[cfg(test)]
+use node::BranchEntry;
+use node::{LeafEntry, Node};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -173,15 +179,13 @@ impl ProllyTree {
             Ok(false)
         }
     }
-
-    #[cfg(test)]
-    fn rebuild_tree(&mut self, data_dir: &Path) -> Result<Option<ContentId>, DbError> {
-        self.root = build_tree(&self.cache, &self.config, data_dir)?;
-        Ok(self.root)
-    }
 }
 
 /// Build a Prolly Tree bottom-up from sorted entries. Returns root CID.
+// ZEB-479: test-only — the mutate.rs/diff.rs tests use this as the reference
+// implementation to validate incremental updates against; production trees
+// are built incrementally via `mutate`. Un-gate if a bulk-build path lands.
+#[cfg(test)]
 pub(crate) fn build_tree(
     entries: &[Entry],
     config: &ChunkerConfig,

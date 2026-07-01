@@ -465,7 +465,7 @@ mod tests {
         let payload_b64 = B64.encode(r#"{"iss":"i","sub":"h"}"#.as_bytes());
         let signing_input = format!("{header_b64}.{payload_b64}");
         let issuer_sig = issuer.sign(signing_input.as_bytes());
-        let sig_b64 = B64.encode(&issuer_sig);
+        let sig_b64 = B64.encode(issuer_sig);
         let sd_jwt_without_kb = format!("{signing_input}.{sig_b64}~");
         let sd_hash = B64.encode(Sha256::digest(sd_jwt_without_kb.as_bytes()));
 
@@ -477,7 +477,7 @@ mod tests {
         let kb_payload_b64 = B64.encode(serde_json::to_vec(&kb_payload).unwrap());
         let kb_si = format!("{kb_header_b64}.{kb_payload_b64}");
         let kb_sig = holder.sign(kb_si.as_bytes());
-        let kb_jwt = format!("{kb_si}.{}", B64.encode(&kb_sig));
+        let kb_jwt = format!("{kb_si}.{}", B64.encode(kb_sig));
 
         let sd_jwt = SdJwt {
             header: JwsHeader {
@@ -529,7 +529,7 @@ mod tests {
         let payload_b64 = B64.encode(r#"{"iss":"issuer","sub":"holder"}"#.as_bytes());
         let signing_input = format!("{header_b64}.{payload_b64}");
         let issuer_sig = issuer.sign(signing_input.as_bytes());
-        let sig_b64 = B64.encode(&issuer_sig);
+        let sig_b64 = B64.encode(issuer_sig);
         let sd_jwt_without_kb = format!("{signing_input}.{sig_b64}~");
         let sd_hash = B64.encode(Sha256::digest(sd_jwt_without_kb.as_bytes()));
 
@@ -544,7 +544,7 @@ mod tests {
         let kb_payload_b64 = B64.encode(serde_json::to_vec(&kb_payload).unwrap());
         let kb_si = format!("{kb_header_b64}.{kb_payload_b64}");
         let kb_sig = holder.sign(kb_si.as_bytes());
-        let kb_jwt = format!("{kb_si}.{}", B64.encode(&kb_sig));
+        let kb_jwt = format!("{kb_si}.{}", B64.encode(kb_sig));
 
         let sd_jwt = SdJwt {
             header: JwsHeader {

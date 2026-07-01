@@ -824,8 +824,8 @@ impl<B: BookStore> StorageTier<B> {
                     self.archive_used_bytes = self.archive_used_bytes.saturating_sub(entry_size);
                     self.archive_lru.retain(|c| c != &cid);
                 }
-                if !self.disk_index.contains_key(&cid) {
-                    self.disk_index.insert(cid, size);
+                if let std::collections::hash_map::Entry::Vacant(e) = self.disk_index.entry(cid) {
+                    e.insert(size);
                     self.disk_lru.push_back(cid);
                     self.disk_used_bytes += size;
                 }

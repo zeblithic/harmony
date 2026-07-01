@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn pads_small_payload_to_block_boundary() {
-        let (mut a, mut b) = MockSocket::pair(MAC_A, MAC_B);
+        let (a, mut b) = MockSocket::pair(MAC_A, MAC_B);
         // Wrap sender only.
         let mut padded = PaddedSocket::new(a, 1024);
 
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn pads_medium_payload() {
-        let (mut a, mut b) = MockSocket::pair(MAC_A, MAC_B);
+        let (a, mut b) = MockSocket::pair(MAC_A, MAC_B);
         let mut padded = PaddedSocket::new(a, 1024);
 
         // 500-byte data packet + 1-byte type tag = 501 bytes payload.
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn large_payload_clamped_to_mtu() {
-        let (mut a, mut b) = MockSocket::pair(MAC_A, MAC_B);
+        let (a, mut b) = MockSocket::pair(MAC_A, MAC_B);
         let mut padded = PaddedSocket::new(a, 1024);
 
         // 1100-byte payload + 14 ETH = 1114 bytes.
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn near_mtu_payload_sent_unpadded() {
-        let (mut a, mut b) = MockSocket::pair(MAC_A, MAC_B);
+        let (a, mut b) = MockSocket::pair(MAC_A, MAC_B);
         let mut padded = PaddedSocket::new(a, 1024);
 
         // 1490-byte payload + 14 ETH = 1504 wire.
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn at_mtu_payload_sent_as_is() {
-        let (mut a, mut b) = MockSocket::pair(MAC_A, MAC_B);
+        let (a, mut b) = MockSocket::pair(MAC_A, MAC_B);
         let mut padded = PaddedSocket::new(a, 1024);
 
         // 1500-byte payload + 14 ETH = 1514 wire = exactly MTU.
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn exactly_aligned_payload_not_re_padded() {
-        let (mut a, mut b) = MockSocket::pair(MAC_A, MAC_B);
+        let (a, mut b) = MockSocket::pair(MAC_A, MAC_B);
         let mut padded = PaddedSocket::new(a, 1024);
 
         // payload = 1024 - 14 = 1010 bytes → wire = 1024, already aligned.
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn recv_passes_through_unchanged() {
-        let (mut a, mut b) = MockSocket::pair(MAC_A, MAC_B);
+        let (mut a, b) = MockSocket::pair(MAC_A, MAC_B);
 
         // Send unpadded from raw socket A.
         a.send_frame(MAC_B, &[1, 2, 3]).unwrap();

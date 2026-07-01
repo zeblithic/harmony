@@ -561,11 +561,21 @@ async fn write_length_prefixed(
 /// MAX_TUNNEL_CONNECTIONS × 8 KiB = 512 KiB total.
 const HANDSHAKE_MAX_MESSAGE: usize = 8 * 1024;
 
+// ZEB-479: compile-time budget checks (were runtime test asserts; const
+// asserts fail at build time and satisfy clippy::assertions_on_constants).
+// TunnelInit: 1088 (CT) + 1952 (DSA pk) + 32 (nonce) + 3309 (sig) = 6381 bytes.
+const _: () = assert!(HANDSHAKE_MAX_MESSAGE >= 6381 + 100);
+// TunnelAccept: 1952 (DSA pk) + 32 (nonce) + 3309 (sig) = 5293 bytes.
+const _: () = assert!(HANDSHAKE_MAX_MESSAGE >= 5293 + 100);
+
 /// Maximum message size during the authenticated data phase.
 /// Sized to cover Zenoh content-item frames routed over the tunnel (Bead #3).
 /// Capped at 2 MiB to limit per-peer allocation (64 peers × 2 MiB = 128 MiB
 /// worst case).
 const DATA_MAX_MESSAGE: usize = 2 * 1024 * 1024;
+
+// 64 concurrent peers × 2 MiB = 128 MiB worst case, under 256 MiB.
+const _: () = assert!(DATA_MAX_MESSAGE * 64 <= 256 * 1024 * 1024);
 
 /// Read a length-prefixed message: [4 bytes big-endian length][payload].
 ///
@@ -610,33 +620,14 @@ mod tests {
         assert!(b >= a);
     }
 
-    #[test]
-    fn handshake_max_covers_tunnel_init() {
-        // TunnelInit: 1088 (CT) + 1952 (DSA pk) + 32 (nonce) + 3309 (sig) = 6381 bytes
-        assert!(
-            HANDSHAKE_MAX_MESSAGE >= 6381 + 100,
-            "HANDSHAKE_MAX_MESSAGE ({HANDSHAKE_MAX_MESSAGE}) must have headroom above TunnelInit (6381 bytes)"
-        );
-    }
-
-    #[test]
-    fn handshake_max_covers_tunnel_accept() {
-        // TunnelAccept: 1952 (DSA pk) + 32 (nonce) + 3309 (sig) = 5293 bytes
-        assert!(
-            HANDSHAKE_MAX_MESSAGE >= 5293 + 100,
-            "HANDSHAKE_MAX_MESSAGE ({HANDSHAKE_MAX_MESSAGE}) must have headroom above TunnelAccept (5293 bytes)"
-        );
-    }
+    // ZEB-479: the HANDSHAKE_MAX_MESSAGE / DATA_MAX_MESSAGE budget checks that
+    // lived here as runtime tests are now `const _: () = assert!(...)` items
+    // next to the constant definitions — they fail at compile time instead.
 
     #[test]
     fn data_max_is_reasonable() {
         // 2 MiB cap per message
         assert_eq!(DATA_MAX_MESSAGE, 2 * 1024 * 1024);
-        // 64 concurrent peers x 2 MiB = 128 MiB worst case, under 256 MiB
-        assert!(
-            DATA_MAX_MESSAGE * 64 <= 256 * 1024 * 1024,
-            "worst-case allocation for 64 peers exceeds 256 MiB"
-        );
     }
 
     #[test]

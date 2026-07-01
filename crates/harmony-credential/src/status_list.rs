@@ -80,6 +80,13 @@ pub struct MemoryStatusListResolver {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+impl Default for MemoryStatusListResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 impl MemoryStatusListResolver {
     pub fn new() -> Self {
         Self {

@@ -167,7 +167,7 @@ mod tests {
         let artist = PrivateIdentity::generate(&mut OsRng);
         let mut manifest = make_test_manifest(&artist);
         manifest.sign(&artist);
-        assert!(manifest.verify(&artist.public_identity()).is_ok());
+        assert!(manifest.verify(artist.public_identity()).is_ok());
     }
 
     #[test]
@@ -176,7 +176,7 @@ mod tests {
         let imposter = PrivateIdentity::generate(&mut OsRng);
         let mut manifest = make_test_manifest(&artist);
         manifest.sign(&artist);
-        let result = manifest.verify(&imposter.public_identity());
+        let result = manifest.verify(imposter.public_identity());
         assert!(result.is_err());
     }
 
@@ -190,7 +190,7 @@ mod tests {
             currency: alloc::string::String::from("USD"),
             per: PricePer::Month,
         });
-        let result = manifest.verify(&artist.public_identity());
+        let result = manifest.verify(artist.public_identity());
         assert!(result.is_err());
     }
 
@@ -214,6 +214,6 @@ mod tests {
             signature: [0u8; 64],
         };
         manifest.sign(&artist);
-        assert!(manifest.verify(&artist.public_identity()).is_ok());
+        assert!(manifest.verify(artist.public_identity()).is_ok());
     }
 }

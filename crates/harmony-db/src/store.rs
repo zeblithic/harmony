@@ -31,8 +31,11 @@ pub struct DiskBookStore {
     /// the `&[u8]` lifetime requirement.
     cache: RefCell<HashMap<ContentId, Vec<u8>>>,
     /// Optional network fetch callback: given a CID, returns bytes if available.
-    fetcher: Option<Box<dyn Fn(&ContentId) -> Option<Vec<u8>>>>,
+    fetcher: Option<BlockFetcher>,
 }
+
+/// Network fetch callback: given a CID, returns bytes if available.
+type BlockFetcher = Box<dyn Fn(&ContentId) -> Option<Vec<u8>>>;
 
 impl DiskBookStore {
     /// Create a store backed by the given data directory (no network fallback).

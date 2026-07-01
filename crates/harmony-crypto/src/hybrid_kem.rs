@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn hybrid_kem_roundtrip() {
         let (ml_pk, ml_sk) = crate::ml_kem::generate(&mut OsRng);
-        let x_sk = x25519_dalek::StaticSecret::random_from_rng(&mut OsRng);
+        let x_sk = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let x_pk = x25519_dalek::PublicKey::from(&x_sk);
 
         let (ct, x_eph_pk, shared_key_sender) =
@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn different_contexts_produce_different_keys() {
         let (ml_pk, ml_sk) = crate::ml_kem::generate(&mut OsRng);
-        let x_sk = x25519_dalek::StaticSecret::random_from_rng(&mut OsRng);
+        let x_sk = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let x_pk = x25519_dalek::PublicKey::from(&x_sk);
 
         let (ct, x_eph_pk, key1) =

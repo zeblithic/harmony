@@ -93,10 +93,15 @@ enum RawSink {
     },
     #[cfg(test)]
     Captured {
-        raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
-        sealed_unicast: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
+        raw: CapturedPublishes,
+        sealed_unicast: CapturedPublishes,
     },
 }
+
+/// Captured publish log — (key expression, payload) pairs recorded by test
+/// publishers instead of hitting a live Zenoh session.
+#[cfg(test)]
+type CapturedPublishes = Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>;
 
 /// Test handles returned by `ZenohPublisher::inert_for_test` so callers can
 /// assert on both coalesced root-CID updates and raw-mail publishes without
@@ -105,8 +110,8 @@ enum RawSink {
 pub struct InertHandles {
     pub latest: Arc<Mutex<HashMap<String, [u8; CID_LEN]>>>,
     pub current: Arc<Mutex<HashMap<[u8; ADDRESS_HASH_LEN], [u8; CID_LEN]>>>,
-    pub raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
-    pub sealed_unicast: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>>,
+    pub raw: CapturedPublishes,
+    pub sealed_unicast: CapturedPublishes,
 }
 
 impl ZenohPublisher {
@@ -312,9 +317,8 @@ impl ZenohPublisher {
             Arc::new(Mutex::new(HashMap::new()));
         let current: Arc<Mutex<HashMap<[u8; ADDRESS_HASH_LEN], [u8; CID_LEN]>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let raw: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>> = Arc::new(Mutex::new(Vec::new()));
-        let sealed_unicast: Arc<Mutex<Vec<(String, Arc<Vec<u8>>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let raw: CapturedPublishes = Arc::new(Mutex::new(Vec::new()));
+        let sealed_unicast: CapturedPublishes = Arc::new(Mutex::new(Vec::new()));
         let wake = Arc::new(Notify::new());
         let publisher = Self {
             latest: Arc::clone(&latest),
@@ -595,6 +599,9 @@ impl ZenohPublisher {
     /// is logged via the caller-supplied closures but not reported
     /// back, because the caller has already committed to SMTP semantics
     /// by the time the task runs.
+    // ZEB-479: 9 args, 4 of which are outcome callbacks — bundling those into
+    // a struct would obscure this private helper more than it helps.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_session_publish(
         session: &zenoh::Session,
         cancel: &CancellationToken,

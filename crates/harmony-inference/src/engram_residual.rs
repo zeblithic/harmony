@@ -317,11 +317,8 @@ mod tests {
         // - position 3's window covers 1,2,3 (all zero) => also zero
         // Only position 4 (last) should be non-zero.
         let output_data: Vec<Vec<Vec<f32>>> = output.to_vec3()?;
-        for pos in 0..(seq_len - 1) {
-            let max_at_pos: f32 = output_data[0][pos]
-                .iter()
-                .map(|v| v.abs())
-                .fold(0f32, f32::max);
+        for (pos, row) in output_data[0].iter().enumerate().take(seq_len - 1) {
+            let max_at_pos: f32 = row.iter().map(|v| v.abs()).fold(0f32, f32::max);
             assert!(
                 max_at_pos < 1e-6,
                 "position {pos} should be unaffected by future data, got max abs {max_at_pos}"

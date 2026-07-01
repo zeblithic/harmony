@@ -1192,13 +1192,8 @@ mod tests {
         let all_pages = book.page_data_from_book_encrypted(&data, &meta);
 
         let meta_count = book.metadata_page_count();
-        for i in 0..meta_count {
-            let sentinel = u32::from_le_bytes([
-                all_pages[i][0],
-                all_pages[i][1],
-                all_pages[i][2],
-                all_pages[i][3],
-            ]);
+        for page in all_pages.iter().take(meta_count) {
+            let sentinel = u32::from_le_bytes([page[0], page[1], page[2], page[3]]);
             assert_eq!(sentinel, ENCRYPTED_SENTINEL);
         }
     }

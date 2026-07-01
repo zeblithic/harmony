@@ -73,7 +73,7 @@ impl SpecDecConfig {
     /// Create a validated config. Panics on invalid thresholds.
     pub fn new(tau_generate: f32, tau_chain: f32, tau_accept: f32, max_draft_len: usize) -> Self {
         assert!(
-            tau_generate >= 0.0 && tau_generate < 1.0,
+            (0.0..1.0).contains(&tau_generate),
             "tau_generate must be in [0, 1), got {tau_generate}"
         );
         assert!(
