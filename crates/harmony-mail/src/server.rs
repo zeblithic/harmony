@@ -46,7 +46,8 @@ use crate::tls;
 
 /// Outcome of the spawn_blocking CAS-ingest phase: `(message CAS CID,
 /// serialized message bytes)`. Either half is `None` when its step failed —
-/// see the call-site comments in `handle_smtp_data`.
+/// see the call-site comments in `process_async_actions`
+/// (`SmtpAction::DeliverToHarmony`).
 type CasIngestOutcome = Result<(Option<[u8; 32]>, Option<Vec<u8>>), String>;
 
 /// Everything remote delivery needs, bundled so its availability is a single

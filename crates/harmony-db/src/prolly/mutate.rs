@@ -207,7 +207,7 @@ fn cascade_up(
         let mut entries = level.entries.clone();
         let start = level.child_idx;
         let end = (start + replace_count).min(entries.len());
-        entries.splice(start..end, replacement.into_iter());
+        entries.splice(start..end, replacement);
 
         if entries.is_empty() {
             // Branch level emptied — propagate upward.

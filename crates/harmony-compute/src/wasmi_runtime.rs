@@ -876,7 +876,12 @@ impl ComputeRuntime for WasmiRuntime {
             _ => None,
         };
 
-        let return_val: i32 = if let Some((_load_gguf_cid, _load_tok_cid)) = model_load_cids {
+        // ZEB-479: the bound CIDs are consumed only inside the
+        // cfg(feature = "inference") block below — without the feature they
+        // are deliberately unused. Do NOT underscore-prefix them: that breaks
+        // the inference build (PR #284 review; ZEB-481-class cfg-gated rot).
+        #[allow(unused_variables)]
+        let return_val: i32 = if let Some((load_gguf_cid, load_tok_cid)) = model_load_cids {
             #[cfg(feature = "inference")]
             {
                 match response {

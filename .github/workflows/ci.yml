@@ -8,8 +8,10 @@ name: CI
 on:
   push:
 
+# push-only trigger (matches harmony-client; solo-org repo, no fork PRs), so
+# the concurrency key is the ref — there is no pull_request event to read.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -22,6 +24,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Build scripts / tests from third-party crates run in these jobs;
+          # don't leave the GITHUB_TOKEN persisted in git config for them.
+          persist-credentials: false
 
       # mold: link-time is a large share of --all-targets builds.
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
@@ -47,6 +53,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Build scripts / tests from third-party crates run in these jobs;
+          # don't leave the GITHUB_TOKEN persisted in git config for them.
+          persist-credentials: false
 
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
 
