@@ -89,7 +89,7 @@ mod tests {
         let payload_b64 = b64(payload_json);
         let signing_input = alloc::format!("{}.{}", header_b64, payload_b64);
         let signature = private.sign(signing_input.as_bytes());
-        let sig_b64 = B64.encode(&signature);
+        let sig_b64 = B64.encode(signature);
         alloc::format!("{}.{}", signing_input, sig_b64)
     }
 
@@ -149,7 +149,7 @@ mod tests {
         let header_b64 = B64.encode(r#"{"alg":"EdDSA"}"#.as_bytes());
         let payload_b64 = B64.encode(r#"{"iss":"alice"}"#.as_bytes());
         let signing_input = alloc::format!("{}.{}", header_b64, payload_b64);
-        let sig_b64 = B64.encode(&private.sign(signing_input.as_bytes()));
+        let sig_b64 = B64.encode(private.sign(signing_input.as_bytes()));
         let compact = alloc::format!("{}.{}", signing_input, sig_b64);
 
         let sd_jwt = crate::parse::parse(&compact).unwrap();
@@ -167,7 +167,7 @@ mod tests {
         let header_b64 = B64.encode(r#"{"alg":"EdDSA","typ":"jwt"}"#.as_bytes());
         let payload_b64 = B64.encode(r#"{"iss":"alice"}"#.as_bytes());
         let signing_input = alloc::format!("{}.{}", header_b64, payload_b64);
-        let sig_b64 = B64.encode(&private.sign(signing_input.as_bytes()));
+        let sig_b64 = B64.encode(private.sign(signing_input.as_bytes()));
         let compact = alloc::format!("{}.{}", signing_input, sig_b64);
 
         let sd_jwt = crate::parse::parse(&compact).unwrap();
@@ -184,7 +184,7 @@ mod tests {
         let header_b64 = B64.encode(r#"{"alg":"EdDSA","typ":"application/sd+jwt"}"#.as_bytes());
         let payload_b64 = B64.encode(r#"{"iss":"alice"}"#.as_bytes());
         let signing_input = alloc::format!("{}.{}", header_b64, payload_b64);
-        let sig_b64 = B64.encode(&private.sign(signing_input.as_bytes()));
+        let sig_b64 = B64.encode(private.sign(signing_input.as_bytes()));
         let compact = alloc::format!("{}.{}", signing_input, sig_b64);
 
         let sd_jwt = crate::parse::parse(&compact).unwrap();

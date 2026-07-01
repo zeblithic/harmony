@@ -52,6 +52,9 @@ enum Commands {
     },
 }
 
+// ZEB-479: mirrors the clap subcommand's flags one-to-one; bundling them into
+// a struct would just duplicate the derive definition above.
+#[allow(clippy::too_many_arguments)]
 async fn run_engram(
     config_path: PathBuf,
     input: PathBuf,

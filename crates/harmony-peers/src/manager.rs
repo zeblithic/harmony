@@ -412,7 +412,7 @@ mod tests {
     fn contact_added_high_priority_probes_on_tick() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0xAA, true, PeeringPriority::High);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0xAA; 16],
             },
@@ -428,7 +428,7 @@ mod tests {
     fn contact_added_normal_priority_probes_on_tick() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0xA1, true, PeeringPriority::Normal);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0xA1; 16],
             },
@@ -454,7 +454,7 @@ mod tests {
     fn contact_added_low_priority_no_probe() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0xBB, true, PeeringPriority::Low);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0xBB; 16],
             },
@@ -470,7 +470,7 @@ mod tests {
     fn announce_received_triggers_link_initiation() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0xCC, true, PeeringPriority::Normal);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0xCC; 16],
             },
@@ -504,13 +504,13 @@ mod tests {
     fn link_established_transitions_to_connected() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0xDD, true, PeeringPriority::High);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0xDD; 16],
             },
             &store,
         );
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::AnnounceReceived {
                 identity_hash: [0xDD; 16],
             },
@@ -537,20 +537,20 @@ mod tests {
     fn link_closed_transitions_to_searching() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0xEE, true, PeeringPriority::Normal);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0xEE; 16],
             },
             &store,
         );
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::LinkEstablished {
                 identity_hash: [0xEE; 16],
                 now: 5000,
             },
             &store,
         );
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::LinkClosed {
                 identity_hash: [0xEE; 16],
             },
@@ -565,13 +565,13 @@ mod tests {
     fn contact_removed_closes_link() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0x11, true, PeeringPriority::High);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0x11; 16],
             },
             &store,
         );
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::LinkEstablished {
                 identity_hash: [0x11; 16],
                 now: 5000,
@@ -594,13 +594,13 @@ mod tests {
     fn disabled_policy_closes_active_link() {
         let mut mgr = PeerManager::new();
         let mut store = make_store_with_contact(0x22, true, PeeringPriority::High);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0x22; 16],
             },
             &store,
         );
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::LinkEstablished {
                 identity_hash: [0x22; 16],
                 now: 5000,
@@ -627,15 +627,15 @@ mod tests {
     fn priority_change_updates_probe_interval() {
         let mut mgr = PeerManager::new();
         let mut store = make_store_with_contact(0xA2, true, PeeringPriority::Normal);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0xA2; 16],
             },
             &store,
         );
-        mgr.on_event(PeerEvent::Tick { now: 1000 }, &store);
+        let _ = mgr.on_event(PeerEvent::Tick { now: 1000 }, &store);
         store.get_mut(&[0xA2; 16]).unwrap().peering.priority = PeeringPriority::High;
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0xA2; 16],
             },
@@ -652,7 +652,7 @@ mod tests {
     fn re_enable_policy_starts_searching() {
         let mut mgr = PeerManager::new();
         let mut store = make_store_with_contact(0x33, false, PeeringPriority::Normal);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0x33; 16],
             },
@@ -663,7 +663,7 @@ mod tests {
             PeerStatus::Disabled
         );
         store.get_mut(&[0x33; 16]).unwrap().peering.enabled = true;
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0x33; 16],
             },
@@ -679,13 +679,13 @@ mod tests {
     fn connected_peer_no_probing() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0x44, true, PeeringPriority::High);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0x44; 16],
             },
             &store,
         );
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::LinkEstablished {
                 identity_hash: [0x44; 16],
                 now: 5000,
@@ -702,7 +702,7 @@ mod tests {
     fn probe_interval_respected() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0x55, true, PeeringPriority::High);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0x55; 16],
             },
@@ -729,20 +729,20 @@ mod tests {
     fn backoff_increases_probe_interval() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0x66, true, PeeringPriority::High);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0x66; 16],
             },
             &store,
         );
         for _ in 0..3 {
-            mgr.on_event(
+            let _ = mgr.on_event(
                 PeerEvent::AnnounceReceived {
                     identity_hash: [0x66; 16],
                 },
                 &store,
             );
-            mgr.on_event(
+            let _ = mgr.on_event(
                 PeerEvent::LinkClosed {
                     identity_hash: [0x66; 16],
                 },
@@ -751,7 +751,7 @@ mod tests {
         }
         assert_eq!(mgr.peers.get(&[0x66; 16]).unwrap().retry_count, 3);
         // interval = min(30 * 2^3, 600) = 240s base, jittered ≈ 180-300s
-        mgr.on_event(PeerEvent::Tick { now: 10000 }, &store);
+        let _ = mgr.on_event(PeerEvent::Tick { now: 10000 }, &store);
         let actions = mgr.on_event(PeerEvent::Tick { now: 10100 }, &store);
         assert!(!actions
             .iter()
@@ -767,27 +767,27 @@ mod tests {
     fn backoff_caps_at_600s() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0x77, true, PeeringPriority::High);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0x77; 16],
             },
             &store,
         );
         for _ in 0..10 {
-            mgr.on_event(
+            let _ = mgr.on_event(
                 PeerEvent::AnnounceReceived {
                     identity_hash: [0x77; 16],
                 },
                 &store,
             );
-            mgr.on_event(
+            let _ = mgr.on_event(
                 PeerEvent::LinkClosed {
                     identity_hash: [0x77; 16],
                 },
                 &store,
             );
         }
-        mgr.on_event(PeerEvent::Tick { now: 50000 }, &store);
+        let _ = mgr.on_event(PeerEvent::Tick { now: 50000 }, &store);
         let actions = mgr.on_event(PeerEvent::Tick { now: 50601 }, &store);
         assert!(actions.contains(&PeerAction::SendPathRequest {
             identity_hash: [0x77; 16]
@@ -798,20 +798,20 @@ mod tests {
     fn link_established_resets_retry_count() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0x88, true, PeeringPriority::Normal);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0x88; 16],
             },
             &store,
         );
         for _ in 0..5 {
-            mgr.on_event(
+            let _ = mgr.on_event(
                 PeerEvent::AnnounceReceived {
                     identity_hash: [0x88; 16],
                 },
                 &store,
             );
-            mgr.on_event(
+            let _ = mgr.on_event(
                 PeerEvent::LinkClosed {
                     identity_hash: [0x88; 16],
                 },
@@ -819,13 +819,13 @@ mod tests {
             );
         }
         assert_eq!(mgr.peers.get(&[0x88; 16]).unwrap().retry_count, 5);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::AnnounceReceived {
                 identity_hash: [0x88; 16],
             },
             &store,
         );
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::LinkEstablished {
                 identity_hash: [0x88; 16],
                 now: 90000,
@@ -839,13 +839,13 @@ mod tests {
     fn connecting_timeout_transitions_to_searching() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0x99, true, PeeringPriority::High);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0x99; 16],
             },
             &store,
         );
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::AnnounceReceived {
                 identity_hash: [0x99; 16],
             },
@@ -856,13 +856,13 @@ mod tests {
             PeerStatus::Connecting
         );
         // First tick stamps connecting_since
-        mgr.on_event(PeerEvent::Tick { now: 1000 }, &store);
+        let _ = mgr.on_event(PeerEvent::Tick { now: 1000 }, &store);
         assert_eq!(
             mgr.peers.get(&[0x99; 16]).unwrap().status,
             PeerStatus::Connecting
         );
         // Tick 61s later — should timeout
-        mgr.on_event(PeerEvent::Tick { now: 1061 }, &store);
+        let _ = mgr.on_event(PeerEvent::Tick { now: 1061 }, &store);
         let peer = mgr.peers.get(&[0x99; 16]).unwrap();
         assert_eq!(peer.status, PeerStatus::Searching);
         assert_eq!(peer.retry_count, 1);
@@ -872,25 +872,25 @@ mod tests {
     fn backoff_starts_from_failure_not_original_probe() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0xE1, true, PeeringPriority::High);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0xE1; 16],
             },
             &store,
         );
         // Probe at t=1000
-        mgr.on_event(PeerEvent::Tick { now: 1000 }, &store);
+        let _ = mgr.on_event(PeerEvent::Tick { now: 1000 }, &store);
         // Announce arrives, enter Connecting
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::AnnounceReceived {
                 identity_hash: [0xE1; 16],
             },
             &store,
         );
         // Tick stamps connecting_since at t=1020
-        mgr.on_event(PeerEvent::Tick { now: 1020 }, &store);
+        let _ = mgr.on_event(PeerEvent::Tick { now: 1020 }, &store);
         // Connection fails at t=1050
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::LinkClosed {
                 identity_hash: [0xE1; 16],
             },
@@ -920,13 +920,13 @@ mod tests {
     fn link_established_after_contact_removed_emits_close() {
         let mut mgr = PeerManager::new();
         let store = make_store_with_contact(0xF0, true, PeeringPriority::High);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0xF0; 16],
             },
             &store,
         );
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::AnnounceReceived {
                 identity_hash: [0xF0; 16],
             },
@@ -962,13 +962,13 @@ mod tests {
     fn link_established_while_disabled_emits_close() {
         let mut mgr = PeerManager::new();
         let mut store = make_store_with_contact(0xF1, true, PeeringPriority::High);
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::ContactChanged {
                 identity_hash: [0xF1; 16],
             },
             &store,
         );
-        mgr.on_event(
+        let _ = mgr.on_event(
             PeerEvent::AnnounceReceived {
                 identity_hash: [0xF1; 16],
             },
@@ -1013,7 +1013,7 @@ mod tests {
         let id: IdentityHash = [0xD0; 16];
         let (store, _) = make_tunnel_contact(id);
         let mut mgr = PeerManager::new();
-        mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
+        let _ = mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
         let actions = mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
         // Must emit InitiateTunnel, not InitiateLink
         assert!(
@@ -1037,8 +1037,8 @@ mod tests {
         let id: IdentityHash = [0xD1; 16];
         let (store, _) = make_tunnel_contact(id);
         let mut mgr = PeerManager::new();
-        mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
-        mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
+        let _ = mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
+        let _ = mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
 
         let actions = mgr.on_event(
             PeerEvent::TunnelEstablished {
@@ -1066,11 +1066,11 @@ mod tests {
         let id: IdentityHash = [0xD2; 16];
         let (store, _) = make_tunnel_contact(id);
         let mut mgr = PeerManager::new();
-        mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
-        mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
+        let _ = mgr.on_event(PeerEvent::ContactChanged { identity_hash: id }, &store);
+        let _ = mgr.on_event(PeerEvent::AnnounceReceived { identity_hash: id }, &store);
         assert_eq!(mgr.peers.get(&id).unwrap().status, PeerStatus::Connecting);
 
-        mgr.on_event(PeerEvent::TunnelFailed { identity_hash: id }, &store);
+        let _ = mgr.on_event(PeerEvent::TunnelFailed { identity_hash: id }, &store);
         let peer = mgr.peers.get(&id).unwrap();
         assert_eq!(peer.status, PeerStatus::Searching);
         assert_eq!(peer.retry_count, 1);

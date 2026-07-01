@@ -295,6 +295,9 @@ impl Attention {
         })
     }
 
+    // ZEB-479: GGUF loader takes the model's shape parameters individually;
+    // bundling them into a struct for one private constructor is not worth it.
+    #[allow(clippy::too_many_arguments)]
     fn from_gguf<R: Read + Seek>(
         ct: &gguf_file::Content,
         reader: &mut R,

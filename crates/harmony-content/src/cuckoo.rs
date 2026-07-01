@@ -544,7 +544,7 @@ mod tests {
         buf.extend_from_slice(&num_buckets.to_be_bytes());
         buf.extend_from_slice(&0u32.to_be_bytes());
         // Provide correct body length for 3 buckets.
-        buf.extend_from_slice(&vec![0u8; 3 * 4 * 2]);
+        buf.extend_from_slice(&[0u8; 3 * 4 * 2]);
         let err = CuckooFilter::from_bytes(&buf).unwrap_err();
         assert_eq!(err, CuckooError::NotPowerOfTwo { got: 3 });
     }

@@ -216,10 +216,7 @@ fn is_authorized(
                 }
                 Some(Role::Officer) => {
                     // Officer can only kick Members.
-                    match state.role_of(target) {
-                        Some(Role::Member) => true,
-                        _ => false,
-                    }
+                    matches!(state.role_of(target), Some(Role::Member))
                 }
                 _ => false,
             }
@@ -241,10 +238,7 @@ fn is_authorized(
             }
             // Target must be a member whose role can be lowered.
             // Can only demote Officer → Member.
-            match state.role_of(target) {
-                Some(Role::Officer) => true,
-                _ => false,
-            }
+            matches!(state.role_of(target), Some(Role::Officer))
         }
 
         GroupAction::Dissolve => {

@@ -479,8 +479,8 @@ impl InferenceEngine for HarmonyEngine {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Extract a `Vec<f32>` from a logits tensor.
-// logits_to_vec is now shared: crate::logits_to_vec
+// logits_to_vec (extract a `Vec<f32>` from a logits tensor) moved — it is now
+// shared as crate::logits_to_vec.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -959,6 +959,10 @@ mod tests {
     // ── Integration: generation loop with thinking ───────────────────────
 
     #[test]
+    // ZEB-479: the Emit arm mirrors the production generation loop, whose
+    // tokens/consecutive_thinks updates feed the next iteration; this test
+    // breaks after one emission, so those final writes are deliberately dead.
+    #[allow(unused_assignments)]
     fn generation_loop_with_thinking() {
         // Engine biased toward Uncertain — will Think until safety cap.
         let engine = engine_with_biased_uq(3); // Uncertain, conf=0.5 < 0.85
@@ -1017,6 +1021,9 @@ mod tests {
     }
 
     #[test]
+    // ZEB-479: single-shot mirror of the production loop body — the arm-final
+    // tokens/consecutive_thinks writes are deliberately dead (see above).
+    #[allow(unused_assignments)]
     fn generation_loop_confident_skips_thinking() {
         // Engine biased toward Confident — should never think.
         let engine = engine_with_biased_uq(0); // Confident

@@ -307,7 +307,7 @@ impl PagedKvCache {
         let need_new_page = table.is_empty()
             || self.pool[*table.last().unwrap()]
                 .as_ref()
-                .map_or(true, |b| b.used >= page_size);
+                .is_none_or(|b| b.used >= page_size);
 
         if need_new_page {
             let block_id = self.allocator.alloc().ok_or_else(|| {
@@ -457,7 +457,7 @@ impl PagedKvCache {
         let page_size = self.config.page_size;
 
         // How many full pages to keep, and the remainder in the last page.
-        let keep_pages = (new_position + page_size - 1) / page_size; // ceil div
+        let keep_pages = new_position.div_ceil(page_size); // ceil div
         let last_page_used = if new_position == 0 {
             0
         } else {

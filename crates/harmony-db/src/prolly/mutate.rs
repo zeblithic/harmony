@@ -903,7 +903,7 @@ mod tests {
                     .unwrap()
                     .path()
                     .extension()
-                    .map_or(false, |ext| ext == "bin")
+                    .is_some_and(|ext| ext == "bin")
             })
             .count();
 
@@ -920,7 +920,7 @@ mod tests {
                     .unwrap()
                     .path()
                     .extension()
-                    .map_or(false, |ext| ext == "bin")
+                    .is_some_and(|ext| ext == "bin")
             })
             .count();
 

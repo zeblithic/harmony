@@ -303,8 +303,8 @@ mod tests {
         };
         let (_, cid) = builder.build_with_flags(flags).unwrap();
         assert_eq!(cid.cid_type(), CidType::Bundle(1));
-        assert_eq!(cid.flags().encrypted, true);
-        assert_eq!(cid.flags().ephemeral, false);
+        assert!(cid.flags().encrypted);
+        assert!(!cid.flags().ephemeral);
     }
 
     #[test]

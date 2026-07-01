@@ -229,7 +229,7 @@ mod tests {
         let mut found = scan_books(dir.path());
         found.sort_by_key(|(c, _)| c.to_bytes());
 
-        let mut expected = vec![cid_a, cid_b, cid_c];
+        let mut expected = [cid_a, cid_b, cid_c];
         expected.sort_by_key(|c| c.to_bytes());
 
         assert_eq!(found.len(), expected.len());

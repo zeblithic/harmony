@@ -44,6 +44,23 @@ use crate::smtp::{SmtpAction, SmtpCommand, SmtpConfig, SmtpEvent, SmtpSession, S
 use crate::smtp_parse::parse_command;
 use crate::tls;
 
+/// Outcome of the spawn_blocking CAS-ingest phase: `(message CAS CID,
+/// serialized message bytes)`. Either half is `None` when its step failed —
+/// see the call-site comments in `handle_smtp_data`.
+type CasIngestOutcome = Result<(Option<[u8; 32]>, Option<Vec<u8>>), String>;
+
+/// Everything remote delivery needs, bundled so its availability is a single
+/// `Option`: (gateway identity, recipient resolver, publisher, message bytes).
+type RemoteDeliveryCtx<'a> = (
+    Arc<harmony_identity::PrivateIdentity>,
+    Arc<dyn crate::remote_delivery::RecipientResolver>,
+    Arc<crate::mailbox_manager::ZenohPublisher>,
+    &'a [u8],
+);
+
+/// IMAP FETCH pre-scan result: (seq/uid pairs, message rows, mailbox path).
+type ImapFetchScan = Result<(Vec<(u32, u32)>, Vec<imap_store::MessageRow>, PathBuf), String>;
+
 /// Per-IP connection tracking entry.
 struct IpEntry {
     active: usize,
@@ -1202,7 +1219,7 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                 let signals = crate::spam::SpamSignals {
                     dnsbl_listed: false,
                     fcrdns_pass: true,
-                    spf_result: spf_result.clone(),
+                    spf_result: *spf_result,
                     dkim_result: crate::spam::DkimResult::Missing,
                     dmarc_result: crate::spam::DmarcResult::None,
                     has_executable_attachment: false,
@@ -1268,7 +1285,7 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                 // CAS state. Both fields become None only if serialization
                 // itself failed.
                 let cas_result = tokio::task::spawn_blocking(
-                    move || -> Result<(Option<[u8; 32]>, Option<Vec<u8>>), String> {
+                    move || -> CasIngestOutcome {
                         let config = &harmony_content::chunker::ChunkerConfig::DEFAULT;
                         let mut book_store = harmony_db::DiskBookStore::new(&csp);
 
@@ -1361,12 +1378,7 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                 // serialization failed), remote delivery is effectively
                 // disabled and every non-local recipient falls through to a
                 // debug log.
-                let remote_ctx: Option<(
-                    Arc<harmony_identity::PrivateIdentity>,
-                    Arc<dyn crate::remote_delivery::RecipientResolver>,
-                    Arc<crate::mailbox_manager::ZenohPublisher>,
-                    &[u8],
-                )> = match (
+                let remote_ctx: Option<RemoteDeliveryCtx> = match (
                     gateway_identity.as_ref(),
                     recipient_resolver.as_ref(),
                     mailbox_publisher.as_ref(),
@@ -1444,7 +1456,7 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                                                 &mut rng,
                                                 gw_id.as_ref(),
                                                 &recipient_identity,
-                                                *bytes,
+                                                bytes,
                                             ) {
                                                 Ok(sealed) => {
                                                     // Only set remote_accepted
@@ -1560,8 +1572,6 @@ pub async fn process_async_actions<W: AsyncWrite + Unpin>(
                     if let Some(ref msg_cid) = message_cid {
                         let mgr = Arc::clone(mgr);
                         let msg_cid = *msg_cid;
-                        let msg_id = msg_id;
-                        let sender_address = sender_address;
                         let subject_snippet = subject_snippet.clone();
                         let delivered_to = delivered_to.clone();
                         // Fire-and-forget, but surface panics via a tiny
@@ -2317,10 +2327,7 @@ where
                 } else {
                     attributes.clone()
                 };
-                let fetch_result: Result<
-                    (Vec<(u32, u32)>, Vec<imap_store::MessageRow>, PathBuf),
-                    String,
-                > = (|| {
+                let fetch_result: ImapFetchScan = (|| {
                     let mailbox_name = match &session.state {
                         ImapState::Selected { mailbox, .. } => mailbox.name.clone(),
                         _ => return Err("no mailbox selected".to_string()),
@@ -2520,7 +2527,7 @@ where
                     let max_uid = all_msgs.last().map(|m| m.uid).unwrap_or(0);
                     let max_seqnum = all_msgs.len() as u32;
                     let book_store = if needs_cas {
-                        Some(harmony_db::DiskBookStore::new(&content_store_path))
+                        Some(harmony_db::DiskBookStore::new(content_store_path))
                     } else {
                         None
                     };
@@ -2889,7 +2896,7 @@ fn parse_imap_date(s: &str) -> Option<u64> {
         _ => return None,
     };
     let year: u64 = parts[2].parse().ok()?;
-    if year < 1970 || year > 9999 {
+    if !(1970..=9999).contains(&year) {
         return None;
     }
 
@@ -3015,32 +3022,27 @@ fn matches_single_criterion(
         SearchKey::Larger(n) => msg_row.rfc822_size > *n,
         SearchKey::Smaller(n) => msg_row.rfc822_size < *n,
 
-        SearchKey::Since(date) => {
-            parse_imap_date(date).map_or(false, |d| msg_row.internal_date >= d)
-        }
-        SearchKey::Before(date) => {
-            parse_imap_date(date).map_or(false, |d| msg_row.internal_date < d)
-        }
-        SearchKey::On(date) => parse_imap_date(date).map_or(false, |d| {
-            msg_row.internal_date >= d && msg_row.internal_date < d + 86400
-        }),
+        SearchKey::Since(date) => parse_imap_date(date).is_some_and(|d| msg_row.internal_date >= d),
+        SearchKey::Before(date) => parse_imap_date(date).is_some_and(|d| msg_row.internal_date < d),
+        SearchKey::On(date) => parse_imap_date(date)
+            .is_some_and(|d| msg_row.internal_date >= d && msg_row.internal_date < d + 86400),
 
         SearchKey::Uid(set) => sequence_set_contains(set, msg_row.uid, max_uid),
         SearchKey::SequenceSet(set) => sequence_set_contains(set, seqnum, max_seqnum),
 
-        SearchKey::Subject(s) => msg.map_or(false, |m| {
-            m.subject.to_lowercase().contains(&s.to_lowercase())
-        }),
-        SearchKey::Body(s) => {
-            msg.map_or(false, |m| m.body.to_lowercase().contains(&s.to_lowercase()))
+        SearchKey::Subject(s) => {
+            msg.is_some_and(|m| m.subject.to_lowercase().contains(&s.to_lowercase()))
         }
-        SearchKey::From(s) => msg.map_or(false, |m| {
+        SearchKey::Body(s) => {
+            msg.is_some_and(|m| m.body.to_lowercase().contains(&s.to_lowercase()))
+        }
+        SearchKey::From(s) => msg.is_some_and(|m| {
             let sender_hex = hex::encode(m.sender_address);
             sender_hex.to_lowercase().contains(&s.to_lowercase())
         }),
         SearchKey::To(s) => {
             let needle = s.to_lowercase();
-            msg.map_or(false, |m| {
+            msg.is_some_and(|m| {
                 m.recipients.iter().any(|r| {
                     r.recipient_type == crate::message::RecipientType::To && {
                         let addr_hex = hex::encode(r.address_hash);
@@ -3049,7 +3051,7 @@ fn matches_single_criterion(
                 })
             })
         }
-        SearchKey::Header(name, value) => msg.map_or(false, |m| {
+        SearchKey::Header(name, value) => msg.is_some_and(|m| {
             let val_lower = value.to_lowercase();
             match name.to_lowercase().as_str() {
                 "subject" => m.subject.to_lowercase().contains(&val_lower),

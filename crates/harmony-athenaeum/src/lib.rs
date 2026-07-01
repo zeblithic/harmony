@@ -452,9 +452,9 @@ mod tests {
         // Data pages in encrypted book should match raw book pages
         let enc_data_pages = enc.data_pages();
         assert_eq!(enc_data_pages.len(), raw.pages.len());
-        for i in 0..raw.pages.len() {
+        for (i, (raw_page, enc_page)) in raw.pages.iter().zip(enc_data_pages.iter()).enumerate() {
             assert_eq!(
-                raw.pages[i], enc_data_pages[i],
+                raw_page, enc_page,
                 "data page {i}: addresses differ between raw and encrypted"
             );
         }

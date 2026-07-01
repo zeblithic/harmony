@@ -209,6 +209,13 @@ pub struct MemoryKeyResolver {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+impl Default for MemoryKeyResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 impl MemoryKeyResolver {
     pub fn new() -> Self {
         Self {
@@ -232,6 +239,13 @@ impl CredentialKeyResolver for MemoryKeyResolver {
 #[cfg(any(test, feature = "test-utils"))]
 pub struct MemoryCredentialResolver {
     credentials: hashbrown::HashMap<[u8; 32], Credential>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Default for MemoryCredentialResolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]

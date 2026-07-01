@@ -568,7 +568,7 @@ identity_key = "/tmp/test.key"
             .get("connect")
             .and_then(|v| v.get("endpoints"))
             .and_then(|v| v.as_array())
-            .map_or(true, |eps| eps.is_empty()));
+            .is_none_or(|eps| eps.is_empty()));
     }
 
     #[test]
@@ -596,6 +596,6 @@ identity_key = "/tmp/test.key"
             .get("connect")
             .and_then(|v| v.get("endpoints"))
             .and_then(|v| v.as_array())
-            .map_or(true, |eps| eps.is_empty()));
+            .is_none_or(|eps| eps.is_empty()));
     }
 }

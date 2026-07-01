@@ -893,7 +893,7 @@ mod tests {
     fn bundle_size_min_max_range() {
         // raw=0 is 1MB (minimum valid bundle size), not a sentinel.
         assert_eq!(decode_bundle_size(0), 1_048_576);
-        assert_eq!(decode_bundle_size((0 << 8) | 1), 2_097_152);
+        assert_eq!(decode_bundle_size(1), 2_097_152);
         assert_eq!(decode_bundle_size((4095 << 8) | 255), u64::MAX);
     }
 

@@ -197,6 +197,9 @@ impl PeerTable {
     }
 
     /// Iterate all known peer socket addresses.
+    // ZEB-479: test-only (like peer_count) — no production caller today; the
+    // PeerTable's wider fate is ZEB-478 (rename/retire).
+    #[cfg(test)]
     pub fn peer_addrs(&self) -> impl Iterator<Item = &SocketAddr> {
         self.peers.keys()
     }
@@ -329,7 +332,7 @@ mod tests {
         t.add_peer(sa, our_addr, 1);
 
         assert_eq!(t.peer_count(), 0, "self-announcement must be dropped");
-        assert!(t.addr_to_sockets.get(&our_addr).is_none());
+        assert!(!t.addr_to_sockets.contains_key(&our_addr));
     }
 
     // ── 3. idempotent_add ─────────────────────────────────────────────────────
@@ -371,7 +374,7 @@ mod tests {
         assert_eq!(t.peer_count(), 1);
         // Old reverse-index entry must be gone
         assert!(
-            t.addr_to_sockets.get(&ra_old).is_none(),
+            !t.addr_to_sockets.contains_key(&ra_old),
             "old reticulum addr must be removed from reverse index"
         );
         // New reverse-index entry must exist
@@ -412,7 +415,7 @@ mod tests {
 
         assert_eq!(removed, 2);
         assert_eq!(t.peer_count(), 0);
-        assert!(t.addr_to_sockets.get(&ra).is_none());
+        assert!(!t.addr_to_sockets.contains_key(&ra));
     }
 
     // ── 6. remove_by_reticulum_addr_unknown_is_zero ───────────────────────────
@@ -479,7 +482,7 @@ mod tests {
         assert!(evicted.contains(&sa));
         assert_eq!(t.peer_count(), 0);
         assert!(
-            t.addr_to_sockets.get(&ra).is_none(),
+            !t.addr_to_sockets.contains_key(&ra),
             "reverse index must be cleaned"
         );
     }
@@ -520,7 +523,7 @@ mod tests {
         assert_eq!(t.peer_count(), 0);
         // The reverse-index entry for ra must be gone entirely.
         assert!(
-            t.addr_to_sockets.get(&ra).is_none(),
+            !t.addr_to_sockets.contains_key(&ra),
             "addr_to_sockets must be empty after all sockets for a reticulum addr evict"
         );
     }

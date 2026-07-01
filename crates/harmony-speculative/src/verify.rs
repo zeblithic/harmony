@@ -157,7 +157,7 @@ mod tests {
         // All draft entries propose 0.5 draft probability.
         let draft_logprob = (0.5f32).ln(); // ≈ -0.693
 
-        let _drafts = vec![
+        let _drafts = [
             DraftEntry {
                 token_id: 1,
                 logprob: draft_logprob,
