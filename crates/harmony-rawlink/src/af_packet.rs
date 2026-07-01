@@ -111,6 +111,11 @@ fn bpf_filter_ethertype() -> [libc::sock_filter; 4] {
 pub struct AfPacketSocket {
     fd: OwnedFd,
     rx_ring: *mut u8,
+    // ZEB-479: never read today — sends go via sendto() and Drop unmaps the
+    // whole contiguous region from rx_ring — but the field documents
+    // ownership of the TX half of the mapping (see the struct invariants),
+    // like tx_frame_idx below. Surfaced by the first Linux CI run.
+    #[allow(dead_code)]
     tx_ring: *mut u8,
     rx_ring_size: usize,
     tx_ring_size: usize,
