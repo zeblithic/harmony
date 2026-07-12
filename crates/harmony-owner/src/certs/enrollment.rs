@@ -160,6 +160,16 @@ impl EnrollmentCert {
                         cert_type: "Enrollment",
                     });
                 }
+                // Quorum certs carry their signatures in the issuer; the
+                // top-level field must be empty or it is unauthenticated
+                // malleable bytes — it participates in struct equality
+                // (Enrollment-Conflict detection) and CRDT LWW tie-breaks
+                // without being covered by any signature (ZEB-677).
+                if !self.signature.is_empty() {
+                    return Err(OwnerError::InvalidSignature {
+                        cert_type: "Enrollment-Quorum-Nonempty-Signature",
+                    });
+                }
                 if self.device_pubkeys.identity_hash() != self.device_id {
                     return Err(OwnerError::IdentityHashMismatch);
                 }
@@ -494,12 +504,15 @@ mod tests {
     }
 
     /// Master-enrolls devices A and B under one owner, quorum-enrolls a new
-    /// device C signed by A+B, and returns everything a chain verifier needs.
+    /// device C signed by A+B, and returns everything a chain verifier needs
+    /// (including the master materials, for reissue-style tests).
     fn quorum_world() -> (
         [u8; 16],            // owner_id
         EnrollmentCert,      // quorum cert for C
         Vec<EnrollmentCert>, // signer certs [A, B] (Master-issued)
         SigningKey,          // A's device sk (for tamper/depth tests)
+        SigningKey,          // master sk
+        PubKeyBundle,        // master bundle
     ) {
         let (master_sk, master_bundle) = fresh_pubkey_bundle(1, 2);
         let owner_id = master_bundle.identity_hash();
@@ -517,7 +530,7 @@ mod tests {
         .unwrap();
         let b_cert = EnrollmentCert::sign_master(
             &master_sk,
-            master_bundle,
+            master_bundle.clone(),
             b_bundle.identity_hash(),
             b_bundle.clone(),
             100,
@@ -542,19 +555,26 @@ mod tests {
         ];
         let c_cert =
             EnrollmentCert::assemble_quorum(owner_id, c_id, c_bundle, 1_000, None, parts).unwrap();
-        (owner_id, c_cert, vec![a_cert, b_cert], a_sk)
+        (
+            owner_id,
+            c_cert,
+            vec![a_cert, b_cert],
+            a_sk,
+            master_sk,
+            master_bundle,
+        )
     }
 
     #[test]
     fn quorum_chain_verifies_with_signer_certs() {
-        let (_owner, cert, signer_certs, _a_sk) = quorum_world();
+        let (_owner, cert, signer_certs, _a_sk, _m_sk, _m_bundle) = quorum_world();
         cert.verify_quorum_with_signers(&signer_certs, 2_000)
             .unwrap();
     }
 
     #[test]
     fn quorum_chain_rejects_missing_signer_cert() {
-        let (_owner, cert, signer_certs, _a_sk) = quorum_world();
+        let (_owner, cert, signer_certs, _a_sk, _m_sk, _m_bundle) = quorum_world();
         let only_a = &signer_certs[..1];
         assert!(matches!(
             cert.verify_quorum_with_signers(only_a, 2_000),
@@ -564,7 +584,7 @@ mod tests {
 
     #[test]
     fn quorum_chain_rejects_tampered_signature() {
-        let (_owner, mut cert, signer_certs, _a_sk) = quorum_world();
+        let (_owner, mut cert, signer_certs, _a_sk, _m_sk, _m_bundle) = quorum_world();
         if let EnrollmentIssuer::Quorum { signatures, .. } = &mut cert.issuer {
             signatures[0][0] ^= 0xFF;
         }
@@ -576,7 +596,7 @@ mod tests {
 
     #[test]
     fn quorum_chain_rejects_wrong_owner_signer_cert() {
-        let (_owner, cert, mut signer_certs, _a_sk) = quorum_world();
+        let (_owner, cert, mut signer_certs, _a_sk, _m_sk, _m_bundle) = quorum_world();
         // Re-issue A's cert under a DIFFERENT master: the signer cert is
         // internally valid but belongs to a foreign owner.
         let (other_master_sk, other_master_bundle) = fresh_pubkey_bundle(9, 10);
@@ -599,7 +619,7 @@ mod tests {
 
     #[test]
     fn quorum_chain_rejects_quorum_issued_signer_cert_depth1() {
-        let (owner_id, cert, mut signer_certs, a_sk) = quorum_world();
+        let (owner_id, cert, mut signer_certs, a_sk, _m_sk, _m_bundle) = quorum_world();
         // Replace A's Master cert with a structurally-valid Quorum-issued one
         // for the same device: depth-1 violation. (Signatures are junk-by-
         // construction — both parts signed by A — but the depth check must
@@ -639,7 +659,7 @@ mod tests {
 
     #[test]
     fn quorum_chain_rejects_expired_signer_cert() {
-        let (_owner, cert, signer_certs, _a_sk) = quorum_world();
+        let (_owner, cert, signer_certs, _a_sk, _m_sk, _m_bundle) = quorum_world();
         // Mutating expires_at also breaks the signer cert's signature, but
         // the expiry check inside signer_cert.verify() fires FIRST, so the
         // error is deterministically EnrollmentCertExpired.
@@ -653,7 +673,7 @@ mod tests {
 
     #[test]
     fn quorum_chain_rejects_master_cert_input() {
-        let (_owner, _cert, signer_certs, _a_sk) = quorum_world();
+        let (_owner, _cert, signer_certs, _a_sk, _m_sk, _m_bundle) = quorum_world();
         // A Master-issued cert may not be passed to the quorum verifier.
         let err = signer_certs[0].verify_quorum_with_signers(&signer_certs, 2_000);
         assert!(
@@ -663,17 +683,38 @@ mod tests {
 
     #[test]
     fn quorum_chain_rejects_backdated_signer_cert() {
-        let (_owner, cert, mut signer_certs, _a_sk) = quorum_world();
-        // Signer enrolled AFTER the quorum cert was issued (cert at 1_000).
-        // The mutation breaks A's cert signature too, but the backdating
-        // guard runs only after signer_cert.verify() — so assert the
-        // signature error surfaces (the chain is rejected either way; the
-        // dedicated ordering-independent backdating coverage lives in the
-        // OwnerState tests where a genuinely later-issued cert is signable).
-        signer_certs[0].issued_at = 5_000;
-        assert!(cert
-            .verify_quorum_with_signers(&signer_certs, 6_000)
-            .is_err());
+        let (_owner, cert, mut signer_certs, _a_sk, master_sk, master_bundle) = quorum_world();
+        // Reissue A's cert under the ORIGINAL master with issued_at AFTER the
+        // quorum cert (1_000) — the signer cert is fully valid, so the
+        // backdating branch itself must fire (not a signature failure).
+        signer_certs[0] = EnrollmentCert::sign_master(
+            &master_sk,
+            master_bundle,
+            signer_certs[0].device_id,
+            signer_certs[0].device_pubkeys.clone(),
+            5_000,
+            None,
+        )
+        .unwrap();
+        let err = cert.verify_quorum_with_signers(&signer_certs, 6_000);
+        assert!(
+            matches!(err, Err(OwnerError::InvalidSignature { cert_type }) if cert_type == "Enrollment-Quorum-Backdated-Signer")
+        );
+    }
+
+    #[test]
+    fn quorum_chain_rejects_nonempty_top_level_signature() {
+        let (_owner, mut cert, signer_certs, _a_sk, _m_sk, _m_bundle) = quorum_world();
+        // The top-level signature field is unused for Quorum certs; nonempty
+        // bytes are unauthenticated malleability (struct equality + LWW
+        // tie-breaks) and must be rejected.
+        cert.signature = vec![0xAA];
+        let err = cert.verify_quorum_with_signers(&signer_certs, 2_000);
+        assert!(
+            matches!(err, Err(OwnerError::InvalidSignature { cert_type }) if cert_type == "Enrollment-Quorum-Nonempty-Signature")
+        );
+        // The structural verify() chokepoint rejects it too.
+        assert!(cert.verify(2_000).is_err());
     }
 
     #[test]

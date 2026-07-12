@@ -281,6 +281,15 @@ impl RevocationCert {
                 cert_type: "Revocation-Quorum-Duplicate-Signer",
             });
         }
+        // Quorum certs carry their signatures in the issuer; the top-level
+        // field must be empty or it is unauthenticated malleable bytes — it
+        // participates in struct equality and RevocationSet LWW tie-breaks
+        // without being covered by any signature (ZEB-677).
+        if !self.signature.is_empty() {
+            return Err(OwnerError::InvalidSignature {
+                cert_type: "Revocation-Quorum-Nonempty-Signature",
+            });
+        }
         let payload_bytes = Self::quorum_signing_payload_bytes(
             self.owner_id,
             self.target,
@@ -497,6 +506,19 @@ mod tests {
             cert.verify_quorum_with_signers(&signer_certs, 2_000),
             Err(OwnerError::InvalidSignature { .. })
         ));
+    }
+
+    #[test]
+    fn quorum_revocation_rejects_nonempty_top_level_signature() {
+        let (owner_id, signer_certs, a_sk, b_sk) = signer_world();
+        let mut cert = assemble_quorum_revocation(owner_id, &signer_certs, &a_sk, &b_sk, [9u8; 16]);
+        // Unused for Quorum revocations — nonempty bytes are unauthenticated
+        // malleability (struct equality + RevocationSet LWW tie-breaks).
+        cert.signature = vec![0xAA];
+        let err = cert.verify_quorum_with_signers(&signer_certs, 2_000);
+        assert!(
+            matches!(err, Err(OwnerError::InvalidSignature { cert_type }) if cert_type == "Revocation-Quorum-Nonempty-Signature")
+        );
     }
 
     #[test]
