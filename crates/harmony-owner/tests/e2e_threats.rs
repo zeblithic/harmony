@@ -113,7 +113,7 @@ fn revoked_device_cannot_be_un_revoked() {
         RevocationReason::Decommissioned,
     )
     .unwrap();
-    state.add_revocation(rev).unwrap();
+    state.add_revocation(rev, 0, u64::MAX).unwrap();
     assert!(state.is_revoked(device_a_id));
 
     // Even an "older" revocation insertion does not un-revoke (it stays revoked, with the earliest cert kept).
@@ -125,7 +125,7 @@ fn revoked_device_cannot_be_un_revoked() {
         RevocationReason::Other("test".into()),
     )
     .unwrap();
-    state.add_revocation(rev2).unwrap();
+    state.add_revocation(rev2, 0, u64::MAX).unwrap();
     assert!(state.is_revoked(device_a_id));
 }
 

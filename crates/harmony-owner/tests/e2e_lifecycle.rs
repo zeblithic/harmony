@@ -164,7 +164,7 @@ fn full_three_device_lifecycle() {
         RevocationReason::Decommissioned,
     )
     .unwrap();
-    state.add_revocation(revocation).unwrap();
+    state.add_revocation(revocation, 0, u64::MAX).unwrap();
 
     assert_eq!(
         evaluate_trust(

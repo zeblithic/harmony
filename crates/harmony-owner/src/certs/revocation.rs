@@ -218,8 +218,7 @@ impl RevocationCert {
                 got: parts.len(),
             });
         }
-        let unique: std::collections::HashSet<[u8; 16]> =
-            parts.iter().map(|(id, _)| *id).collect();
+        let unique: std::collections::HashSet<[u8; 16]> = parts.iter().map(|(id, _)| *id).collect();
         if unique.len() != parts.len() {
             return Err(OwnerError::InvalidSignature {
                 cert_type: "Revocation-Quorum-Duplicate-Signer",
@@ -317,11 +316,10 @@ impl RevocationCert {
                     cert_type: "Revocation-Quorum-Backdated-Signer",
                 });
             }
-            let vk =
-                VerifyingKey::from_bytes(&signer_cert.device_pubkeys.classical.ed25519_verify)
-                    .map_err(|_| OwnerError::InvalidSignature {
-                        cert_type: "Revocation-Quorum-Member",
-                    })?;
+            let vk = VerifyingKey::from_bytes(&signer_cert.device_pubkeys.classical.ed25519_verify)
+                .map_err(|_| OwnerError::InvalidSignature {
+                    cert_type: "Revocation-Quorum-Member",
+                })?;
             verify_with_tag(
                 &vk,
                 tags::REVOCATION,

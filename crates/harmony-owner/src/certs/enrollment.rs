@@ -262,11 +262,10 @@ impl EnrollmentCert {
                     cert_type: "Enrollment-Quorum-Backdated-Signer",
                 });
             }
-            let vk =
-                VerifyingKey::from_bytes(&signer_cert.device_pubkeys.classical.ed25519_verify)
-                    .map_err(|_| OwnerError::InvalidSignature {
-                        cert_type: "Enrollment-Quorum-Member",
-                    })?;
+            let vk = VerifyingKey::from_bytes(&signer_cert.device_pubkeys.classical.ed25519_verify)
+                .map_err(|_| OwnerError::InvalidSignature {
+                    cert_type: "Enrollment-Quorum-Member",
+                })?;
             verify_with_tag(
                 &vk,
                 tags::ENROLLMENT,
@@ -466,12 +465,23 @@ mod tests {
         let signers = [a_bundle.identity_hash(), b_bundle.identity_hash()];
 
         let payload = EnrollmentCert::quorum_signing_payload_bytes(
-            owner_id, new_id, &new_bundle, 1_000, None, &signers,
+            owner_id,
+            new_id,
+            &new_bundle,
+            1_000,
+            None,
+            &signers,
         )
         .unwrap();
         let parts = vec![
-            (signers[0], EnrollmentCert::sign_quorum_part(&a_sk, &payload)),
-            (signers[1], EnrollmentCert::sign_quorum_part(&b_sk, &payload)),
+            (
+                signers[0],
+                EnrollmentCert::sign_quorum_part(&a_sk, &payload),
+            ),
+            (
+                signers[1],
+                EnrollmentCert::sign_quorum_part(&b_sk, &payload),
+            ),
         ];
         let cert =
             EnrollmentCert::assemble_quorum(owner_id, new_id, new_bundle, 1_000, None, parts)
@@ -521,8 +531,14 @@ mod tests {
         )
         .unwrap();
         let parts = vec![
-            (signers[0], EnrollmentCert::sign_quorum_part(&a_sk, &payload)),
-            (signers[1], EnrollmentCert::sign_quorum_part(&b_sk, &payload)),
+            (
+                signers[0],
+                EnrollmentCert::sign_quorum_part(&a_sk, &payload),
+            ),
+            (
+                signers[1],
+                EnrollmentCert::sign_quorum_part(&b_sk, &payload),
+            ),
         ];
         let c_cert =
             EnrollmentCert::assemble_quorum(owner_id, c_id, c_bundle, 1_000, None, parts).unwrap();
@@ -566,9 +582,15 @@ mod tests {
         let (other_master_sk, other_master_bundle) = fresh_pubkey_bundle(9, 10);
         let a_pub = signer_certs[0].device_pubkeys.clone();
         let a_id = signer_certs[0].device_id;
-        signer_certs[0] =
-            EnrollmentCert::sign_master(&other_master_sk, other_master_bundle, a_id, a_pub, 100, None)
-                .unwrap();
+        signer_certs[0] = EnrollmentCert::sign_master(
+            &other_master_sk,
+            other_master_bundle,
+            a_id,
+            a_pub,
+            100,
+            None,
+        )
+        .unwrap();
         assert!(matches!(
             cert.verify_quorum_with_signers(&signer_certs, 2_000),
             Err(OwnerError::WrongOwner { .. })
@@ -594,7 +616,10 @@ mod tests {
         )
         .unwrap();
         let parts = vec![
-            (a.device_id, EnrollmentCert::sign_quorum_part(&a_sk, &payload)),
+            (
+                a.device_id,
+                EnrollmentCert::sign_quorum_part(&a_sk, &payload),
+            ),
             (b_id, EnrollmentCert::sign_quorum_part(&a_sk, &payload)),
         ];
         signer_certs[0] = EnrollmentCert::assemble_quorum(
@@ -646,7 +671,9 @@ mod tests {
         // dedicated ordering-independent backdating coverage lives in the
         // OwnerState tests where a genuinely later-issued cert is signable).
         signer_certs[0].issued_at = 5_000;
-        assert!(cert.verify_quorum_with_signers(&signer_certs, 6_000).is_err());
+        assert!(cert
+            .verify_quorum_with_signers(&signer_certs, 6_000)
+            .is_err());
     }
 
     #[test]
@@ -658,7 +685,12 @@ mod tests {
         let a_id = a_bundle.identity_hash();
 
         let payload = EnrollmentCert::quorum_signing_payload_bytes(
-            owner_id, new_id, &new_bundle, 1_000, None, &[a_id],
+            owner_id,
+            new_id,
+            &new_bundle,
+            1_000,
+            None,
+            &[a_id],
         )
         .unwrap();
         let one = vec![(a_id, EnrollmentCert::sign_quorum_part(&a_sk, &payload))];
@@ -668,7 +700,12 @@ mod tests {
         ));
 
         let payload2 = EnrollmentCert::quorum_signing_payload_bytes(
-            owner_id, new_id, &new_bundle, 1_000, None, &[a_id, a_id],
+            owner_id,
+            new_id,
+            &new_bundle,
+            1_000,
+            None,
+            &[a_id, a_id],
         )
         .unwrap();
         let dup = vec![
