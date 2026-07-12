@@ -1706,7 +1706,7 @@ pub async fn run(
                         }
                     }
 
-                    let interface_name = format!("tunnel-{}", &hex::encode(&dial.node_id[..8]));
+                    let interface_name = format!("tunnel-{}", hex::encode(&dial.node_id[..8]));
                     let conn_tx_clone = conn_tx.clone();
                     let relay_map_clone = relay_map.clone();
 
