@@ -419,9 +419,6 @@ impl OwnerState {
 /// Uses the shared `EnrollmentSigningPayload` from `certs/enrollment.rs` so
 /// signing and verification cannot drift apart.
 fn quorum_signing_payload(cert: &EnrollmentCert) -> Result<Vec<u8>, OwnerError> {
-    use crate::cbor;
-    use crate::certs::enrollment::EnrollmentSigningPayload;
-
     let signers = match &cert.issuer {
         EnrollmentIssuer::Quorum { signers, .. } => signers,
         _ => {
@@ -430,20 +427,14 @@ fn quorum_signing_payload(cert: &EnrollmentCert) -> Result<Vec<u8>, OwnerError> 
             })
         }
     };
-
-    // issuer_data for Quorum = cbor(signers list), same as enrollment.rs
-    let issuer_data = cbor::to_canonical(signers)?;
-
-    cbor::to_canonical(&EnrollmentSigningPayload {
-        version: cert.version,
-        owner_id: cert.owner_id,
-        device_id: cert.device_id,
-        device_pubkeys: &cert.device_pubkeys,
-        issued_at: cert.issued_at,
-        expires_at: cert.expires_at,
-        issuer_kind: 1, // Quorum = 1
-        issuer_data,
-    })
+    EnrollmentCert::quorum_signing_payload_bytes(
+        cert.owner_id,
+        cert.device_id,
+        &cert.device_pubkeys,
+        cert.issued_at,
+        cert.expires_at,
+        signers,
+    )
 }
 
 #[cfg(test)]

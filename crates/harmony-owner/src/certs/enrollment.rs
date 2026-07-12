@@ -167,6 +167,78 @@ impl EnrollmentCert {
             }
         }
     }
+
+    /// Canonical detached-signature payload for a Quorum-issued enrollment
+    /// cert. The signer set is part of the payload, so it must be fixed
+    /// before any part is signed. Public so the ceremony can collect
+    /// signatures across devices (ZEB-677); `OwnerState` and
+    /// `enroll_via_quorum` use the same function, so signing and
+    /// verification cannot drift.
+    pub fn quorum_signing_payload_bytes(
+        owner_id: [u8; 16],
+        device_id: [u8; 16],
+        device_pubkeys: &PubKeyBundle,
+        issued_at: u64,
+        expires_at: Option<u64>,
+        signers: &[[u8; 16]],
+    ) -> Result<Vec<u8>, OwnerError> {
+        let issuer_data = cbor::to_canonical(&signers.to_vec())?;
+        cbor::to_canonical(&EnrollmentSigningPayload {
+            version: ENROLLMENT_VERSION,
+            owner_id,
+            device_id,
+            device_pubkeys,
+            issued_at,
+            expires_at,
+            issuer_kind: 1, // Quorum
+            issuer_data,
+        })
+    }
+
+    /// Sign one quorum part over `quorum_signing_payload_bytes` output with
+    /// the correct domain tag. Thin wrapper so callers never touch raw tags.
+    pub fn sign_quorum_part(sk: &SigningKey, payload_bytes: &[u8]) -> Vec<u8> {
+        sign_with_tag(sk, tags::ENROLLMENT, payload_bytes)
+    }
+
+    /// Assemble a Quorum-issued cert from independently collected
+    /// `(signer_device_id, detached_signature)` parts. Performs the
+    /// structural quorum checks; full signature verification requires the
+    /// signer certs (`verify_quorum_with_signers`) or `OwnerState`.
+    pub fn assemble_quorum(
+        owner_id: [u8; 16],
+        device_id: [u8; 16],
+        device_pubkeys: PubKeyBundle,
+        issued_at: u64,
+        expires_at: Option<u64>,
+        parts: Vec<([u8; 16], Vec<u8>)>,
+    ) -> Result<Self, OwnerError> {
+        if parts.len() < 2 {
+            return Err(OwnerError::InsufficientQuorum {
+                min: 2,
+                got: parts.len(),
+            });
+        }
+        let (signers, signatures): (Vec<[u8; 16]>, Vec<Vec<u8>>) = parts.into_iter().unzip();
+        let cert = EnrollmentCert {
+            version: ENROLLMENT_VERSION,
+            owner_id,
+            device_id,
+            device_pubkeys,
+            issued_at,
+            expires_at,
+            issuer: EnrollmentIssuer::Quorum {
+                signers,
+                signatures,
+            },
+            signature: Vec::new(),
+        };
+        // Structural checks (distinctness, parity, device-id binding) live in
+        // verify(); expiry is irrelevant at issuance time, so verify at
+        // issued_at.
+        cert.verify(issued_at)?;
+        Ok(cert)
+    }
 }
 
 fn signing_payload<'a>(
@@ -305,6 +377,65 @@ mod tests {
         ));
         assert!(cert.verify(2_000).is_ok()); // exactly-at-expiry still valid (not strictly greater)
         assert!(cert.verify(1_500).is_ok());
+    }
+
+    #[test]
+    fn assembled_quorum_cert_matches_shape_and_passes_structural_verify() {
+        let (a_sk, a_bundle) = fresh_pubkey_bundle(1, 2);
+        let (b_sk, b_bundle) = fresh_pubkey_bundle(3, 4);
+        let (_new_sk, new_bundle) = fresh_pubkey_bundle(5, 6);
+        let owner_id = [7u8; 16];
+        let new_id = new_bundle.identity_hash();
+        let signers = [a_bundle.identity_hash(), b_bundle.identity_hash()];
+
+        let payload = EnrollmentCert::quorum_signing_payload_bytes(
+            owner_id, new_id, &new_bundle, 1_000, None, &signers,
+        )
+        .unwrap();
+        let parts = vec![
+            (signers[0], EnrollmentCert::sign_quorum_part(&a_sk, &payload)),
+            (signers[1], EnrollmentCert::sign_quorum_part(&b_sk, &payload)),
+        ];
+        let cert =
+            EnrollmentCert::assemble_quorum(owner_id, new_id, new_bundle, 1_000, None, parts)
+                .unwrap();
+        assert!(
+            matches!(&cert.issuer, EnrollmentIssuer::Quorum { signers: s, signatures } if s.len() == 2 && signatures.len() == 2)
+        );
+        assert!(cert.signature.is_empty()); // quorum sigs live in the issuer
+        cert.verify(2_000).unwrap(); // structural verify passes
+    }
+
+    #[test]
+    fn assemble_quorum_rejects_single_part_and_duplicate_signers() {
+        let (a_sk, a_bundle) = fresh_pubkey_bundle(1, 2);
+        let (_new_sk, new_bundle) = fresh_pubkey_bundle(5, 6);
+        let owner_id = [7u8; 16];
+        let new_id = new_bundle.identity_hash();
+        let a_id = a_bundle.identity_hash();
+
+        let payload = EnrollmentCert::quorum_signing_payload_bytes(
+            owner_id, new_id, &new_bundle, 1_000, None, &[a_id],
+        )
+        .unwrap();
+        let one = vec![(a_id, EnrollmentCert::sign_quorum_part(&a_sk, &payload))];
+        assert!(matches!(
+            EnrollmentCert::assemble_quorum(owner_id, new_id, new_bundle.clone(), 1_000, None, one),
+            Err(OwnerError::InsufficientQuorum { min: 2, got: 1 })
+        ));
+
+        let payload2 = EnrollmentCert::quorum_signing_payload_bytes(
+            owner_id, new_id, &new_bundle, 1_000, None, &[a_id, a_id],
+        )
+        .unwrap();
+        let dup = vec![
+            (a_id, EnrollmentCert::sign_quorum_part(&a_sk, &payload2)),
+            (a_id, EnrollmentCert::sign_quorum_part(&a_sk, &payload2)),
+        ];
+        assert!(
+            EnrollmentCert::assemble_quorum(owner_id, new_id, new_bundle, 1_000, None, dup)
+                .is_err()
+        );
     }
 
     #[test]

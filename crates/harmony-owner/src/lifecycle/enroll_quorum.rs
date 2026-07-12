@@ -1,5 +1,3 @@
-use crate::cbor;
-use crate::certs::enrollment::EnrollmentSigningPayload;
 use crate::certs::{EnrollmentCert, EnrollmentIssuer, Stance, VouchingCert};
 use crate::lifecycle::EnrollResult;
 use crate::pubkey_bundle::PubKeyBundle;
@@ -74,19 +72,14 @@ pub fn enroll_via_quorum(
     }
     let signers: Vec<[u8; 16]> = quorum_signers.iter().map(|(_, id)| *id).collect();
 
-    // issuer_data for Quorum = cbor(signers list) — matches state.rs verification.
-    let issuer_data = cbor::to_canonical(&signers)?;
-
-    let payload_bytes = cbor::to_canonical(&EnrollmentSigningPayload {
-        version: crate::certs::enrollment::ENROLLMENT_VERSION,
-        owner_id: state.owner_id,
+    let payload_bytes = EnrollmentCert::quorum_signing_payload_bytes(
+        state.owner_id,
         device_id,
-        device_pubkeys: &new_device_pubkey,
-        issued_at: now,
-        expires_at: None,
-        issuer_kind: 1,
-        issuer_data,
-    })?;
+        &new_device_pubkey,
+        now,
+        None,
+        &signers,
+    )?;
 
     let signatures: Vec<Vec<u8>> = quorum_signers
         .iter()
