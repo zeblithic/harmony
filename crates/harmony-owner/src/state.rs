@@ -387,7 +387,7 @@ impl OwnerState {
                 cert.verify(Some(&vk))?;
             }
             crate::certs::RevocationIssuer::Quorum { .. } => {
-                return Err(OwnerError::QuorumRevocationNotImplemented);
+                return Err(OwnerError::QuorumRequiresSignerCerts);
             }
             crate::certs::RevocationIssuer::Master { .. } => {
                 cert.verify(None)?;
@@ -686,10 +686,7 @@ mod tests {
             signature: Vec::new(),
         };
         let result = state.add_revocation(cert);
-        assert!(matches!(
-            result,
-            Err(OwnerError::QuorumRevocationNotImplemented)
-        ));
+        assert!(matches!(result, Err(OwnerError::QuorumRequiresSignerCerts)));
     }
 
     #[test]
