@@ -126,7 +126,7 @@ mod tests {
     fn claim_type_constant() {
         // 0x4D = 'M', 0x45 = 'E'
         assert_eq!(MEMO_CLAIM_TYPE, 0x4D45);
-        assert_eq!(MEMO_CLAIM_TYPE, u16::from_be_bytes([b'M', b'E']));
+        assert_eq!(MEMO_CLAIM_TYPE, u16::from_be_bytes(*b"ME"));
     }
 
     #[test]

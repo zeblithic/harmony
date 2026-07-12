@@ -260,6 +260,14 @@ impl OwnerState {
                             owner: self.owner_id,
                             device: *signer_id,
                         })?;
+                // Depth-1 (ZEB-677 §2): quorum signers must themselves be
+                // Master-issued, or state would admit certs that peer
+                // verification (verify_quorum_with_signers) rejects.
+                if !matches!(signer_enrollment.issuer, EnrollmentIssuer::Master { .. }) {
+                    return Err(OwnerError::InvalidSignature {
+                        cert_type: "Enrollment-Quorum-Signer-Not-Master",
+                    });
+                }
                 if signer_enrollment.issued_at > cert.issued_at {
                     return Err(OwnerError::InvalidSignature {
                         cert_type: "Enrollment-Quorum-Backdated-Signer",
@@ -362,7 +370,15 @@ impl OwnerState {
         Ok(())
     }
 
-    pub fn add_revocation(&mut self, cert: crate::certs::RevocationCert) -> Result<(), OwnerError> {
+    /// `now`/`active_window_secs` (Unix seconds) are used only by the Quorum
+    /// arm's active-signer policy — the same checks as `add_enrollment`'s
+    /// quorum path. SelfDevice/Master verification ignores them.
+    pub fn add_revocation(
+        &mut self,
+        cert: crate::certs::RevocationCert,
+        now: u64,
+        active_window_secs: u64,
+    ) -> Result<(), OwnerError> {
         if cert.owner_id != self.owner_id {
             return Err(OwnerError::WrongOwner {
                 expected: self.owner_id,
@@ -386,8 +402,99 @@ impl OwnerState {
                     })?;
                 cert.verify(Some(&vk))?;
             }
-            crate::certs::RevocationIssuer::Quorum { .. } => {
-                return Err(OwnerError::QuorumRevocationNotImplemented);
+            crate::certs::RevocationIssuer::Quorum {
+                signers,
+                signatures,
+            } => {
+                // Mirror the structural guards RevocationCert::verify /
+                // verify_quorum_with_signers enforce — this arm never calls
+                // either, so it must gate version and the top-level
+                // signature field itself.
+                if cert.version != crate::certs::revocation::REVOCATION_VERSION {
+                    return Err(OwnerError::UnknownVersion(cert.version));
+                }
+                if !cert.signature.is_empty() {
+                    return Err(OwnerError::InvalidSignature {
+                        cert_type: "Revocation-Quorum-Nonempty-Signature",
+                    });
+                }
+                if signers.len() < 2 {
+                    return Err(OwnerError::InsufficientQuorum {
+                        min: 2,
+                        got: signers.len(),
+                    });
+                }
+                if signers.len() != signatures.len() {
+                    return Err(OwnerError::InvalidSignature {
+                        cert_type: "Revocation-Quorum-Length-Mismatch",
+                    });
+                }
+                let unique: std::collections::HashSet<[u8; 16]> = signers.iter().copied().collect();
+                if unique.len() != signers.len() {
+                    return Err(OwnerError::InvalidSignature {
+                        cert_type: "Revocation-Quorum-Duplicate-Signer",
+                    });
+                }
+                for signer_id in signers {
+                    if self.is_revoked(*signer_id) {
+                        return Err(OwnerError::Revoked { device: *signer_id });
+                    }
+                }
+                // Same active-signer policy as add_enrollment's quorum path:
+                // every signer must have fresh liveness. Fleet-internal only —
+                // peer verification (verify_quorum_with_signers) cannot and
+                // does not check liveness.
+                let active = self.active_devices(now, active_window_secs);
+                let active_set: std::collections::HashSet<[u8; 16]> = active.into_iter().collect();
+                for signer_id in signers {
+                    if !active_set.contains(signer_id) {
+                        return Err(OwnerError::InvalidSignature {
+                            cert_type: "Revocation-Quorum-Inactive-Signer",
+                        });
+                    }
+                }
+                let payload_bytes = crate::certs::RevocationCert::quorum_signing_payload_bytes(
+                    cert.owner_id,
+                    cert.target,
+                    cert.issued_at,
+                    &cert.reason,
+                    signers,
+                )?;
+                for (signer_id, sig) in signers.iter().zip(signatures.iter()) {
+                    let signer_enrollment =
+                        self.enrollments
+                            .get(signer_id)
+                            .ok_or(OwnerError::NotEnrolled {
+                                owner: self.owner_id,
+                                device: *signer_id,
+                            })?;
+                    // Depth-1 (ZEB-677 §2): quorum signers must themselves be
+                    // Master-issued, or state would admit certs that peer
+                    // verification (verify_quorum_with_signers) rejects.
+                    if !matches!(signer_enrollment.issuer, EnrollmentIssuer::Master { .. }) {
+                        return Err(OwnerError::InvalidSignature {
+                            cert_type: "Revocation-Quorum-Signer-Not-Master",
+                        });
+                    }
+                    if signer_enrollment.issued_at > cert.issued_at {
+                        return Err(OwnerError::InvalidSignature {
+                            cert_type: "Revocation-Quorum-Backdated-Signer",
+                        });
+                    }
+                    let vk = VerifyingKey::from_bytes(
+                        &signer_enrollment.device_pubkeys.classical.ed25519_verify,
+                    )
+                    .map_err(|_| OwnerError::InvalidSignature {
+                        cert_type: "Revocation-Quorum-Member",
+                    })?;
+                    crate::signing::verify_with_tag(
+                        &vk,
+                        crate::signing::tags::REVOCATION,
+                        &payload_bytes,
+                        sig,
+                        "Revocation-Quorum-Member",
+                    )?;
+                }
             }
             crate::certs::RevocationIssuer::Master { .. } => {
                 cert.verify(None)?;
@@ -419,9 +526,6 @@ impl OwnerState {
 /// Uses the shared `EnrollmentSigningPayload` from `certs/enrollment.rs` so
 /// signing and verification cannot drift apart.
 fn quorum_signing_payload(cert: &EnrollmentCert) -> Result<Vec<u8>, OwnerError> {
-    use crate::cbor;
-    use crate::certs::enrollment::EnrollmentSigningPayload;
-
     let signers = match &cert.issuer {
         EnrollmentIssuer::Quorum { signers, .. } => signers,
         _ => {
@@ -430,20 +534,14 @@ fn quorum_signing_payload(cert: &EnrollmentCert) -> Result<Vec<u8>, OwnerError> 
             })
         }
     };
-
-    // issuer_data for Quorum = cbor(signers list), same as enrollment.rs
-    let issuer_data = cbor::to_canonical(signers)?;
-
-    cbor::to_canonical(&EnrollmentSigningPayload {
-        version: cert.version,
-        owner_id: cert.owner_id,
-        device_id: cert.device_id,
-        device_pubkeys: &cert.device_pubkeys,
-        issued_at: cert.issued_at,
-        expires_at: cert.expires_at,
-        issuer_kind: 1, // Quorum = 1
-        issuer_data,
-    })
+    EnrollmentCert::quorum_signing_payload_bytes(
+        cert.owner_id,
+        cert.device_id,
+        &cert.device_pubkeys,
+        cert.issued_at,
+        cert.expires_at,
+        signers,
+    )
 }
 
 #[cfg(test)]
@@ -536,7 +634,7 @@ mod tests {
             crate::certs::RevocationReason::Decommissioned,
         )
         .unwrap();
-        state.add_revocation(revocation).unwrap();
+        state.add_revocation(revocation, 0, u64::MAX).unwrap();
 
         let active = state.active_devices(1_500_000, 24 * 60 * 60);
         assert!(active.is_empty());
@@ -657,21 +755,92 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn quorum_revocation_rejected_until_implemented() {
-        use crate::certs::{RevocationCert, RevocationIssuer, RevocationReason};
+    /// Master-enrolls A and B (liveness at 1_000_500 ⇒ active), returning
+    /// everything the quorum-revocation tests need.
+    #[allow(clippy::type_complexity)]
+    fn quorum_revoke_world() -> (
+        OwnerState,
+        SigningKey,   // master sk
+        PubKeyBundle, // master bundle
+        SigningKey,   // A sk
+        [u8; 16],     // A id
+        SigningKey,   // B sk
+        [u8; 16],     // B id
+    ) {
         let (master_sk, master_bundle) = keypair_and_bundle();
         let owner_id = master_bundle.identity_hash();
         let (sk_a, bundle_a) = keypair_and_bundle();
-        let device_a_id = bundle_a.identity_hash();
+        let id_a = bundle_a.identity_hash();
+        let (sk_b, bundle_b) = keypair_and_bundle();
+        let id_b = bundle_b.identity_hash();
         let mut state = OwnerState::new(owner_id);
+        for (id, bundle) in [(id_a, bundle_a), (id_b, bundle_b)] {
+            state
+                .add_enrollment(
+                    EnrollmentCert::sign_master(
+                        &master_sk,
+                        master_bundle.clone(),
+                        id,
+                        bundle,
+                        1_000_000,
+                        None,
+                    )
+                    .unwrap(),
+                    1_000_000,
+                    crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+                )
+                .unwrap();
+        }
+        for sk in [&sk_a, &sk_b] {
+            state
+                .add_liveness(LivenessCert::sign(sk, owner_id, 1_000_500).unwrap())
+                .unwrap();
+        }
+        (state, master_sk, master_bundle, sk_a, id_a, sk_b, id_b)
+    }
+
+    fn quorum_revocation_cert(
+        owner_id: [u8; 16],
+        target: [u8; 16],
+        issued_at: u64,
+        parts: Vec<([u8; 16], &SigningKey)>,
+    ) -> crate::certs::RevocationCert {
+        use crate::certs::{RevocationCert, RevocationReason};
+        let signers: Vec<[u8; 16]> = parts.iter().map(|(id, _)| *id).collect();
+        let payload = RevocationCert::quorum_signing_payload_bytes(
+            owner_id,
+            target,
+            issued_at,
+            &RevocationReason::Lost,
+            &signers,
+        )
+        .unwrap();
+        RevocationCert::assemble_quorum(
+            owner_id,
+            target,
+            issued_at,
+            RevocationReason::Lost,
+            parts
+                .into_iter()
+                .map(|(id, sk)| (id, RevocationCert::sign_quorum_part(sk, &payload)))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn quorum_revocation_accepted_with_valid_parts() {
+        // A+B quorum-revoke enrolled device C — the lost-master story.
+        let (mut state, master_sk, master_bundle, sk_a, id_a, sk_b, id_b) = quorum_revoke_world();
+        let (_sk_c, bundle_c) = keypair_and_bundle();
+        let id_c = bundle_c.identity_hash();
         state
             .add_enrollment(
                 EnrollmentCert::sign_master(
                     &master_sk,
                     master_bundle,
-                    device_a_id,
-                    bundle_a,
+                    id_c,
+                    bundle_c,
                     1_000_000,
                     None,
                 )
@@ -681,23 +850,297 @@ mod tests {
             )
             .unwrap();
 
-        // Construct a Quorum revocation manually
-        let cert = RevocationCert {
+        let cert = quorum_revocation_cert(
+            state.owner_id,
+            id_c,
+            1_001_000,
+            vec![(id_a, &sk_a), (id_b, &sk_b)],
+        );
+        state
+            .add_revocation(cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        assert!(state.is_revoked(id_c));
+    }
+
+    #[test]
+    fn quorum_signer_must_be_master_issued_for_enroll_and_revoke() {
+        // Depth-1 at the state layer: quorum-enroll C via A+B, then try to
+        // use C as a quorum signer for a new enrollment AND a revocation —
+        // both must be refused, or state would admit certs peers reject.
+        let (mut state, _m_sk, _m_bundle, sk_a, id_a, sk_b, id_b) = quorum_revoke_world();
+        let (sk_c, bundle_c) = keypair_and_bundle();
+        let id_c = bundle_c.identity_hash();
+        let signers_ab = [id_a, id_b];
+        let payload = EnrollmentCert::quorum_signing_payload_bytes(
+            state.owner_id,
+            id_c,
+            &bundle_c,
+            1_001_000,
+            None,
+            &signers_ab,
+        )
+        .unwrap();
+        let c_cert = EnrollmentCert::assemble_quorum(
+            state.owner_id,
+            id_c,
+            bundle_c,
+            1_001_000,
+            None,
+            vec![
+                (id_a, EnrollmentCert::sign_quorum_part(&sk_a, &payload)),
+                (id_b, EnrollmentCert::sign_quorum_part(&sk_b, &payload)),
+            ],
+        )
+        .unwrap();
+        state
+            .add_enrollment(c_cert, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        state
+            .add_liveness(LivenessCert::sign(&sk_c, state.owner_id, 1_001_100).unwrap())
+            .unwrap();
+
+        // (a) Quorum ENROLLMENT of D signed by [A, C]: C is quorum-issued.
+        let (_sk_d, bundle_d) = keypair_and_bundle();
+        let id_d = bundle_d.identity_hash();
+        let signers_ac = [id_a, id_c];
+        let payload_d = EnrollmentCert::quorum_signing_payload_bytes(
+            state.owner_id,
+            id_d,
+            &bundle_d,
+            1_001_500,
+            None,
+            &signers_ac,
+        )
+        .unwrap();
+        let d_cert = EnrollmentCert::assemble_quorum(
+            state.owner_id,
+            id_d,
+            bundle_d,
+            1_001_500,
+            None,
+            vec![
+                (id_a, EnrollmentCert::sign_quorum_part(&sk_a, &payload_d)),
+                (id_c, EnrollmentCert::sign_quorum_part(&sk_c, &payload_d)),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            state.add_enrollment(d_cert, 1_001_500, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS),
+            Err(OwnerError::InvalidSignature {
+                cert_type: "Enrollment-Quorum-Signer-Not-Master"
+            })
+        ));
+
+        // (b) Quorum REVOCATION of B signed by [A, C]: same refusal.
+        use crate::certs::{RevocationCert, RevocationReason};
+        let rev_payload = RevocationCert::quorum_signing_payload_bytes(
+            state.owner_id,
+            id_b,
+            1_001_500,
+            &RevocationReason::Lost,
+            &signers_ac,
+        )
+        .unwrap();
+        let rev = RevocationCert::assemble_quorum(
+            state.owner_id,
+            id_b,
+            1_001_500,
+            RevocationReason::Lost,
+            vec![
+                (id_a, RevocationCert::sign_quorum_part(&sk_a, &rev_payload)),
+                (id_c, RevocationCert::sign_quorum_part(&sk_c, &rev_payload)),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            state.add_revocation(rev, 1_001_500, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS),
+            Err(OwnerError::InvalidSignature {
+                cert_type: "Revocation-Quorum-Signer-Not-Master"
+            })
+        ));
+    }
+
+    #[test]
+    fn quorum_revocation_rejects_bad_version_and_nonempty_signature() {
+        let (mut state, _m_sk, _m_bundle, sk_a, id_a, sk_b, id_b) = quorum_revoke_world();
+        let _ = id_b;
+        let target = [9u8; 16];
+        let good = quorum_revocation_cert(
+            state.owner_id,
+            target,
+            1_001_000,
+            vec![(id_a, &sk_a), (id_b, &sk_b)],
+        );
+        // Unknown version: the quorum arm never calls RevocationCert::verify,
+        // so it must gate the version itself.
+        let mut bad_version = good.clone();
+        bad_version.version = 2;
+        assert!(matches!(
+            state.add_revocation(
+                bad_version,
+                1_001_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS
+            ),
+            Err(OwnerError::UnknownVersion(2))
+        ));
+        // Nonempty top-level signature: unauthenticated malleable bytes.
+        let mut bad_sig = good;
+        bad_sig.signature = vec![0xAA];
+        assert!(matches!(
+            state.add_revocation(bad_sig, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS),
+            Err(OwnerError::InvalidSignature {
+                cert_type: "Revocation-Quorum-Nonempty-Signature"
+            })
+        ));
+    }
+
+    #[test]
+    fn quorum_revocation_with_garbage_parts_rejected() {
+        use crate::certs::{RevocationCert, RevocationIssuer, RevocationReason};
+        let (mut state, _m_sk, _m_bundle, sk_a, id_a, _sk_b, id_b) = quorum_revoke_world();
+        // Single signer: structural rejection.
+        let single = RevocationCert {
             version: 1,
-            owner_id,
-            target: device_a_id,
+            owner_id: state.owner_id,
+            target: id_b,
             issued_at: 1_001_000,
             issuer: RevocationIssuer::Quorum {
-                signers: vec![device_a_id],
+                signers: vec![id_a],
                 signatures: vec![sk_a.sign(b"dummy").to_bytes().to_vec()],
             },
             reason: RevocationReason::Compromised,
             signature: Vec::new(),
         };
-        let result = state.add_revocation(cert);
         assert!(matches!(
-            result,
-            Err(OwnerError::QuorumRevocationNotImplemented)
+            state.add_revocation(single, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS),
+            Err(OwnerError::InsufficientQuorum { min: 2, got: 1 })
+        ));
+        // Two active enrolled signers but garbage signatures: signature rejection.
+        let garbage = RevocationCert {
+            version: 1,
+            owner_id: state.owner_id,
+            target: [9u8; 16],
+            issued_at: 1_001_000,
+            issuer: RevocationIssuer::Quorum {
+                signers: vec![id_a, id_b],
+                signatures: vec![vec![0u8; 64], vec![0u8; 64]],
+            },
+            reason: RevocationReason::Compromised,
+            signature: Vec::new(),
+        };
+        assert!(matches!(
+            state.add_revocation(garbage, 1_001_000, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS),
+            Err(OwnerError::InvalidSignature {
+                cert_type: "Revocation-Quorum-Member"
+            })
+        ));
+    }
+
+    #[test]
+    fn quorum_revocation_signer_policy_rejections() {
+        // Inactive signers: verify past the active window.
+        let (mut state, _m_sk, _m_bundle, sk_a, id_a, sk_b, id_b) = quorum_revoke_world();
+        let target = [9u8; 16];
+        let cert = quorum_revocation_cert(
+            state.owner_id,
+            target,
+            1_001_000,
+            vec![(id_a, &sk_a), (id_b, &sk_b)],
+        );
+        let far_future = 1_000_500 + crate::trust::DEFAULT_ACTIVE_WINDOW_SECS + 1;
+        assert!(matches!(
+            state.add_revocation(cert, far_future, crate::trust::DEFAULT_ACTIVE_WINDOW_SECS),
+            Err(OwnerError::InvalidSignature {
+                cert_type: "Revocation-Quorum-Inactive-Signer"
+            })
+        ));
+
+        // Unenrolled ghost signer: no liveness either, so the active-window
+        // check (which runs before the enrollment lookup, mirroring
+        // add_enrollment's quorum order) rejects it.
+        let ghost = [0xEEu8; 16];
+        use crate::certs::{RevocationCert, RevocationIssuer, RevocationReason};
+        let signers = vec![id_a, ghost];
+        let payload = RevocationCert::quorum_signing_payload_bytes(
+            state.owner_id,
+            target,
+            1_001_000,
+            &RevocationReason::Lost,
+            &signers,
+        )
+        .unwrap();
+        let ghost_cert = RevocationCert {
+            version: 1,
+            owner_id: state.owner_id,
+            target,
+            issued_at: 1_001_000,
+            issuer: RevocationIssuer::Quorum {
+                signers,
+                signatures: vec![
+                    RevocationCert::sign_quorum_part(&sk_a, &payload),
+                    vec![0u8; 64],
+                ],
+            },
+            reason: RevocationReason::Lost,
+            signature: Vec::new(),
+        };
+        assert!(matches!(
+            state.add_revocation(
+                ghost_cert,
+                1_001_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS
+            ),
+            Err(OwnerError::InvalidSignature {
+                cert_type: "Revocation-Quorum-Inactive-Signer"
+            })
+        ));
+
+        // Backdated: quorum cert issued BEFORE its signers were enrolled.
+        let backdated = quorum_revocation_cert(
+            state.owner_id,
+            target,
+            999_999, // signers enrolled at 1_000_000
+            vec![(id_a, &sk_a), (id_b, &sk_b)],
+        );
+        assert!(matches!(
+            state.add_revocation(
+                backdated,
+                1_001_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS
+            ),
+            Err(OwnerError::InvalidSignature {
+                cert_type: "Revocation-Quorum-Backdated-Signer"
+            })
+        ));
+
+        // Revoked signer: B self-revokes, then A+B quorum must be refused.
+        state
+            .add_revocation(
+                RevocationCert::sign_self(
+                    &sk_b,
+                    state.owner_id,
+                    id_b,
+                    1_002_000,
+                    RevocationReason::Lost,
+                )
+                .unwrap(),
+                1_002_000,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
+            )
+            .unwrap();
+        let revoked_signer = quorum_revocation_cert(
+            state.owner_id,
+            target,
+            1_002_500,
+            vec![(id_a, &sk_a), (id_b, &sk_b)],
+        );
+        assert!(matches!(
+            state.add_revocation(
+                revoked_signer,
+                1_002_500,
+                crate::trust::DEFAULT_ACTIVE_WINDOW_SECS
+            ),
+            Err(OwnerError::Revoked { .. })
         ));
     }
 
@@ -824,7 +1267,7 @@ mod tests {
             crate::certs::RevocationReason::Compromised,
         )
         .unwrap();
-        state.add_revocation(rev).unwrap();
+        state.add_revocation(rev, 0, u64::MAX).unwrap();
 
         let liveness = LivenessCert::sign(&sk_a, owner_id, 1_001_000).unwrap();
         let result = state.add_liveness(liveness);
@@ -905,7 +1348,7 @@ mod tests {
             crate::certs::RevocationReason::Compromised,
         )
         .unwrap();
-        state.add_revocation(rev).unwrap();
+        state.add_revocation(rev, 0, u64::MAX).unwrap();
 
         // Re-enroll attempt with a fresh enrollment cert for the same device_id
         // — must be rejected because the device is revoked (Remove-Wins is permanent).
@@ -1185,7 +1628,7 @@ mod tests {
             crate::certs::RevocationReason::Compromised,
         )
         .unwrap();
-        state.add_revocation(rev).unwrap();
+        state.add_revocation(rev, 0, u64::MAX).unwrap();
 
         let vouch = crate::certs::VouchingCert::sign(
             &sk_a,

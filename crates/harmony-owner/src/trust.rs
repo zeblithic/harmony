@@ -344,7 +344,7 @@ mod tests {
             crate::certs::RevocationReason::Compromised,
         )
         .unwrap();
-        state.add_revocation(rev).unwrap();
+        state.add_revocation(rev, 0, u64::MAX).unwrap();
 
         // Now jump WAY past freshness. A's liveness is stale; B's is also stale
         // (and B is revoked anyway). Freshness scoped to active siblings → no
