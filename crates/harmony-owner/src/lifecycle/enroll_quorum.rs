@@ -41,7 +41,7 @@ pub fn enroll_via_quorum(
     }
     for (sk, id) in &quorum_signers {
         // Must be enrolled
-        let _enrollment = state.enrollments.get(id).ok_or(OwnerError::NotEnrolled {
+        let enrollment = state.enrollments.get(id).ok_or(OwnerError::NotEnrolled {
             owner: state.owner_id,
             device: *id,
         })?;
@@ -54,6 +54,17 @@ pub fn enroll_via_quorum(
             return Err(OwnerError::InvalidSignature {
                 cert_type: "Enrollment-Quorum-Inactive-Signer",
             });
+        }
+        // ZEB-411: signer enrollment must not be expired. Fail-fast here so a
+        // caller learns before signing, matching add_enrollment's apply-time
+        // walk-back (which mirrors peer verify_quorum_with_signers).
+        if let Some(exp) = enrollment.expires_at {
+            if now > exp {
+                return Err(OwnerError::EnrollmentCertExpired {
+                    expires_at: exp,
+                    now_secs: now,
+                });
+            }
         }
         // Provided signing key must match the enrollment's pubkey
         let derived_id =
@@ -336,5 +347,124 @@ mod tests {
             crate::trust::DEFAULT_ACTIVE_WINDOW_SECS,
         );
         assert!(matches!(result, Err(OwnerError::InsufficientQuorum { .. })));
+    }
+
+    /// ZEB-411: build a state with Master signers A (non-expiring) and B
+    /// (`expires_at = b_expires_at`), both live at 1_000_500. Callers pass
+    /// `u64::MAX` as the active window so both stay active at any `now`,
+    /// isolating the signer-cert-expiry check under test.
+    #[allow(clippy::type_complexity)]
+    fn expiring_signer_state(
+        b_expires_at: Option<u64>,
+    ) -> (OwnerState, SigningKey, [u8; 16], SigningKey, [u8; 16]) {
+        let mk = || {
+            let sk = SigningKey::generate(&mut OsRng);
+            let bundle = PubKeyBundle {
+                classical: ClassicalKeys {
+                    ed25519_verify: sk.verifying_key().to_bytes(),
+                    x25519_pub: [0u8; 32],
+                },
+                post_quantum: None,
+            };
+            (sk, bundle)
+        };
+        let (master_sk, master_bundle) = mk();
+        let owner_id = master_bundle.identity_hash();
+        let mut state = OwnerState::new(owner_id);
+        let (sk_a, bundle_a) = mk();
+        let id_a = bundle_a.identity_hash();
+        let (sk_b, bundle_b) = mk();
+        let id_b = bundle_b.identity_hash();
+        state
+            .add_enrollment(
+                EnrollmentCert::sign_master(
+                    &master_sk,
+                    master_bundle.clone(),
+                    id_a,
+                    bundle_a,
+                    1_000_000,
+                    None,
+                )
+                .unwrap(),
+                1_000_000,
+                u64::MAX,
+            )
+            .unwrap();
+        state
+            .add_enrollment(
+                EnrollmentCert::sign_master(
+                    &master_sk,
+                    master_bundle,
+                    id_b,
+                    bundle_b,
+                    1_000_000,
+                    b_expires_at,
+                )
+                .unwrap(),
+                1_000_000,
+                u64::MAX,
+            )
+            .unwrap();
+        for sk in [&sk_a, &sk_b] {
+            state
+                .add_liveness(LivenessCert::sign(sk, owner_id, 1_000_500).unwrap())
+                .unwrap();
+        }
+        (state, sk_a, id_a, sk_b, id_b)
+    }
+
+    #[test]
+    fn enroll_via_quorum_rejects_expired_signer() {
+        // ZEB-411: signer B is a Master enrollment that expired at T=2_000_000.
+        // At now=3_000_000 B is still live (active window) but expired;
+        // enroll_via_quorum must fail-fast with EnrollmentCertExpired, matching
+        // add_enrollment's apply-time rejection so callers learn before signing.
+        let (state, sk_a, id_a, sk_b, id_b) = expiring_signer_state(Some(2_000_000));
+        let new_sk = SigningKey::generate(&mut OsRng);
+        let new_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: new_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let result = enroll_via_quorum(
+            &state,
+            vec![(&sk_a, id_a), (&sk_b, id_b)],
+            &new_sk,
+            new_bundle,
+            3_000_000,
+            u64::MAX,
+        );
+        assert!(matches!(
+            result,
+            Err(OwnerError::EnrollmentCertExpired {
+                expires_at: 2_000_000,
+                now_secs: 3_000_000
+            })
+        ));
+    }
+
+    #[test]
+    fn enroll_via_quorum_accepts_unexpired_signer() {
+        // Positive guard: identical setup at now=1_500_000 (< T) succeeds.
+        let (state, sk_a, id_a, sk_b, id_b) = expiring_signer_state(Some(2_000_000));
+        let new_sk = SigningKey::generate(&mut OsRng);
+        let new_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: new_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let result = enroll_via_quorum(
+            &state,
+            vec![(&sk_a, id_a), (&sk_b, id_b)],
+            &new_sk,
+            new_bundle,
+            1_500_000,
+            u64::MAX,
+        );
+        assert!(result.is_ok());
     }
 }
