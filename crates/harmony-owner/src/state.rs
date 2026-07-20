@@ -268,17 +268,15 @@ impl OwnerState {
                         cert_type: "Enrollment-Quorum-Signer-Not-Master",
                     });
                 }
-                if signer_enrollment.issued_at > cert.issued_at {
-                    return Err(OwnerError::InvalidSignature {
-                        cert_type: "Enrollment-Quorum-Backdated-Signer",
-                    });
-                }
-                // ZEB-411: reject an expired signer enrollment, mirroring the
-                // peer-side `signer_cert.verify(now)` in
-                // `verify_quorum_with_signers`. Expiry is time-relative — a
-                // signer valid when it was added can expire later — so unlike
-                // the signature it can't be inherited from insert-time
-                // verification. Without this, state admits certs peers reject.
+                // ZEB-411: reject an expired signer enrollment *before* the
+                // backdating guard, mirroring peer verification, which runs
+                // `signer_cert.verify(now)` (expiry) before its `issued_at`
+                // ordering check in `verify_quorum_with_signers`. Expiry is
+                // time-relative — a signer valid when it was added can expire
+                // later — so unlike the signature it can't be inherited from
+                // insert-time verification. Placing it first keeps local↔peer
+                // error precedence identical for a signer that is both expired
+                // and backdated. Without this, state admits certs peers reject.
                 if let Some(exp) = signer_enrollment.expires_at {
                     if now > exp {
                         return Err(OwnerError::EnrollmentCertExpired {
@@ -286,6 +284,11 @@ impl OwnerState {
                             now_secs: now,
                         });
                     }
+                }
+                if signer_enrollment.issued_at > cert.issued_at {
+                    return Err(OwnerError::InvalidSignature {
+                        cert_type: "Enrollment-Quorum-Backdated-Signer",
+                    });
                 }
                 let vk = VerifyingKey::from_bytes(
                     &signer_enrollment.device_pubkeys.classical.ed25519_verify,
@@ -490,14 +493,13 @@ impl OwnerState {
                             cert_type: "Revocation-Quorum-Signer-Not-Master",
                         });
                     }
-                    if signer_enrollment.issued_at > cert.issued_at {
-                        return Err(OwnerError::InvalidSignature {
-                            cert_type: "Revocation-Quorum-Backdated-Signer",
-                        });
-                    }
-                    // ZEB-411: reject an expired signer enrollment, mirroring
-                    // the peer-side `signer_cert.verify(now)` in
-                    // `RevocationCert::verify_quorum_with_signers`.
+                    // ZEB-411: reject an expired signer enrollment *before* the
+                    // backdating guard, mirroring the peer-side
+                    // `signer_cert.verify(now)` in
+                    // `RevocationCert::verify_quorum_with_signers` (which runs
+                    // expiry before its `issued_at` ordering check), so
+                    // local↔peer error precedence stays identical for a signer
+                    // that is both expired and backdated.
                     if let Some(exp) = signer_enrollment.expires_at {
                         if now > exp {
                             return Err(OwnerError::EnrollmentCertExpired {
@@ -505,6 +507,11 @@ impl OwnerState {
                                 now_secs: now,
                             });
                         }
+                    }
+                    if signer_enrollment.issued_at > cert.issued_at {
+                        return Err(OwnerError::InvalidSignature {
+                            cert_type: "Revocation-Quorum-Backdated-Signer",
+                        });
                     }
                     let vk = VerifyingKey::from_bytes(
                         &signer_enrollment.device_pubkeys.classical.ed25519_verify,
@@ -1108,6 +1115,78 @@ mod tests {
         );
         state.add_enrollment(cert, 1_500_000, u64::MAX).unwrap();
         assert!(state.enrollments.contains_key(&id_d));
+    }
+
+    #[test]
+    fn add_enrollment_quorum_expiry_precedes_backdating() {
+        // ZEB-411 (Qodo): when a signer is BOTH expired and backdated, the
+        // local walk-back must return EnrollmentCertExpired (not
+        // Backdated-Signer), matching peer verify_quorum_with_signers which
+        // runs signer expiry (via signer_cert.verify(now)) before its issued_at
+        // ordering check. This test fails if the two guards are reordered.
+        let (master_sk, master_bundle) = keypair_and_bundle();
+        let owner_id = master_bundle.identity_hash();
+        let (sk_a, bundle_a) = keypair_and_bundle();
+        let id_a = bundle_a.identity_hash();
+        let (sk_b, bundle_b) = keypair_and_bundle();
+        let id_b = bundle_b.identity_hash();
+        let mut state = OwnerState::new(owner_id);
+        // A: issued early, non-expiring (never backdated vs the candidate).
+        state
+            .add_enrollment(
+                EnrollmentCert::sign_master(
+                    &master_sk,
+                    master_bundle.clone(),
+                    id_a,
+                    bundle_a,
+                    1_000_000,
+                    None,
+                )
+                .unwrap(),
+                1_000_000,
+                u64::MAX,
+            )
+            .unwrap();
+        // B: issued LATER than the candidate (→ backdated) and expiring at 3M.
+        state
+            .add_enrollment(
+                EnrollmentCert::sign_master(
+                    &master_sk,
+                    master_bundle,
+                    id_b,
+                    bundle_b,
+                    2_000_000,
+                    Some(3_000_000),
+                )
+                .unwrap(),
+                2_000_000,
+                u64::MAX,
+            )
+            .unwrap();
+        for sk in [&sk_a, &sk_b] {
+            state
+                .add_liveness(LivenessCert::sign(sk, owner_id, 2_000_500).unwrap())
+                .unwrap();
+        }
+        let (_sk_d, bundle_d) = keypair_and_bundle();
+        let id_d = bundle_d.identity_hash();
+        // Candidate issued_at 1_500_000: A (1_000_000) is not backdated; B
+        // (2_000_000) IS backdated relative to it.
+        let cert = quorum_enroll_cert(
+            state.owner_id,
+            id_d,
+            bundle_d,
+            1_500_000,
+            vec![(id_a, &sk_a), (id_b, &sk_b)],
+        );
+        // Apply at now=4M (> B.expires_at): B is both expired AND backdated.
+        assert!(matches!(
+            state.add_enrollment(cert, 4_000_000, u64::MAX),
+            Err(OwnerError::EnrollmentCertExpired {
+                expires_at: 3_000_000,
+                now_secs: 4_000_000
+            })
+        ));
     }
 
     #[test]
