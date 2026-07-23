@@ -20,6 +20,8 @@ ml-dsa = { workspace = true }
 hybrid-array = { workspace = true }
 keccak = { workspace = true }
 x25519-dalek = { workspace = true }
+curve25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 zeroize = { workspace = true }
 subtle = { workspace = true }
