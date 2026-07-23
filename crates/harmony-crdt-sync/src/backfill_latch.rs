@@ -23,6 +23,10 @@
 //! - [`RootFetchLatch`] — the page-less sibling for a single full-state
 //!   pull, where any reply satisfies and zero replies means no responder.
 //!
+//! Both latches *compose* a private [`RetryState`] that owns the shared
+//! in-flight/backoff bookkeeping and its poll guard, so their retry
+//! semantics cannot drift apart; only the request/paging specifics differ.
+//!
 //! `W` is only ever cloned and equality-compared, never inspected, so a
 //! domain watermark type keeps its own home (and any wire-format contract)
 //! in the caller's crate; the latch stays generic and domain-free.
@@ -68,6 +72,111 @@ pub struct PageOutcome<W> {
     pub limit: usize,
 }
 
+/// One escalation step of the shared retry-backoff schedule: first retry
+/// waits `base` clamped to `cap` (a misconfigured base > cap must not
+/// violate the cap), then doubles per consecutive miss up to the cap. Used
+/// by both latches via their shared [`RetryState`].
+///
+/// The doubling saturates: with a caller-injected `cap_ms` near `u64::MAX`
+/// an unchecked `* 2` could overflow (a debug-build panic, or a release
+/// wrap that clamps *below* the intended delay). `saturating_mul` keeps the
+/// clamp-to-`cap` semantics intact at any magnitude.
+fn arm_backoff_step(current_delay_ms: u64, base_ms: u64, cap_ms: u64) -> u64 {
+    if current_delay_ms == 0 {
+        base_ms.min(cap_ms)
+    } else {
+        current_delay_ms.saturating_mul(2).min(cap_ms)
+    }
+}
+
+/// The guard decision both latches' `next_action` reads out of their
+/// [`RetryState`].
+enum RetryPoll {
+    /// Satisfied — the latch emits its `Idle`.
+    Idle,
+    /// Not yet time to (re)send — the latch emits `WaitUntil(ms)`.
+    Wait(u64),
+    /// Send now — the latch emits its `Request`; the request is in-flight.
+    Fire,
+}
+
+/// Retry/backoff bookkeeping shared by [`BackfillLatch`] and
+/// [`RootFetchLatch`]. Both latches *hold* one of these; only the
+/// request/paging specifics differ. Bundling the six fields plus the
+/// poll guard, satisfy, and backoff-arming transitions in one place keeps
+/// the two latches' retry semantics from drifting apart when one is edited.
+#[derive(Debug, Clone)]
+struct RetryState {
+    /// A completed answer has satisfied the query; cleared by re-arm.
+    satisfied: bool,
+    /// A request has been handed out and no outcome has landed yet.
+    in_flight: bool,
+    /// Earliest wall-clock ms at which the next request may be sent.
+    next_retry_at: u64,
+    /// Current backoff delay (ms); 0 = no consecutive no-reply yet.
+    retry_delay_ms: u64,
+    /// First-retry delay after an unanswered request (ms). Production =
+    /// [`BACKFILL_RETRY_BASE_MS`].
+    retry_base_ms: u64,
+    /// Backoff ceiling (ms). Production = [`BACKFILL_RETRY_CAP_MS`].
+    retry_cap_ms: u64,
+}
+
+impl RetryState {
+    fn new(base_ms: u64, cap_ms: u64) -> Self {
+        Self {
+            satisfied: false,
+            in_flight: false,
+            next_retry_at: 0,
+            retry_delay_ms: 0,
+            retry_base_ms: base_ms,
+            retry_cap_ms: cap_ms,
+        }
+    }
+
+    /// The in-flight/backoff guard shared by both `next_action` impls.
+    fn poll(&mut self, now_ms: u64) -> RetryPoll {
+        if self.satisfied {
+            return RetryPoll::Idle;
+        }
+        if self.in_flight {
+            // A request is already outstanding; nothing new until an outcome
+            // lands. `next_retry_at` may sit in the past here (only
+            // `arm_backoff` moves it), so clamp to `now`.
+            return RetryPoll::Wait(self.next_retry_at.max(now_ms));
+        }
+        if now_ms < self.next_retry_at {
+            return RetryPoll::Wait(self.next_retry_at);
+        }
+        self.in_flight = true;
+        RetryPoll::Fire
+    }
+
+    /// Clear in-flight and backoff so the next poll may fire immediately,
+    /// *without* satisfying (the paging loop's progress branch).
+    fn rearm_now(&mut self, now_ms: u64) {
+        self.in_flight = false;
+        self.retry_delay_ms = 0;
+        self.next_retry_at = now_ms;
+    }
+
+    /// A served answer: satisfied, in-flight + backoff cleared.
+    fn satisfy(&mut self, now_ms: u64) {
+        self.rearm_now(now_ms);
+        self.satisfied = true;
+    }
+
+    /// Clear in-flight, escalate the backoff, and arm the next retry instant.
+    /// The arming saturates so a huge injected delay cannot wrap
+    /// `next_retry_at` into the past (which would defeat the backoff).
+    fn arm_backoff(&mut self, now_ms: u64) {
+        self.in_flight = false;
+        self.retry_delay_ms =
+            arm_backoff_step(self.retry_delay_ms, self.retry_base_ms, self.retry_cap_ms);
+        self.next_retry_at = now_ms.saturating_add(self.retry_delay_ms);
+    }
+}
+
 /// Retry latch + paging state machine for one paginated backfill.
 ///
 /// Drive it by polling [`next_action`](Self::next_action) with the current
@@ -82,21 +191,8 @@ pub struct PageOutcome<W> {
 pub struct BackfillLatch<W> {
     /// Request events strictly after this watermark (`None` = from start).
     since: Option<W>,
-    /// Set by a completed short/empty page; cleared by `reset`.
-    satisfied: bool,
-    /// A `Request` has been handed out and neither `on_page_complete`
-    /// nor `on_no_reply` has been called yet.
-    in_flight: bool,
-    /// Earliest wall-clock ms at which the next request may be sent.
-    next_retry_at: u64,
-    /// Current backoff delay (ms); 0 = no consecutive no-reply yet.
-    retry_delay_ms: u64,
-    /// First-retry delay after an unanswered request (ms). Production =
-    /// [`BACKFILL_RETRY_BASE_MS`]; tests inject smaller values via
-    /// [`Self::new_with_backoff`].
-    retry_base_ms: u64,
-    /// Backoff ceiling (ms). Production = [`BACKFILL_RETRY_CAP_MS`].
-    retry_cap_ms: u64,
+    /// Shared in-flight/backoff bookkeeping.
+    retry: RetryState,
 }
 
 impl<W: Clone + PartialEq> BackfillLatch<W> {
@@ -111,37 +207,23 @@ impl<W: Clone + PartialEq> BackfillLatch<W> {
     pub fn new_with_backoff(watermark: Option<W>, base_ms: u64, cap_ms: u64) -> Self {
         Self {
             since: watermark,
-            satisfied: false,
-            in_flight: false,
-            next_retry_at: 0,
-            retry_delay_ms: 0,
-            retry_base_ms: base_ms,
-            retry_cap_ms: cap_ms,
+            retry: RetryState::new(base_ms, cap_ms),
         }
     }
 
     /// True once a completed short/empty page has answered the query.
     pub fn is_satisfied(&self) -> bool {
-        self.satisfied
+        self.retry.satisfied
     }
 
     /// Decide the next driver action at wall-clock `now_ms`.
     pub fn next_action(&mut self, now_ms: u64) -> BackfillAction<W> {
-        if self.satisfied {
-            return BackfillAction::Idle;
-        }
-        if self.in_flight {
-            // A request is already outstanding; nothing new until an
-            // outcome lands. `next_retry_at` may sit in the past here
-            // (it is only re-armed by `on_no_reply`), so clamp to `now`.
-            return BackfillAction::WaitUntil(self.next_retry_at.max(now_ms));
-        }
-        if now_ms < self.next_retry_at {
-            return BackfillAction::WaitUntil(self.next_retry_at);
-        }
-        self.in_flight = true;
-        BackfillAction::Request {
-            since: self.since.clone(),
+        match self.retry.poll(now_ms) {
+            RetryPoll::Idle => BackfillAction::Idle,
+            RetryPoll::Wait(at) => BackfillAction::WaitUntil(at),
+            RetryPoll::Fire => BackfillAction::Request {
+                since: self.since.clone(),
+            },
         }
     }
 
@@ -158,14 +240,10 @@ impl<W: Clone + PartialEq> BackfillLatch<W> {
     /// - **No progress** (`max_hlc_seen` is `None` or equals the current
     ///   `since`): see the no-progress branch below.
     pub fn on_page_complete(&mut self, outcome: PageOutcome<W>, now_ms: u64) {
-        self.in_flight = false;
-
         let full_page = outcome.limit > 0 && outcome.events >= outcome.limit;
         if !full_page {
             // Spec D24: a served "nothing more" is an answer.
-            self.satisfied = true;
-            self.retry_delay_ms = 0;
-            self.next_retry_at = now_ms;
+            self.retry.satisfy(now_ms);
             return;
         }
         let progressed = outcome.max_hlc_seen.is_some() && outcome.max_hlc_seen != self.since;
@@ -174,8 +252,7 @@ impl<W: Clone + PartialEq> BackfillLatch<W> {
             // verified watermark moved — re-request immediately from the
             // new window, resetting the no-reply backoff.
             self.since = outcome.max_hlc_seen;
-            self.retry_delay_ms = 0;
-            self.next_retry_at = now_ms;
+            self.retry.rearm_now(now_ms);
         } else {
             // No-progress full page: the verified watermark did not move
             // past the window we asked for, so an immediate re-request
@@ -187,7 +264,7 @@ impl<W: Clone + PartialEq> BackfillLatch<W> {
             // satisfying the latch: history may genuinely remain, and the
             // holder set can change, so backing off (rather than declaring
             // done) keeps liveness.
-            self.arm_backoff(now_ms);
+            self.retry.arm_backoff(now_ms);
         }
     }
 
@@ -197,42 +274,15 @@ impl<W: Clone + PartialEq> BackfillLatch<W> {
     /// consecutive no-reply, capped at `retry_cap_ms` (production 600 s);
     /// retries forever (the driver enforces shutdown).
     pub fn on_no_reply(&mut self, now_ms: u64) {
-        self.in_flight = false;
-        self.arm_backoff(now_ms);
-    }
-
-    /// Escalate the retry backoff and arm `next_retry_at`. Shared by
-    /// [`Self::on_no_reply`] and the no-progress full-page branch of
-    /// [`Self::on_page_complete`]. Delegates the step computation to
-    /// `arm_backoff_step`.
-    fn arm_backoff(&mut self, now_ms: u64) {
-        self.retry_delay_ms =
-            arm_backoff_step(self.retry_delay_ms, self.retry_base_ms, self.retry_cap_ms);
-        self.next_retry_at = now_ms.saturating_add(self.retry_delay_ms);
+        self.retry.arm_backoff(now_ms);
     }
 
     /// Re-arm a satisfied latch with a new watermark (transport-recovery
     /// hook); clears in-flight and backoff state. Preserves the configured
     /// backoff schedule.
     pub fn reset(&mut self, watermark: Option<W>) {
-        *self = Self::new_with_backoff(watermark, self.retry_base_ms, self.retry_cap_ms);
-    }
-}
-
-/// One escalation step of the shared retry-backoff schedule: first retry
-/// waits `base` clamped to `cap` (a misconfigured base > cap must not
-/// violate the cap), then doubles per consecutive miss up to the cap.
-/// Shared by [`BackfillLatch`] and [`RootFetchLatch`].
-///
-/// The doubling saturates: with a caller-injected `cap_ms` near `u64::MAX`
-/// an unchecked `* 2` could overflow (a debug-build panic, or a release
-/// wrap that clamps *below* the intended delay). `saturating_mul` keeps the
-/// clamp-to-`cap` semantics intact at any magnitude.
-fn arm_backoff_step(current_delay_ms: u64, base_ms: u64, cap_ms: u64) -> u64 {
-    if current_delay_ms == 0 {
-        base_ms.min(cap_ms)
-    } else {
-        current_delay_ms.saturating_mul(2).min(cap_ms)
+        *self =
+            Self::new_with_backoff(watermark, self.retry.retry_base_ms, self.retry.retry_cap_ms);
     }
 }
 
@@ -252,15 +302,11 @@ pub enum RootFetchAction {
 /// Page-less sibling of [`BackfillLatch`]: a responder always has a root,
 /// so ≥1 reply satisfies and zero replies means no responder. Shares the
 /// spec backoff schedule (30 s base doubling to a 600 s cap, retrying
-/// forever — the driver enforces shutdown).
+/// forever — the driver enforces shutdown) via the same [`RetryState`].
 #[derive(Debug, Clone)]
 pub struct RootFetchLatch {
-    satisfied: bool,
-    in_flight: bool,
-    next_retry_at: u64,
-    retry_delay_ms: u64,
-    retry_base_ms: u64,
-    retry_cap_ms: u64,
+    /// Shared in-flight/backoff bookkeeping.
+    retry: RetryState,
 }
 
 impl RootFetchLatch {
@@ -273,55 +319,38 @@ impl RootFetchLatch {
     /// mirrors [`BackfillLatch::new_with_backoff`]).
     pub fn new_with_backoff(base_ms: u64, cap_ms: u64) -> Self {
         Self {
-            satisfied: false,
-            in_flight: false,
-            next_retry_at: 0,
-            retry_delay_ms: 0,
-            retry_base_ms: base_ms,
-            retry_cap_ms: cap_ms,
+            retry: RetryState::new(base_ms, cap_ms),
         }
     }
 
     /// True once at least one responder has replied.
     pub fn is_satisfied(&self) -> bool {
-        self.satisfied
+        self.retry.satisfied
     }
 
     /// Decide the next driver action at wall-clock `now_ms`.
     pub fn next_action(&mut self, now_ms: u64) -> RootFetchAction {
-        if self.satisfied {
-            return RootFetchAction::Idle;
+        match self.retry.poll(now_ms) {
+            RetryPoll::Idle => RootFetchAction::Idle,
+            RetryPoll::Wait(at) => RootFetchAction::WaitUntil(at),
+            RetryPoll::Fire => RootFetchAction::Request,
         }
-        if self.in_flight {
-            return RootFetchAction::WaitUntil(self.next_retry_at.max(now_ms));
-        }
-        if now_ms < self.next_retry_at {
-            return RootFetchAction::WaitUntil(self.next_retry_at);
-        }
-        self.in_flight = true;
-        RootFetchAction::Request
     }
 
     /// ≥1 responder replied: satisfied, backoff cleared.
     pub fn on_reply(&mut self, now_ms: u64) {
-        self.in_flight = false;
-        self.satisfied = true;
-        self.retry_delay_ms = 0;
-        self.next_retry_at = now_ms;
+        self.retry.satisfy(now_ms);
     }
 
-    /// Zero responders: arm the escalating backoff (same schedule and
-    /// clamp semantics as `BackfillLatch::arm_backoff`).
+    /// Zero responders: arm the escalating backoff (same schedule and clamp
+    /// semantics as [`BackfillLatch::on_no_reply`], via the shared state).
     pub fn on_no_reply(&mut self, now_ms: u64) {
-        self.in_flight = false;
-        self.retry_delay_ms =
-            arm_backoff_step(self.retry_delay_ms, self.retry_base_ms, self.retry_cap_ms);
-        self.next_retry_at = now_ms.saturating_add(self.retry_delay_ms);
+        self.retry.arm_backoff(now_ms);
     }
 
     /// Transport-recovery re-arm: unsatisfy, clear in-flight + backoff.
     pub fn reset(&mut self) {
-        *self = Self::new_with_backoff(self.retry_base_ms, self.retry_cap_ms);
+        *self = Self::new_with_backoff(self.retry.retry_base_ms, self.retry.retry_cap_ms);
     }
 }
 
