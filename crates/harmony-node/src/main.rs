@@ -17,11 +17,9 @@ mod narinfo;
 #[cfg(feature = "nix-cache")]
 pub(crate) mod nix_cache;
 mod runtime;
-// Zenoh-over-tunnel, initiator, and close paths are forward-looking (Bead #3).
-#[allow(dead_code)]
+// ZEB-739 task 5: node-side glue for the shared iroh tunnel stack (harmony-iroh
+// + harmony-tunnel-iroh); the forked `tunnel_task.rs` driver was deleted.
 mod tunnel_bridge;
-#[allow(dead_code)]
-mod tunnel_task;
 
 use clap::{Parser, Subcommand};
 

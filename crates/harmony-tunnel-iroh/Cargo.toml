@@ -1,0 +1,33 @@
+[package]
+name = "harmony-tunnel-iroh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Per-peer iroh QUIC tunnel manager + async driver bridging iroh bi-streams into the harmony-tunnel PQ session"
+
+[dependencies]
+# ZEB-739 iroh-tier (task 5): the workspace is now unified on iroh 1.0, so this
+# crate takes the workspace pin (mirrors harmony-iroh). During tasks 1–4 it
+# direct-pinned `iroh = "1.0"` while the workspace was still on 0.91.
+iroh = { workspace = true }
+harmony-iroh = { workspace = true }
+harmony-tunnel = { workspace = true, features = ["std"] }
+harmony-identity = { workspace = true, features = ["std"] }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+blake3 = { workspace = true }
+futures-util = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }
+tracing = { workspace = true }
+rand = { workspace = true }
+# The v2 tunnel hello frame is CBOR on the wire — preserve it byte-for-byte with
+# the same ciborium + serde-derived `TunnelHello` the client ships (both are
+# already workspace deps; no new third-party crates enter the graph).
+ciborium = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+rand = { workspace = true }

@@ -17,6 +17,7 @@ members = [
     "crates/harmony-identity",
     "crates/harmony-ingest",
     "crates/harmony-inference",
+    "crates/harmony-iroh",
     "crates/harmony-model",
     "crates/harmony-jain",
     "crates/harmony-jcs",
@@ -35,6 +36,7 @@ members = [
     "crates/harmony-roxy",
     "crates/harmony-trust",
     "crates/harmony-tunnel",
+    "crates/harmony-tunnel-iroh",
     "crates/harmony-oluo",
     "crates/harmony-owner",
     "crates/harmony-semantic",
@@ -138,7 +140,7 @@ tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "sig
 tower-http = { version = "0.6", default-features = false }
 zenoh = "1"
 libc = "0.2"
-iroh = "0.91"
+iroh = "1.0"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = "0.3"
 
@@ -199,6 +201,14 @@ harmony-speculative = { path = "crates/harmony-speculative" }
 harmony-telemetry = { path = "crates/harmony-telemetry" }
 harmony-inference = { path = "crates/harmony-inference" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
+# I/O-bearing std crate (ZEB-739 iroh-tier): NO default-features = false — this
+# is the harmony-rawlink form, not the bare-metal form. Takes the workspace iroh
+# pin (the workspace is unified on iroh 1.0).
+harmony-iroh = { path = "crates/harmony-iroh" }
+# I/O-bearing std crate (ZEB-739 iroh-tier, task 4): per-peer PQ tunnel manager +
+# driver over iroh. Like harmony-iroh, NO default-features = false and takes the
+# workspace iroh pin (the workspace is unified on iroh 1.0).
+harmony-tunnel-iroh = { path = "crates/harmony-tunnel-iroh" }
 
 # Optimized profile for cross-compiled deployment binaries (OpenWRT, RPi).
 # Does not affect normal `--release` builds — use `--profile release-cross`.

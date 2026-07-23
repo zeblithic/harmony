@@ -17,3 +17,14 @@
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
 rustflags = ["-C", "link-self-contained=yes"]
+
+# ZEB-739 (iroh-tier): the iroh 1.0 QUIC + rustls + post-quantum tunnel
+# handshake produces very large async state machines; in debug/test builds the
+# per-`#[test]` harness thread and Tokio's worker threads default to ~2 MiB and
+# overflow during a real loopback handshake (harmony-tunnel-iroh's driver
+# tests). std's `thread::min_stack()` reads RUST_MIN_STACK at spawn, and Tokio's
+# worker threads inherit it when the runtime builder sets no explicit
+# `thread_stack_size`, so bumping it to 8 MiB sizes both. Matches
+# harmony-client's `.cargo/config.toml` precedent (same value).
+[env]
+RUST_MIN_STACK = { value = "8388608" }

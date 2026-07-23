@@ -1,0 +1,21 @@
+[package]
+name = "harmony-iroh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Reusable iroh endpoint + ALPN-dispatch substrate for Harmony transports"
+
+[dependencies]
+# ZEB-739 iroh-tier (task 5): the workspace is now unified on iroh 1.0, so this
+# crate takes the workspace pin. (During tasks 1–4 it direct-pinned `iroh = "1.0"`
+# while the workspace was still on 0.91; task 5 flipped the workspace to 1.0.)
+iroh = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
