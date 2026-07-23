@@ -96,6 +96,17 @@ pub struct IrohEndpoint {
     /// path that mutates the endpoint's relay map. Shared via `Arc` so every
     /// `Clone` of this wrapper observes the same live set.
     relay_urls: Arc<Mutex<BTreeSet<RelayUrl>>>,
+    /// Serializes concurrent [`Self::apply_relay_urls`] reconciliations. The
+    /// `relay_urls` `std::sync::Mutex` above only guards each individual
+    /// snapshot/update; without this async lock two concurrent callers could
+    /// each snapshot the same stale `current` set, interleave their
+    /// insert/remove mutations against the live endpoint, and then overwrite the
+    /// tracked set — leaving relays configured that are absent from either
+    /// target and breaking the authoritative-state contract. Held across the
+    /// whole reconcile so snapshot → mutate → tracked-set update is one critical
+    /// section. Shared via `Arc` so every `Clone` serializes against the same
+    /// lock.
+    relay_update_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl IrohEndpoint {
@@ -147,6 +158,7 @@ impl IrohEndpoint {
         Self {
             inner,
             relay_urls: Arc::new(Mutex::new(relay_urls)),
+            relay_update_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -176,6 +188,12 @@ impl IrohEndpoint {
     /// which the counts still reflect so a caller's log matches the intended
     /// diff.
     pub async fn apply_relay_urls(&self, target: &[RelayUrl]) -> (usize, usize) {
+        // Serialize concurrent reconciliations: the snapshot below, the
+        // insert/remove mutations, and the tracked-set update must be one
+        // critical section, or two concurrent callers each acting on the same
+        // stale snapshot can leave the endpoint's relay map inconsistent with
+        // its tracked set (see `relay_update_lock`).
+        let _reconcile_guard = self.relay_update_lock.lock().await;
         let current: BTreeSet<RelayUrl> = {
             let guard = self.relay_urls.lock().unwrap_or_else(|p| p.into_inner());
             guard.clone()
@@ -255,11 +273,12 @@ impl IrohEndpoint {
     }
 
     /// Escape hatch: the raw [`iroh::Endpoint`] for callers that need the full
-    /// iroh API — outbound `.connect()`, inbound `.accept()` (see
-    /// [`crate::dispatch::spawn_accept`]), or any surface not re-exposed here.
+    /// iroh API — outbound `.connect()`, inbound `.accept()` driven against an
+    /// [`crate::dispatch::AlpnDispatchTable`], or any surface not re-exposed
+    /// here.
     ///
     /// Cross-crate `pub` by contract (ZEB-739 Risk #3): the link manager, the
-    /// tunnel driver, and the accept helper all live in downstream crates and
+    /// tunnel driver, and the accept loop all live in downstream crates and
     /// need the raw endpoint. Prefer adding a method to [`IrohEndpoint`] over
     /// reaching through this when the need is general.
     pub fn inner(&self) -> &Endpoint {

@@ -22,9 +22,8 @@
 //!   [`HandshakeOutcome`] per peer; the app supplies a sink (the client's
 //!   network-health registry; harmony-node can use a no-op).
 //!
-//! During the ZEB-739 iroh-tier stage this crate pins `iroh = "1.0"` directly
-//! while the rest of the workspace is still on 0.91; a later unit flips the
-//! whole workspace to 1.0.
+//! This crate takes the workspace's shared `iroh` 1.0 pin — the same version
+//! every iroh-touching crate in the workspace now resolves to.
 
 mod driver;
 mod framing;

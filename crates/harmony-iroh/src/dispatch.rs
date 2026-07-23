@@ -4,10 +4,9 @@
 //! `MultiplexHandshakeDispatcher` that hard-coded a friend/invite/PEX fan-out
 //! and an accept loop with per-ALPN `if/else` arms. Here that collapses to a
 //! data-driven [`AlpnDispatchTable`] — a map from ALPN byte-string to a
-//! [`IrohHandshakeDispatcher`] — plus a generic [`spawn_accept`] loop that
-//! reads each inbound connection's negotiated ALPN and routes it through the
-//! table. Callers register whichever protocols they speak; this crate knows
-//! none of them.
+//! [`IrohHandshakeDispatcher`]. A consumer's accept loop reads each inbound
+//! connection's negotiated ALPN and routes it through the table. Callers
+//! register whichever protocols they speak; this crate knows none of them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -54,48 +53,6 @@ impl AlpnDispatchTable {
     pub fn dispatch_for(&self, alpn: &[u8]) -> Option<Arc<dyn IrohHandshakeDispatcher>> {
         self.routes.get(alpn).cloned()
     }
-}
-
-/// Spawn the inbound-accept loop for `endpoint`: for each incoming connection,
-/// resolve its negotiated ALPN against `table` and hand the connection to the
-/// matched dispatcher on its own task. Connections whose ALPN has no registered
-/// dispatcher are dropped (which closes them); iroh already filters inbound
-/// connections to the ALPNs the endpoint advertised, so an unmatched ALPN is a
-/// defensive tail rather than an expected case.
-///
-/// The loop ends when `endpoint`'s underlying [`iroh::Endpoint`] is closed
-/// (`accept()` then returns `None`) — hold the returned [`tokio::task::JoinHandle`]
-/// to drive shutdown. Errors resolving an individual `Incoming` are swallowed
-/// per-connection so one bad dial can't tear down the loop.
-///
-/// This is deliberately minimal: it carries none of the client's
-/// connection-cap / boot-window-queue / same-peer-supersession machinery, which
-/// was zenoh-transport-specific. A caller needing that layers it inside its
-/// [`IrohHandshakeDispatcher`] implementation.
-pub fn spawn_accept(
-    endpoint: Arc<crate::endpoint::IrohEndpoint>,
-    table: Arc<AlpnDispatchTable>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let ep = endpoint.inner().clone();
-        while let Some(incoming) = ep.accept().await {
-            let table = Arc::clone(&table);
-            tokio::spawn(async move {
-                let conn = match incoming.await {
-                    Ok(c) => c,
-                    // Handshake/connect failed before we ever saw an ALPN.
-                    Err(_) => return,
-                };
-                // `alpn()` returns the negotiated peer ALPN; the returned `Arc`
-                // no longer borrows `conn`, so `conn` can be moved into the
-                // dispatcher.
-                if let Some(dispatcher) = table.dispatch_for(conn.alpn()) {
-                    dispatcher.handle_connection(conn).await;
-                }
-                // else: unknown ALPN — drop `conn` (closes it).
-            });
-        }
-    })
 }
 
 #[cfg(test)]
