@@ -1,0 +1,22 @@
+[package]
+name = "harmony-iroh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Reusable iroh endpoint + ALPN-dispatch substrate for Harmony transports"
+
+[dependencies]
+# DIRECT pin during the ZEB-739 iroh-tier extraction (tasks 1–4): the core
+# workspace is still on iroh 0.91, and a later unit flips the workspace to 1.0
+# and switches this to `{ workspace = true }`. Two iroh versions coexisting in
+# Cargo.lock during this stage is EXPECTED.
+iroh = "1.0"
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

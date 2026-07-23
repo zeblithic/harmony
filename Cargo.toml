@@ -17,6 +17,7 @@ members = [
     "crates/harmony-identity",
     "crates/harmony-ingest",
     "crates/harmony-inference",
+    "crates/harmony-iroh",
     "crates/harmony-model",
     "crates/harmony-jain",
     "crates/harmony-jcs",
@@ -199,6 +200,10 @@ harmony-speculative = { path = "crates/harmony-speculative" }
 harmony-telemetry = { path = "crates/harmony-telemetry" }
 harmony-inference = { path = "crates/harmony-inference" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
+# I/O-bearing std crate (ZEB-739 iroh-tier): NO default-features = false — this
+# is the harmony-rawlink form, not the bare-metal form. Pins iroh 1.0 directly
+# (see the crate's own Cargo.toml) while the workspace is still on 0.91.
+harmony-iroh = { path = "crates/harmony-iroh" }
 
 # Optimized profile for cross-compiled deployment binaries (OpenWRT, RPi).
 # Does not affect normal `--release` builds — use `--profile release-cross`.
