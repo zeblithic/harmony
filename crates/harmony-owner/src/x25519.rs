@@ -6,8 +6,10 @@
 //! matching PRIVATE key is `harmony_crypto::x25519::ed25519_priv_to_x25519`
 //! (`clamp(SigningKey::to_scalar_bytes())`) — derivable on demand from the
 //! Ed25519 signing key, never stored. harmony-client's `dm_signing` wrappers
-//! delegate to the same core module, so all three stay byte-identical by
-//! construction rather than by a hand-maintained contract.
+//! will delegate to the same core module (ZEB-738 client rewire), so once that
+//! lands all three stay byte-identical by construction rather than by a
+//! hand-maintained contract; until then the frozen reference vector below is
+//! the shared anchor.
 
 pub use harmony_crypto::x25519::ed25519_pub_to_x25519;
 

@@ -28,6 +28,19 @@
 //! construction, the framing offsets, or an `info` value makes previously
 //! sealed data unopenable. A fresh, unique nonce per message is mandatory:
 //! callers MUST pass a cryptographically secure RNG.
+//!
+//! # Security: the ephemeral-key header is not authenticated
+//!
+//! The AEAD runs with empty AAD, so the 32-byte ephemeral-public-key header is
+//! not bound to the ciphertext (this matches the frozen client wire format).
+//! Because X25519 ignores the high bit of the u-coordinate, an attacker can
+//! flip the top bit of the final header byte and the recipient still recovers
+//! the **same** plaintext — the envelope is malleable in that bit. This is
+//! benign for an anonymous sealed box: Poly1305 still guarantees plaintext
+//! integrity, and the ephemeral key is unauthenticated by design. Callers must
+//! nonetheless never treat a sealed envelope's exact bytes as a unique
+//! identifier (e.g. for dedup or content-addressing), since a distinct-looking
+//! envelope can decrypt to identical plaintext.
 
 use alloc::vec::Vec;
 use rand_core::CryptoRngCore;
@@ -176,6 +189,29 @@ mod tests {
         assert!(matches!(
             open(&other_priv, &sealed, KAT_INFO),
             Err(CryptoError::AeadDecryptFailed)
+        ));
+    }
+
+    #[test]
+    fn seal_rejects_all_zero_recipient() {
+        // The all-zero X25519 public key is a low-order point: every DH with it
+        // yields an all-zero shared secret, which must be rejected up front.
+        assert!(matches!(
+            seal(&[0u8; 32], KAT_PLAINTEXT, KAT_INFO, &mut OsRng),
+            Err(CryptoError::InvalidPublicKey)
+        ));
+    }
+
+    #[test]
+    fn open_rejects_all_zero_ephemeral() {
+        // A valid-length envelope whose ephemeral-pubkey header is all zero
+        // forces an all-zero shared secret on open — rejected before the AEAD
+        // layer with InvalidPublicKey rather than AeadDecryptFailed.
+        let (recipient_priv, _) = kat_recipient();
+        let envelope = [0u8; SEALED_BOX_OVERHEAD_LEN];
+        assert!(matches!(
+            open(&recipient_priv, &envelope, KAT_INFO),
+            Err(CryptoError::InvalidPublicKey)
         ));
     }
 
