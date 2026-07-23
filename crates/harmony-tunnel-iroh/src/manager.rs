@@ -231,7 +231,12 @@ impl TunnelManager {
     /// Send (or queue) a sealed+signed DM packet to `peer_node_id` over a PQ
     /// tunnel, lazily dialing if no session exists. One call per recipient
     /// device with a [`TunnelPeer`].
-    pub fn send_dm(self: &Arc<Self>, peer_node_id: [u8; 32], contact: &TunnelPeer, packet: Vec<u8>) {
+    pub fn send_dm(
+        self: &Arc<Self>,
+        peer_node_id: [u8; 32],
+        contact: &TunnelPeer,
+        packet: Vec<u8>,
+    ) {
         let mut sessions = self
             .sessions
             .lock()

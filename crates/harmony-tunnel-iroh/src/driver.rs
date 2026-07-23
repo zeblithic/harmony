@@ -155,10 +155,8 @@ pub async fn run_tunnel_responder(
     // (`conn.remote_id()`), the SAME key the failure arm above records under, so
     // we clear symmetrically; otherwise a previously-flagged peer that reconnects
     // INBOUND stays flagged until we happen to dial it outbound.
-    mgr.compat().record_handshake_outcome(
-        *conn.remote_id().as_bytes(),
-        HandshakeOutcome::Compatible,
-    );
+    mgr.compat()
+        .record_handshake_outcome(*conn.remote_id().as_bytes(), HandshakeOutcome::Compatible);
 
     // Register the live responder session so our outbound DMs to this peer
     // reuse the bidirectional tunnel. The manager applies lower-NodeId collision
@@ -415,7 +413,11 @@ async fn initiator_handshake(
         Ok(c) => (c, true),
         Err(e2) => {
             tracing::debug!(err = %e2, "ZEB-623: tunnel v2 connect failed; falling back to v1");
-            match endpoint.inner().connect(addr, alpn::HARMONY_TUNNEL_V1).await {
+            match endpoint
+                .inner()
+                .connect(addr, alpn::HARMONY_TUNNEL_V1)
+                .await
+            {
                 Ok(c) => (c, false),
                 Err(e1) => {
                     return Err(HandshakeFailure::Other(format!(
@@ -782,7 +784,11 @@ mod tests {
     }
 
     /// Build a `TunnelPeer` from a real PQ identity + a real iroh EndpointId.
-    fn peer_from(pq: &PqPrivateIdentity, iroh_id: [u8; 32], relay: Option<iroh::RelayUrl>) -> TunnelPeer {
+    fn peer_from(
+        pq: &PqPrivateIdentity,
+        iroh_id: [u8; 32],
+        relay: Option<iroh::RelayUrl>,
+    ) -> TunnelPeer {
         TunnelPeer {
             node_id: iroh_id,
             pq_identity: pq.public_identity().clone(),
@@ -853,7 +859,12 @@ mod tests {
         ingest_tx: mpsc::Sender<InboundDm>,
         compat: Arc<dyn crate::manager::CompatSink>,
     ) -> Arc<TunnelManager> {
-        Arc::new(TunnelManager::new(wrap(endpoint), local_pq, ingest_tx, compat))
+        Arc::new(TunnelManager::new(
+            wrap(endpoint),
+            local_pq,
+            ingest_tx,
+            compat,
+        ))
     }
 
     // ── ZEB-473 must-have: in-process two-session round-trip (v1) ────────────
