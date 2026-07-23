@@ -4117,6 +4117,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-tunnel-iroh"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ciborium",
+ "futures-util",
+ "harmony-identity",
+ "harmony-iroh",
+ "harmony-tunnel",
+ "iroh 1.0.2",
+ "rand 0.8.5",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "harmony-workflow"
 version = "0.1.0"
 dependencies = [

@@ -36,6 +36,7 @@ members = [
     "crates/harmony-roxy",
     "crates/harmony-trust",
     "crates/harmony-tunnel",
+    "crates/harmony-tunnel-iroh",
     "crates/harmony-oluo",
     "crates/harmony-owner",
     "crates/harmony-semantic",
@@ -204,6 +205,10 @@ harmony-zenoh = { path = "crates/harmony-zenoh" }
 # is the harmony-rawlink form, not the bare-metal form. Pins iroh 1.0 directly
 # (see the crate's own Cargo.toml) while the workspace is still on 0.91.
 harmony-iroh = { path = "crates/harmony-iroh" }
+# I/O-bearing std crate (ZEB-739 iroh-tier, task 4): per-peer PQ tunnel manager +
+# driver over iroh. Like harmony-iroh, NO default-features = false and pins iroh
+# 1.0 directly while the workspace is still on 0.91.
+harmony-tunnel-iroh = { path = "crates/harmony-tunnel-iroh" }
 
 # Optimized profile for cross-compiled deployment binaries (OpenWRT, RPi).
 # Does not affect normal `--release` builds — use `--profile release-cross`.
