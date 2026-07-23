@@ -19,6 +19,9 @@ pub enum CryptoError {
     #[error("AEAD decryption failed (authentication tag mismatch)")]
     AeadDecryptFailed,
 
+    #[error("weak or invalid Diffie-Hellman public key (produced an all-zero shared secret)")]
+    InvalidPublicKey,
+
     #[error("HKDF output length {requested} exceeds maximum ({max})")]
     HkdfLengthExceeded { requested: usize, max: usize },
 

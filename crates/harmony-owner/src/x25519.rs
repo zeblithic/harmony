@@ -1,28 +1,15 @@
 //! RFC 7748 §5 birational map: Ed25519 verify key → X25519 public key.
 //!
-//! ZEB-372. The matching PRIVATE key is `clamp(SigningKey::to_scalar_bytes())`
-//! (shipped in harmony-client as `ed25519_priv_to_x25519`, dm_signing.rs) —
-//! derivable on demand from the Ed25519 signing key, never stored. This module
-//! must stay byte-compatible with harmony-client `ed25519_pub_to_x25519`
-//! (dm_signing.rs): same decompress → small-order reject → Montgomery.
+//! ZEB-372 / ZEB-738. The implementation now lives in
+//! [`harmony_crypto::x25519`] and is re-exported here so existing
+//! `harmony_owner::x25519::ed25519_pub_to_x25519` call sites are unchanged. The
+//! matching PRIVATE key is `harmony_crypto::x25519::ed25519_priv_to_x25519`
+//! (`clamp(SigningKey::to_scalar_bytes())`) — derivable on demand from the
+//! Ed25519 signing key, never stored. harmony-client's `dm_signing` wrappers
+//! delegate to the same core module, so all three stay byte-identical by
+//! construction rather than by a hand-maintained contract.
 
-/// Convert an Ed25519 verify key to its birational X25519 public key
-/// (RFC 7748 §5). Returns `None` when the bytes fail Edwards decompression
-/// (off-curve) or decode to a small-order (torsion) point.
-///
-/// NOT a canonicality gate: curve25519-dalek's decompression reduces the y
-/// field element mod p, so some non-canonical encodings decompress and return
-/// `Some` — never treat `Some(_)` as proof of a canonical Ed25519 encoding.
-/// Callers constructing bundles from freshly generated keys may `expect()`;
-/// callers handling external bytes must propagate the `None`.
-pub fn ed25519_pub_to_x25519(ed25519_pub: &[u8; 32]) -> Option<[u8; 32]> {
-    use curve25519_dalek::edwards::CompressedEdwardsY;
-    let edwards = CompressedEdwardsY(*ed25519_pub).decompress()?;
-    if edwards.is_small_order() {
-        return None;
-    }
-    Some(edwards.to_montgomery().to_bytes())
-}
+pub use harmony_crypto::x25519::ed25519_pub_to_x25519;
 
 #[cfg(test)]
 mod tests {
@@ -55,7 +42,7 @@ mod tests {
     /// Reference vector — pins the derivation scheme. DO NOT regenerate
     /// casually: changing this derivation orphans every sealed blob addressed
     /// to existing bundles (mirrors the harmony-pkarr derive.rs case-vector
-    /// discipline).
+    /// discipline). Identical to `harmony_crypto::x25519`'s frozen vector.
     #[test]
     fn reference_vector_seed_42() {
         let sk = SigningKey::from_bytes(&[0x42u8; 32]);
