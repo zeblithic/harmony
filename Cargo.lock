@@ -3314,6 +3314,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-crdt-sync"
+version = "0.1.0"
+
+[[package]]
 name = "harmony-credential"
 version = "0.1.0"
 dependencies = [

@@ -13,6 +13,7 @@ members = [
     "crates/harmony-content",
     "crates/harmony-db",
     "crates/harmony-crypto",
+    "crates/harmony-crdt-sync",
     "crates/harmony-identity",
     "crates/harmony-ingest",
     "crates/harmony-inference",
@@ -169,6 +170,7 @@ harmony-engram = { path = "crates/harmony-engram", default-features = false }
 harmony-content = { path = "crates/harmony-content", default-features = false }
 harmony-db = { path = "crates/harmony-db" }
 harmony-crypto = { path = "crates/harmony-crypto", default-features = false }
+harmony-crdt-sync = { path = "crates/harmony-crdt-sync", default-features = false }
 harmony-identity = { path = "crates/harmony-identity", default-features = false }
 harmony-jain = { path = "crates/harmony-jain", default-features = false }
 harmony-jcs = { path = "crates/harmony-jcs", default-features = false }
