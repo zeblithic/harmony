@@ -266,6 +266,25 @@ impl IrohEndpoint {
         &self.inner
     }
 
+    /// Wrap an already-bound raw [`iroh::Endpoint`] with an empty tracked relay
+    /// set — the symmetric partner of [`Self::inner`] for downstream crates.
+    ///
+    /// `#[doc(hidden)]` cross-crate test seam (ZEB-739): downstream tunnel /
+    /// link crates build **hermetic** loopback endpoints (`presets::Minimal` +
+    /// `clear_ip_transports()` + `RelayMode::Disabled` + a non-resolving DNS
+    /// resolver) so their round-trip tests never pay the production N0/netdev
+    /// bind cost — core has no vendored-netdev CoreWLAN patch, so a real
+    /// `new_with_secret` bind can stall ~44s on macOS. Those endpoints must then
+    /// be wrapped in an `IrohEndpoint` to satisfy the manager/driver APIs; this
+    /// is the only public constructor that accepts a caller-bound endpoint.
+    /// Hermetic endpoints bind `RelayMode::Disabled`, so the tracked relay set is
+    /// seeded empty (relay-map behavior is exercised through
+    /// [`Self::new_with_secret`] instead).
+    #[doc(hidden)]
+    pub fn from_endpoint_for_test(inner: Endpoint) -> Self {
+        Self::from_parts(inner, BTreeSet::new())
+    }
+
     /// Gracefully close the endpoint and all open connections. Safe to call
     /// multiple times — `iroh::Endpoint::close` is idempotent.
     pub async fn shutdown(&self) {
