@@ -1,0 +1,19 @@
+[package]
+name = "harmony-crdt-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Verified-CRDT-over-pubsub sync substrate — backfill/backoff latches (grows to host the verified-log and snapshot sync engines)"
+
+[features]
+default = ["std"]
+# Placeholder for future std-gated surface (e.g. the sync engines this crate
+# will grow); the backfill/backoff latches are core-only and need neither
+# std nor alloc.
+std = []
+
+[dependencies]
+
+[dev-dependencies]
