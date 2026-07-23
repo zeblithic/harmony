@@ -8,11 +8,10 @@ rust-version.workspace = true
 description = "Per-peer iroh QUIC tunnel manager + async driver bridging iroh bi-streams into the harmony-tunnel PQ session"
 
 [dependencies]
-# DIRECT pin during the ZEB-739 iroh-tier extraction (tasks 1–4): the core
-# workspace is still on iroh 0.91; a later unit flips the workspace to 1.0 and
-# switches this to `{ workspace = true }`. Two iroh versions coexisting in
-# Cargo.lock during this stage is EXPECTED (mirrors harmony-iroh).
-iroh = "1.0"
+# ZEB-739 iroh-tier (task 5): the workspace is now unified on iroh 1.0, so this
+# crate takes the workspace pin (mirrors harmony-iroh). During tasks 1–4 it
+# direct-pinned `iroh = "1.0"` while the workspace was still on 0.91.
+iroh = { workspace = true }
 harmony-iroh = { workspace = true }
 harmony-tunnel = { workspace = true, features = ["std"] }
 harmony-identity = { workspace = true, features = ["std"] }

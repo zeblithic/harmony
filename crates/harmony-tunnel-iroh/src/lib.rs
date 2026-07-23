@@ -40,3 +40,9 @@ pub use manager::{
     node_id_from_dsa_pubkey, CompatSink, HandshakeOutcome, InboundDm, TunnelCommand, TunnelManager,
 };
 pub use peer::TunnelPeer;
+// ZEB-739 task 5: re-export the ALPN wire strings so a consumer (harmony-node)
+// can advertise EXACTLY the ALPNs this crate's driver negotiates on
+// (`run_tunnel_initiator` dials `/v2` then `/v1`; `run_tunnel_responder` reads
+// the generation from `conn.alpn()`). Single-sourcing them here prevents the
+// endpoint's advertised set from drifting from the driver's negotiated set.
+pub use versioning::alpn;

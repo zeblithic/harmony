@@ -221,6 +221,13 @@ impl TunnelManager {
         self.self_node_id
     }
 
+    /// Gracefully close the underlying iroh endpoint. This tears down every live
+    /// tunnel and ends the inbound accept loop (its `accept()` returns `None`).
+    /// Idempotent — `IrohEndpoint::shutdown` is safe to call more than once.
+    pub async fn shutdown(&self) {
+        self.endpoint.shutdown().await;
+    }
+
     /// Seam B: the per-peer protocol-compatibility sink this manager reports to.
     /// The initiator/responder loops record an incompatible peer here (rejected
     /// tunnel hello) and clear it on a later compatible handshake.
@@ -300,6 +307,37 @@ impl TunnelManager {
                 self.dial_or_await(peer_node_id, contact, vec![packet]);
             }
         }
+    }
+
+    /// Proactively establish a PQ tunnel to `peer_node_id` WITHOUT sending a DM.
+    ///
+    /// ZEB-739 task 5: harmony-node pumps no DMs of its own but pre-establishes
+    /// tunnels to peers it discovers (its old forked transport dialed them
+    /// directly). This is the DM-less analog of [`Self::send_dm`]: if no session
+    /// (or in-flight dial) exists for the peer, it initiates one through the
+    /// SAME single-dialer election ([`Self::dial_or_await`]) with an EMPTY
+    /// pending queue, so the tunnel is brought up (handshake + keepalive) but
+    /// carries no application frame until something is sent. Routing through the
+    /// election is load-bearing: it prevents a concurrent inbound + outbound to
+    /// the same peer from landing a `Responder` handle under our key while our
+    /// own dial completes (which would trip `note_active`'s invariant assert).
+    ///
+    /// Idempotent: a no-op when a `Dialing`/`Active`/`AwaitingInbound`/`Closing`
+    /// handle already exists for the peer.
+    pub fn ensure_tunnel(self: &Arc<Self>, peer_node_id: [u8; 32], contact: &TunnelPeer) {
+        {
+            let sessions = self
+                .sessions
+                .lock()
+                .expect("tunnel sessions mutex poisoned");
+            if sessions.contains_key(&peer_node_id) {
+                return;
+            }
+        }
+        // No session yet — initiate through the single-dialer election. The
+        // spawn_dial / spawn_await_inbound paths re-check under the lock for a
+        // racing `register_inbound`, so this drop-then-dial can't double-install.
+        self.dial_or_await(peer_node_id, contact, Vec::new());
     }
 
     /// ZEB-485 single-dialer gate. The LOWER NodeId is the sole dialer; the

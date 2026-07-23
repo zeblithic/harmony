@@ -1,81 +1,47 @@
-//! Bridge between spawned iroh tunnel tasks and the main event loop.
+//! Node-side glue for the shared iroh tunnel stack (harmony-iroh +
+//! harmony-tunnel-iroh).
 //!
-//! Each active tunnel connection runs in its own spawned task. Events flow
-//! back to the select loop via an mpsc channel, matching the pattern used
-//! for Zenoh task bridging.
+//! ZEB-739 (task 5): harmony-node's forked per-connection tunnel driver (the old
+//! `tunnel_task.rs`) was deleted and the node rewired onto the shared
+//! `harmony-tunnel-iroh` crate — the single home for the DM-over-iroh tunnel the
+//! client also uses. This module holds the two small node-specific adapters the
+//! shared crate needs, plus the node's monotonic clock:
+//!
+//!  * [`NodeCompatSink`] — a no-op [`CompatSink`]. The client surfaces protocol
+//!    incompatibility in a network-health view; harmony-node has no such UI, so
+//!    it discards the driver's per-peer compatibility reports.
+//!  * [`millis_since_start`] — the node's process-global monotonic clock, used
+//!    for `RuntimeEvent` timestamps and deferred-dial scheduling. (The shared
+//!    driver keeps its OWN private epoch for `TunnelSession` timestamps; the two
+//!    never compare across the boundary, so separate epochs are fine.)
+//!
+//! The node is NOT a DM consumer: inbound DMs the shared driver surfaces on its
+//! ingest channel are drained-and-dropped by the event loop, preserving the old
+//! `tunnel_task` behavior of ignoring `DmReceived`. The node's Zenoh- and
+//! replication-over-tunnel paths were verified dead (all send sites are stubs;
+//! the shared DM-only driver drops any inbound non-DM frame) and elided.
 
-use tokio::sync::mpsc;
+use std::time::Instant;
 
-/// Events sent from tunnel tasks to the main select loop.
-#[derive(Debug)]
-pub enum TunnelBridgeEvent {
-    /// A tunnel handshake completed — peer is authenticated.
-    HandshakeComplete {
-        /// Short hex identifier for the tunnel interface name.
-        interface_name: String,
-        /// The remote peer's NodeId (BLAKE3 of ML-DSA pubkey), for routing.
-        peer_node_id: [u8; 32],
-        /// The remote peer's ML-DSA public key bytes.
-        peer_dsa_pubkey: Vec<u8>,
-        /// Monotonic connection ID assigned by the event loop.
-        connection_id: u64,
-    },
-    /// A decrypted Zenoh message arrived from a tunnel peer.
-    ZenohReceived {
-        interface_name: String,
-        message: Vec<u8>,
-        connection_id: u64,
-    },
-    /// A replication message arrived from a tunnel peer.
-    ReplicationReceived {
-        interface_name: String,
-        message: Vec<u8>,
-        connection_id: u64,
-    },
-    /// A tunnel connection was closed or errored.
-    TunnelClosed {
-        interface_name: String,
-        reason: String,
-        /// Monotonic connection ID — only remove the sender if it matches.
-        connection_id: u64,
-    },
-}
+use harmony_tunnel_iroh::{CompatSink, HandshakeOutcome};
 
-/// Handle for sending commands into a tunnel task (held by the event loop).
-#[derive(Debug)]
-pub struct TunnelSender {
-    tx: mpsc::Sender<TunnelCommand>,
-    /// Monotonic connection ID for stale-close detection.
-    pub connection_id: u64,
-}
-
-/// Commands sent from the event loop to a tunnel task.
-#[derive(Debug)]
-pub enum TunnelCommand {
-    /// Send a Zenoh message through this tunnel.
-    SendZenoh { message: Vec<u8> },
-    /// Close this tunnel.
-    Close,
-}
-
-/// A QUIC connection that completed its handshake and is ready for tunnel setup.
+/// No-op protocol-compatibility sink for harmony-node.
 ///
-/// Sent from a spawned handshake task back to the event loop via an mpsc channel,
-/// so the QUIC round-trip doesn't block the select loop.
-pub struct ReadyConnection {
-    pub connection: iroh::endpoint::Connection,
-    pub connection_id: u64,
-    pub interface_name: String,
-    /// For initiator connections: the peer's PQ identity for the handshake.
-    /// None for responder connections (identity learned during handshake).
-    pub remote_pq_identity: Option<harmony_identity::PqIdentity>,
-    /// For initiator connections: the transient iroh Endpoint that must stay alive
-    /// for the duration of the connection. None for responder connections.
-    pub initiator_endpoint: Option<iroh::Endpoint>,
+/// The tunnel driver reports one [`HandshakeOutcome`] per peer (compatible /
+/// incompatible-hello). harmony-node has no network-health surface to join those
+/// on, so it discards them — the DM tunnel is otherwise a no-op on this node.
+pub struct NodeCompatSink;
+
+impl CompatSink for NodeCompatSink {
+    fn record_handshake_outcome(&self, _peer: [u8; 32], _outcome: HandshakeOutcome) {}
 }
 
-impl TunnelSender {
-    pub fn new(tx: mpsc::Sender<TunnelCommand>, connection_id: u64) -> Self {
-        Self { tx, connection_id }
-    }
+/// Monotonic milliseconds since the first call (process-global epoch).
+///
+/// Used for `RuntimeEvent` timestamps and deferred-dial fire times. Shared epoch
+/// across all node callers via `OnceLock`.
+pub fn millis_since_start() -> u64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }

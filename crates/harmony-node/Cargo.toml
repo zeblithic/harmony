@@ -38,6 +38,10 @@ harmony-rawlink = { workspace = true, optional = true }
 harmony-runtime.workspace = true
 harmony-s3 = { workspace = true, optional = true }
 harmony-tunnel = { workspace = true, features = ["std"] }
+# ZEB-739 iroh-tier (task 5): the node's forked transport (old `tunnel_task.rs`)
+# is deleted and rewired onto these two shared core crates.
+harmony-iroh.workspace = true
+harmony-tunnel-iroh.workspace = true
 iroh = { workspace = true }
 harmony-crypto = { workspace = true, features = ["std"] }
 harmony-identity = { workspace = true, features = ["std"] }
