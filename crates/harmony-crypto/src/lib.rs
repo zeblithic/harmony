@@ -2,6 +2,7 @@
 extern crate alloc;
 
 pub mod aead;
+pub mod capability;
 pub mod error;
 pub mod fernet;
 pub mod hash;
