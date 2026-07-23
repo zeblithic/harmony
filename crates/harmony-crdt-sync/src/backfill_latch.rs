@@ -208,7 +208,7 @@ impl<W: Clone + PartialEq> BackfillLatch<W> {
     fn arm_backoff(&mut self, now_ms: u64) {
         self.retry_delay_ms =
             arm_backoff_step(self.retry_delay_ms, self.retry_base_ms, self.retry_cap_ms);
-        self.next_retry_at = now_ms + self.retry_delay_ms;
+        self.next_retry_at = now_ms.saturating_add(self.retry_delay_ms);
     }
 
     /// Re-arm a satisfied latch with a new watermark (transport-recovery
@@ -223,11 +223,16 @@ impl<W: Clone + PartialEq> BackfillLatch<W> {
 /// waits `base` clamped to `cap` (a misconfigured base > cap must not
 /// violate the cap), then doubles per consecutive miss up to the cap.
 /// Shared by [`BackfillLatch`] and [`RootFetchLatch`].
+///
+/// The doubling saturates: with a caller-injected `cap_ms` near `u64::MAX`
+/// an unchecked `* 2` could overflow (a debug-build panic, or a release
+/// wrap that clamps *below* the intended delay). `saturating_mul` keeps the
+/// clamp-to-`cap` semantics intact at any magnitude.
 fn arm_backoff_step(current_delay_ms: u64, base_ms: u64, cap_ms: u64) -> u64 {
     if current_delay_ms == 0 {
         base_ms.min(cap_ms)
     } else {
-        (current_delay_ms * 2).min(cap_ms)
+        current_delay_ms.saturating_mul(2).min(cap_ms)
     }
 }
 
@@ -311,7 +316,7 @@ impl RootFetchLatch {
         self.in_flight = false;
         self.retry_delay_ms =
             arm_backoff_step(self.retry_delay_ms, self.retry_base_ms, self.retry_cap_ms);
-        self.next_retry_at = now_ms + self.retry_delay_ms;
+        self.next_retry_at = now_ms.saturating_add(self.retry_delay_ms);
     }
 
     /// Transport-recovery re-arm: unsatisfy, clear in-flight + backoff.
@@ -395,6 +400,27 @@ mod tests {
         assert_eq!(arm_backoff_step(200, 100, 400), 400);
         // capped.
         assert_eq!(arm_backoff_step(400, 100, 400), 400);
+    }
+
+    #[test]
+    fn backoff_arithmetic_saturates_near_u64_max() {
+        // Doubling must not overflow: with a huge current delay and cap, the
+        // step saturates rather than wrapping below the intended value.
+        assert_eq!(arm_backoff_step(u64::MAX, 100, u64::MAX), u64::MAX);
+        assert_eq!(arm_backoff_step(u64::MAX / 2 + 1, 100, u64::MAX), u64::MAX);
+
+        // Arming `next_retry_at` must not wrap to the past: `now + delay`
+        // saturates, so the latch waits (never immediately re-fires).
+        let mut l = BackfillLatch::<W>::new_with_backoff(Some(0), u64::MAX, u64::MAX);
+        assert_eq!(l.next_action(0), BackfillAction::Request { since: Some(0) });
+        l.on_no_reply(u64::MAX); // now + delay = u64::MAX + u64::MAX -> saturates
+        assert_eq!(l.next_action(0), BackfillAction::WaitUntil(u64::MAX));
+
+        // Same guarantee for the page-less root-fetch latch.
+        let mut r = RootFetchLatch::new_with_backoff(u64::MAX, u64::MAX);
+        assert_eq!(r.next_action(0), RootFetchAction::Request);
+        r.on_no_reply(u64::MAX);
+        assert_eq!(r.next_action(0), RootFetchAction::WaitUntil(u64::MAX));
     }
 
     /// Golden decision-sequence: a fixed script of polls + outcomes must

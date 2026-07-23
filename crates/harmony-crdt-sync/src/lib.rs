@@ -18,7 +18,11 @@
 //! wait, idle) and leave *doing* it (transport, timers, persistence) to a
 //! caller-supplied driver.
 
-#![cfg_attr(not(feature = "std"), no_std)]
+// no_std when the `std` feature is off — except under `test`, where the
+// test harness always links std (so the unit tests may use `Vec`/`vec!`
+// even in a `--no-default-features` test build). The library's own no_std
+// cleanliness is still enforced by a non-test `--no-default-features` build.
+#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 
 pub mod backfill_latch;
 
