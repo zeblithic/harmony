@@ -202,12 +202,12 @@ harmony-telemetry = { path = "crates/harmony-telemetry" }
 harmony-inference = { path = "crates/harmony-inference" }
 harmony-zenoh = { path = "crates/harmony-zenoh" }
 # I/O-bearing std crate (ZEB-739 iroh-tier): NO default-features = false — this
-# is the harmony-rawlink form, not the bare-metal form. Pins iroh 1.0 directly
-# (see the crate's own Cargo.toml) while the workspace is still on 0.91.
+# is the harmony-rawlink form, not the bare-metal form. Takes the workspace iroh
+# pin (the workspace is unified on iroh 1.0).
 harmony-iroh = { path = "crates/harmony-iroh" }
 # I/O-bearing std crate (ZEB-739 iroh-tier, task 4): per-peer PQ tunnel manager +
-# driver over iroh. Like harmony-iroh, NO default-features = false and pins iroh
-# 1.0 directly while the workspace is still on 0.91.
+# driver over iroh. Like harmony-iroh, NO default-features = false and takes the
+# workspace iroh pin (the workspace is unified on iroh 1.0).
 harmony-tunnel-iroh = { path = "crates/harmony-tunnel-iroh" }
 
 # Optimized profile for cross-compiled deployment binaries (OpenWRT, RPi).
