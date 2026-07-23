@@ -635,16 +635,21 @@ impl TunnelManager {
                 return;
             }
             // G1 (ZEB-473): "our dial wins over a responder handle in our slot"
-            // is UNREACHABLE today — the initiator never calls `register_inbound`,
-            // so a Responder handle never sits under our key when our own dial
-            // completes. The old code silently `return`ed here, which would have
-            // ORPHANED our just-completed initiator task (its loop would run with
-            // no manager handle) if the invariant ever broke. Make it loud so a
-            // future regression that lands a responder under our key is caught
-            // immediately rather than leaking a running loop.
+            // is UNREACHABLE, guaranteed by `register_inbound`'s dedup — NOT
+            // (as an earlier comment wrongly claimed) because the initiator never
+            // calls `register_inbound` (it does). The real guarantee: when we are
+            // the lower-NodeId winner with a dial in flight, our `Dialing`
+            // Initiator handle holds the slot, and any racing inbound is dropped
+            // by `keep_new(peer, self)` being false for `self < peer` (the
+            // else-branch above). So `note_active` always finds our own Initiator
+            // here, never a Responder. A Responder only replaces our handle when
+            // we are the HIGHER node, and then `keep_ours` is false → we returned
+            // above. Kept as a loud tripwire so a future refactor that breaks that
+            // dedup is caught immediately rather than silently orphaning the loop.
             unreachable!(
-                "note_active: a Responder handle won dedup against our own completing dial — \
-                 the initiator never registers an inbound session, so this is an invariant break"
+                "note_active: a Responder handle won dedup against our own completing dial \
+                 despite us being the lower-NodeId winner — register_inbound's dedup that drops \
+                 the peer's inbound (keep_new false for self < peer) must have been broken"
             );
         }
 
