@@ -36,6 +36,16 @@ pub const CAPABILITY_TAG_LEN: usize = 32;
 /// - `salt`: optional HKDF salt (HKDF defaults to 32 zero bytes when `None`)
 /// - `info`: HKDF context label — the domain separator for the derived key
 /// - `message`: the payload to authenticate
+///
+/// # Warning
+///
+/// `salt` and `info` bind the derived key to a purpose: two calls that differ
+/// in their effective `salt` bytes or in `info` derive unrelated keys whose
+/// tags will not verify against each other. Passing `None` selects HKDF's
+/// default salt — `HashLen` zero bytes (32 for SHA-256) — so `None` is
+/// equivalent to an explicit all-zero salt, not a separate "unsalted" domain.
+/// The rule that matters: keep `salt` and `info` identical between the minting
+/// and verifying sides.
 pub fn capability_tag(
     secret: &[u8],
     salt: Option<&[u8]>,
@@ -142,8 +152,21 @@ mod tests {
             base,
             capability_tag(&secret, Some(&[1u8; 16]), b"other-purpose", &msg)
         );
-        // No salt -> different tag (salt is load-bearing).
+        // A non-zero salt differs from None's all-zero default salt -> different tag.
         assert_ne!(base, capability_tag(&secret, None, INFO, &msg));
+    }
+
+    #[test]
+    fn none_salt_equals_explicit_all_zero_salt() {
+        // Per RFC 5869, a `None` salt is HKDF's default of HashLen zero bytes
+        // (32 for SHA-256), so `None` and an explicit 32-byte all-zero salt
+        // derive the same key and tag. Pins the `# Warning`'s central claim.
+        let secret = [3u8; 32];
+        let msg = sample_message();
+        assert_eq!(
+            capability_tag(&secret, None, INFO, &msg),
+            capability_tag(&secret, Some(&[0u8; 32]), INFO, &msg),
+        );
     }
 
     #[test]
