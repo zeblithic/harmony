@@ -39,12 +39,15 @@ The design rule that makes one function back three formats: **the caller supplie
 
 ```rust
 /// Argon2id cost parameters. Caller-supplied because each on-disk format encodes
-/// these values in its own header and must round-trip unchanged.
+/// these values in its own header and must round-trip unchanged. Fields are
+/// private so the validating `new()` is the only way to obtain an instance — no
+/// invalid params are constructible. Callers build from their own wire constants
+/// and never read them back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Argon2idParams {
-    pub m_kib: u32,
-    pub t_cost: u32,
-    pub p_cost: u32,
+    m_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
 }
 
 impl Argon2idParams {
