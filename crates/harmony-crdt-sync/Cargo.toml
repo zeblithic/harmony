@@ -9,9 +9,10 @@ description = "Verified-CRDT-over-pubsub sync substrate — backfill/backoff lat
 
 [features]
 default = ["std"]
-# Placeholder for future std-gated surface (e.g. the sync engines this crate
-# will grow); the backfill/backoff latches are core-only and need neither
-# std nor alloc.
+# `std` is default-on but non-essential: the crate is `no_std` + `alloc`
+# (the verified-log engine and backfill latches need only `alloc`; the
+# snapshot sync engine that will land later needs a runtime and lives behind
+# this feature).
 std = []
 
 [dependencies]
