@@ -221,6 +221,24 @@ impl TunnelManager {
         self.self_node_id
     }
 
+    /// The number of tunnel handles the manager currently holds — the total
+    /// tunnel population, counting every state (`Dialing`/`AwaitingInbound`/
+    /// `Active`/`Closing`) and both directions (inbound `Responder` handles from
+    /// [`register_inbound`](Self::register_inbound) and outbound `Initiator`
+    /// handles from [`ensure_tunnel`](Self::ensure_tunnel)/[`send_dm`](Self::send_dm)).
+    ///
+    /// A caller that drives outbound dials (harmony-node's discovery-fed
+    /// `ensure_tunnel` drain, ZEB-740) reads this to bound the population against
+    /// a cap before initiating a new tunnel, restoring the single total-tunnel
+    /// bound the pre-ZEB-739 forked transport enforced on one counter. Read-only;
+    /// briefly takes the sessions lock.
+    pub fn live_tunnel_count(&self) -> usize {
+        self.sessions
+            .lock()
+            .expect("tunnel sessions mutex poisoned")
+            .len()
+    }
+
     /// Gracefully close the underlying iroh endpoint. This tears down every live
     /// tunnel and ends the inbound accept loop (its `accept()` returns `None`).
     /// Idempotent — `IrohEndpoint::shutdown` is safe to call more than once.
@@ -813,6 +831,35 @@ mod tests {
             mgr.handle_snapshot(&peer).map(|(s, r, _)| (s, r)),
             Some((TunnelHandleState::Active, TunnelRole::Responder)),
             "a single survivor remains after a colliding inbound register"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_tunnel_count_tracks_session_population() {
+        // ZEB-740: the outbound population bound reads this count. It must equal
+        // the number of live handles across all states/roles, and fall as
+        // sessions close.
+        let (mgr, _ingest_rx) = test_manager().await;
+        assert_eq!(
+            mgr.live_tunnel_count(),
+            0,
+            "a fresh manager holds no tunnels"
+        );
+
+        let (_rx_a, epoch_a) = mgr.register_inbound(fixed_node_id(0x41));
+        let (_rx_b, _epoch_b) = mgr.register_inbound(fixed_node_id(0x42));
+        assert_eq!(
+            mgr.live_tunnel_count(),
+            2,
+            "each registered inbound session counts toward the population"
+        );
+
+        // Closing one session (epoch-matched eviction) decrements the count.
+        mgr.note_closed(fixed_node_id(0x41), epoch_a);
+        assert_eq!(
+            mgr.live_tunnel_count(),
+            1,
+            "a closed session no longer counts toward the population"
         );
     }
 
