@@ -130,6 +130,13 @@ const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 #[allow(dead_code)]
 const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// ZEB-740: upper bound on the deferred-dial backlog. Each `InitiateTunnel`
+/// action queues a dial delayed 500–4000ms (timing-privacy); a discovery flood
+/// could otherwise grow the heap without limit. Generous headroom over the
+/// tunnel-population cap (`MAX_TUNNEL_CONNECTIONS`) since queued dials drain as
+/// they fire, but bounded so a burst can't exhaust memory.
+const MAX_DEFERRED_DIALS: usize = 1024;
+
 #[allow(dead_code)]
 impl ConfigTunnelPeers {
     fn new(entries: Vec<crate::config::TunnelEntry>) -> Self {
@@ -558,6 +565,25 @@ pub async fn run(
             tokio::spawn(async move {
                 let inner = accept_ep.inner().clone();
                 while let Some(incoming) = inner.accept().await {
+                    // ZEB-740: gate inbound on the TOTAL tunnel population too, so
+                    // inbound and outbound share ONE budget — the pre-#291
+                    // single-counter semantics. The semaphore below still bounds
+                    // concurrent inbound HANDSHAKE work; this additionally refuses
+                    // a new inbound tunnel once the manager already holds
+                    // `MAX_TUNNEL_CONNECTIONS` sessions (inbound `Responder` +
+                    // outbound `Initiator`), so a full outbound population can't be
+                    // topped up past the cap via inbound. Soft bound, like the
+                    // outbound drain: the count is read before `register_inbound`
+                    // installs, so a burst of concurrent handshakes can overshoot,
+                    // but only up to the inbound semaphore's worth.
+                    if accept_mgr.live_tunnel_count() >= MAX_TUNNEL_CONNECTIONS {
+                        tracing::warn!(
+                            limit = MAX_TUNNEL_CONNECTIONS,
+                            "tunnel population cap reached — rejecting inbound"
+                        );
+                        drop(incoming);
+                        continue;
+                    }
                     let permit = match Arc::clone(&limit).try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => {
@@ -1431,6 +1457,31 @@ pub async fn run(
                         continue;
                     };
 
+                    // ZEB-740: restore the total-tunnel-population bound the
+                    // ZEB-739 un-fork dropped for the OUTBOUND path. The old
+                    // forked transport gated accepts + inflight dials on ONE
+                    // counter (`MAX_TUNNEL_CONNECTIONS`); the shared model kept
+                    // only the inbound semaphore (the accept loop above). The
+                    // manager's `live_tunnel_count()` is the TOTAL population
+                    // (inbound `Responder` + outbound `Initiator` handles), so
+                    // gating outbound `ensure_tunnel` on it restores that single
+                    // total cap — a discovery flood can no longer grow an
+                    // unbounded tunnel-handle/task population (fd/mem/CPU).
+                    //
+                    // Soft bound: count-then-`ensure_tunnel` is not atomic (an
+                    // inbound accept can install a session between the read and
+                    // the manager's insert), but the overshoot is itself bounded
+                    // by the inbound semaphore and this drain is single-threaded —
+                    // the same check-then-spawn non-atomicity the old cap had.
+                    if mgr.live_tunnel_count() >= MAX_TUNNEL_CONNECTIONS {
+                        tracing::warn!(
+                            limit = MAX_TUNNEL_CONNECTIONS,
+                            identity = %hex::encode(dial.identity_hash),
+                            "tunnel population cap reached — dropping deferred dial"
+                        );
+                        continue;
+                    }
+
                     // Construct the peer's PQ identity from the announce's public
                     // key bytes (the initiator authenticates the peer with it).
                     let remote_pq_identity =
@@ -1655,6 +1706,18 @@ async fn dispatch_action(
             peer_dsa_pubkey,
             peer_kem_pubkey,
         } => {
+            // ZEB-740: bound the deferred-dial backlog. Reject-newest past the
+            // cap — the peer is re-announced by periodic discovery, so a dropped
+            // enqueue is recovered on the next round, whereas an unbounded heap
+            // under a discovery flood is not.
+            if deferred_dials.len() >= MAX_DEFERRED_DIALS {
+                tracing::warn!(
+                    limit = MAX_DEFERRED_DIALS,
+                    identity = %hex::encode(identity_hash),
+                    "deferred-dial queue full — dropping tunnel initiation"
+                );
+                return;
+            }
             let delay_ms = 500 + (rand::random::<u64>() % 3500);
             let fire_at = millis_since_start() + delay_ms;
             deferred_dials.push(Reverse(DeferredDial {
