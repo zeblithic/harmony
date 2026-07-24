@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::recovery::error::RecoveryError;
 use crate::recovery::wire::{
-    parse_header, serialize_header, HEADER_LEN, KDF_M_KIB, KDF_P, KDF_T, MAX_FILE_LEN, MIN_FILE_LEN,
-    NONCE_LEN, SALT_LEN,
+    parse_header, serialize_header, HEADER_LEN, KDF_M_KIB, KDF_P, KDF_T, MAX_FILE_LEN,
+    MIN_FILE_LEN, NONCE_LEN, SALT_LEN,
 };
 use harmony_crypto::password_envelope::{self, Argon2idParams};
 use rand_core::{OsRng, RngCore};
