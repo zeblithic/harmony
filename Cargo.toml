@@ -30,6 +30,7 @@ members = [
     "crates/harmony-node",
     "crates/harmony-peers",
     "crates/harmony-pkarr",
+    "crates/harmony-reachability",
     "crates/harmony-profile",
     "crates/harmony-platform",
     "crates/harmony-runtime",
