@@ -135,6 +135,18 @@ impl<P: LogPolicy> VerifiedLog<P> {
     /// Insert an event: dedup by id, then verify against the materialized
     /// state of all strictly-prior events (by [`LogPolicy::cmp`]). Stored
     /// only on `Ok`.
+    ///
+    /// Verification is **per-insert against the current strictly-prior set** —
+    /// an event is checked once, when it lands. Inserting an event that sorts
+    /// *before* events already present does **not** re-validate those later
+    /// events against the now-changed prior state, and an event rejected
+    /// because a dependency had not yet arrived is not automatically retried.
+    /// A domain that accepts events out of order is responsible for eventual
+    /// consistency at its sync layer — e.g. by re-delivering the complete
+    /// event set so every event is (re-)attempted with its full prior present.
+    /// This matches the reference adopter, community-membership's
+    /// `insert_event`, whose whole-state-root sync provides exactly that
+    /// re-delivery; adding re-validation here would diverge from it.
     pub fn insert(&mut self, event: P::Event, ctx: &P::Context) -> InsertOutcome<P::Error> {
         let id = P::event_id(&event);
         if self.events.contains_key(&id) {
