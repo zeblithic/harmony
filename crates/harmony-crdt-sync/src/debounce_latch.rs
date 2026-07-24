@@ -28,8 +28,12 @@
 //! the latch instead makes the restore mandatory-looking: each publish path
 //! returns a `#[must_use]` [`PublishClaim`] carrying the signal it took, and
 //! [`settle`](DebounceLatch::settle) hands it back with the outcome. A
-//! failed publish restores the dirty state so the next deadline, flush, or
-//! shutdown retries it.
+//! failed publish restores the dirty signal, so the work survives to be
+//! retried by the next mutation, flush, or shutdown.
+//!
+//! Restoring the *signal* is not the same as scheduling a *retry*, and this
+//! latch does only the former — see [`settle`](DebounceLatch::settle) for why
+//! self-scheduling here would spin, and what to compose instead.
 //!
 //! ```
 //! use harmony_crdt_sync::debounce_latch::{DebounceLatch, PublishOutcome};
@@ -48,9 +52,12 @@
 //! let claim = latch.on_deadline();
 //! assert!(claim.should_publish());
 //!
-//! // The publish failed — settling restores the signal so it is retried.
+//! // The publish failed. Settling restores the signal — but does NOT re-arm
+//! // a deadline: the retry rides the next mutation, flush, or shutdown
+//! // rather than spinning on an instant that has already passed.
 //! latch.settle(claim, PublishOutcome::Failed);
 //! assert!(latch.is_dirty());
+//! assert_eq!(latch.deadline(), None);
 //! ```
 //!
 //! Provenance: extracted from harmony-client's `fleet_sync::internal_task`
@@ -179,9 +186,23 @@ impl DebounceLatch {
 
     /// Hand a claim back with the publish outcome.
     ///
-    /// On [`PublishOutcome::Failed`] the claimed dirty signal is restored,
-    /// so the next deadline, flush, or shutdown retries the publish instead
-    /// of silently dropping it.
+    /// On [`PublishOutcome::Failed`] the claimed **dirty signal** is
+    /// restored, so the work is not silently dropped. It does **not** re-arm
+    /// a deadline: settling leaves the latch dirty with
+    /// [`deadline`](DebounceLatch::deadline) still `None`, and the retry
+    /// rides the next [`mark_dirty`](DebounceLatch::mark_dirty),
+    /// [`on_flush`](DebounceLatch::on_flush), or
+    /// [`on_shutdown`](DebounceLatch::on_shutdown).
+    ///
+    /// This latch deliberately never self-schedules a retry. Re-arming to
+    /// the deadline that just fired would target an instant already in the
+    /// past — that is *why* it fired — so a persistently failing publish
+    /// (transport down, store unreachable) would fire, fail, re-arm to the
+    /// same past instant, and spin without backoff. Retry *pacing* is a
+    /// policy the driver owns: compose
+    /// [`BackfillLatch`](crate::backfill_latch::BackfillLatch) from this
+    /// crate when a failing publish should be retried autonomously under
+    /// escalating backoff.
     pub fn settle(&mut self, claim: PublishClaim, outcome: PublishOutcome) {
         if outcome == PublishOutcome::Failed && claim.took_dirty {
             self.dirty = true;
@@ -265,6 +286,33 @@ mod tests {
         assert!(retry.should_publish());
         latch.settle(retry, PublishOutcome::Succeeded);
         assert!(!latch.is_dirty());
+    }
+
+    // Pins the deliberate half of the above: settling a failure restores the
+    // SIGNAL but arms no deadline, so the latch never self-schedules a retry.
+    // Re-arming would target the instant that just fired — already in the past
+    // — so a persistently failing publish would fire/fail/re-arm in a tight
+    // loop with no backoff. Retry pacing belongs to the driver (compose
+    // BackfillLatch); changing this should be a deliberate act, not a drift.
+    #[test]
+    fn failed_publish_restores_the_signal_but_arms_no_deadline() {
+        let mut latch = DebounceLatch::new(250);
+        latch.mark_dirty(1_000);
+        assert_eq!(latch.deadline(), Some(1_250));
+
+        let claim = latch.on_deadline();
+        latch.settle(claim, PublishOutcome::Failed);
+
+        assert!(latch.is_dirty(), "the work survives");
+        assert_eq!(
+            latch.deadline(),
+            None,
+            "but no deadline is armed — the driver decides when to retry"
+        );
+
+        // The next mutation is what re-arms, at a FUTURE instant.
+        latch.mark_dirty(5_000);
+        assert_eq!(latch.deadline(), Some(5_250));
     }
 
     #[test]

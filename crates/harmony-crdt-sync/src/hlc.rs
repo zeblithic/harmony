@@ -69,13 +69,14 @@ pub struct HlcTick {
 }
 
 impl HlcTick {
-    /// Compute the tick strictly after `prev`, given the writer's current
-    /// wall-clock reading in milliseconds.
+    /// Compute the next tick, given the writer's current wall-clock reading
+    /// in milliseconds.
     ///
-    /// The result is **always** strictly greater than `prev` (when `prev`
-    /// is `Some`), which is the property the caller's replay protection
-    /// depends on. Two cases advance the logical counter instead of the
-    /// wall reading:
+    /// The result is strictly greater than `prev` (when `prev` is `Some`) —
+    /// the property the caller's replay protection depends on — **except
+    /// under logical saturation**, where it ties `prev` instead; see the
+    /// saturation paragraph below for why that exception is the safe one.
+    /// Two cases advance the logical counter instead of the wall reading:
     ///
     /// 1. `wall_ms == prev.wall_ms` — a second stamp inside the same
     ///    millisecond, the common case under a burst of writes.
