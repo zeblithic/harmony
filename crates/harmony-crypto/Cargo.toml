@@ -15,6 +15,7 @@ hmac = { workspace = true }
 aes = { workspace = true }
 cbc = { workspace = true }
 chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true, optional = true }
 ml-kem = { workspace = true }
 ml-dsa = { workspace = true }
 hybrid-array = { workspace = true }
@@ -31,6 +32,10 @@ serde = { workspace = true, optional = true, default-features = false, features 
 [features]
 default = ["std"]
 serde = ["dep:serde"]
+# Password-based at-rest encryption envelope (Argon2id + XChaCha20-Poly1305).
+# Pulls the heavy `argon2` dep; default-off so the 20+ crates that never use it
+# gain nothing. no_std+alloc clean (no getrandom — caller supplies salt/nonce).
+password-envelope = ["dep:argon2"]
 # Disable BLAKE3 NEON assembly — use pure Rust fallback. Required for
 # cross-compilation from non-aarch64 hosts without a C cross-compiler.
 no-neon = ["blake3/no_neon"]

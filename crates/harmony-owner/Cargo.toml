@@ -25,8 +25,6 @@ subtle = { workspace = true }
 
 # Recovery-only — gated by the `recovery` feature.
 bip39 = { workspace = true, optional = true }
-argon2 = { workspace = true, optional = true }
-chacha20poly1305 = { workspace = true, optional = true }
 secrecy = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -38,7 +36,7 @@ default = ["recovery"]
 # Identity backup/restore: BIP39-24 mnemonic + Argon2id-XChaCha20-Poly1305
 # encrypted file. Default-on for typical consumers (harmony-client). Disable
 # via `default-features = false` to skip the heavy crypto deps.
-recovery = ["dep:bip39", "dep:argon2", "dep:chacha20poly1305", "dep:secrecy"]
+recovery = ["dep:bip39", "dep:secrecy", "harmony-crypto/password-envelope"]
 # Test-only: exposes deterministic-input encrypt helper for wire-format
 # fixture generation. NOT default-on. Implies `recovery`.
 test-fixtures = ["recovery"]

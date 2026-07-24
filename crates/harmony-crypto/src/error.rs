@@ -13,6 +13,12 @@ pub enum CryptoError {
     #[error("invalid key length: expected {expected}, got {got}")]
     InvalidKeyLength { expected: usize, got: usize },
 
+    #[error("invalid nonce length: expected {expected}, got {got}")]
+    InvalidNonceLength { expected: usize, got: usize },
+
+    #[error("invalid or out-of-range Argon2 KDF parameters")]
+    InvalidKdfParams,
+
     #[error("AEAD encryption failed")]
     AeadEncryptFailed,
 
