@@ -26,7 +26,6 @@ pub const KDF_ID_ARGON2ID: u8 = 0x01;
 pub const KDF_M_KIB: u32 = 65536;
 pub const KDF_T: u16 = 3;
 pub const KDF_P: u8 = 1;
-pub const KDF_OUT_LEN: usize = 32;
 
 pub const HEADER_LEN: usize = 13;
 pub const SALT_LEN: usize = 16;

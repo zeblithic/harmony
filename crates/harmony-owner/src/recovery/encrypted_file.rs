@@ -6,13 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::recovery::error::RecoveryError;
 use crate::recovery::wire::{
-    parse_header, serialize_header, HEADER_LEN, KDF_M_KIB, KDF_OUT_LEN, KDF_P, KDF_T, MAX_FILE_LEN,
-    MIN_FILE_LEN, NONCE_LEN, SALT_LEN,
+    parse_header, serialize_header, HEADER_LEN, KDF_M_KIB, KDF_P, KDF_T, MAX_FILE_LEN, MIN_FILE_LEN,
+    NONCE_LEN, SALT_LEN,
 };
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    XChaCha20Poly1305, XNonce,
-};
+use harmony_crypto::password_envelope::{self, Argon2idParams};
 use rand_core::{OsRng, RngCore};
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -54,6 +51,13 @@ impl core::fmt::Debug for RecoveryFileBody {
     }
 }
 
+/// The recovery envelope's fixed Argon2id parameters. Equal to the `wire::`
+/// constants that are serialized into (and strict-checked out of) the header.
+fn recovery_kdf_params() -> Argon2idParams {
+    Argon2idParams::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32)
+        .expect("recovery Argon2id params are constants known to validate")
+}
+
 /// Internal encrypt core. Takes already-built plaintext + already-chosen
 /// salt + nonce. Both `to_encrypted_file` (production, random salt+nonce)
 /// and `encrypt_with_params_for_test` (deterministic for fixtures) call
@@ -65,36 +69,20 @@ fn encrypt_core(
     nonce: &[u8; NONCE_LEN],
 ) -> Vec<u8> {
     let header = serialize_header();
-    let key = derive_key_argon2id(passphrase, salt);
-    let cipher = XChaCha20Poly1305::new(key.as_ref().into());
-    let ct = cipher
-        .encrypt(
-            XNonce::from_slice(nonce),
-            Payload {
-                msg: plaintext,
-                aad: &header,
-            },
-        )
-        .expect("XChaCha20-Poly1305 encryption is infallible for in-bounds inputs");
+    let ct = password_envelope::seal(
+        passphrase.expose_secret().as_bytes(),
+        &recovery_kdf_params(),
+        salt,
+        nonce,
+        &header,
+        plaintext,
+    )
+    .expect("sealing is infallible for a 24-byte nonce and validated params");
     let mut out = Vec::with_capacity(HEADER_LEN + SALT_LEN + NONCE_LEN + ct.len());
     out.extend_from_slice(&header);
     out.extend_from_slice(salt);
     out.extend_from_slice(nonce);
     out.extend_from_slice(&ct);
-    out
-}
-
-fn derive_key_argon2id(
-    passphrase: &SecretString,
-    salt: &[u8; SALT_LEN],
-) -> Zeroizing<[u8; KDF_OUT_LEN]> {
-    use argon2::{Algorithm, Argon2, Params, Version};
-    let params = Params::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32, Some(KDF_OUT_LEN))
-        .expect("Argon2 params are constants known to validate");
-    let kdf = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut out: Zeroizing<[u8; KDF_OUT_LEN]> = Zeroizing::new([0u8; KDF_OUT_LEN]);
-    kdf.hash_password_into(passphrase.expose_secret().as_bytes(), salt, out.as_mut())
-        .expect("Argon2 derivation is infallible for valid params");
     out
 }
 
@@ -236,19 +224,15 @@ pub(crate) fn decrypt_inner(
     let ciphertext_and_tag = &bytes[HEADER_LEN + SALT_LEN + NONCE_LEN..];
 
     let header = serialize_header();
-    let key = derive_key_argon2id(passphrase, salt);
-    let cipher = XChaCha20Poly1305::new(key.as_ref().into());
-    let plaintext_vec = cipher
-        .decrypt(
-            XNonce::from_slice(nonce),
-            Payload {
-                msg: ciphertext_and_tag,
-                aad: &header,
-            },
-        )
-        .map_err(|_| RecoveryError::WrongPassphraseOrCorrupt)?;
-    // Wrap plaintext in Zeroizing so it's wiped after we finish parsing.
-    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(plaintext_vec);
+    let plaintext: Zeroizing<Vec<u8>> = password_envelope::open(
+        passphrase.expose_secret().as_bytes(),
+        &recovery_kdf_params(),
+        salt,
+        nonce,
+        &header,
+        ciphertext_and_tag,
+    )
+    .map_err(|_| RecoveryError::WrongPassphraseOrCorrupt)?;
 
     let body: RecoveryFileBody = ciborium::de::from_reader(&plaintext[..])
         .map_err(|_| RecoveryError::PayloadDecodeFailed)?;
