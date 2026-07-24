@@ -90,7 +90,7 @@
 //! stay caller-side.
 
 /// How a publish attempt ended, reported back through
-/// [`DebounceLatch::settle`].
+/// [`PublishClaim::settle`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishOutcome {
     /// The publish reached the transport. The claimed signal is spent.
