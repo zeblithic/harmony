@@ -7,12 +7,14 @@
 //! you missed" shape that apps built on the platform need. This crate is
 //! that substrate.
 //!
-//! It currently exposes the **backfill/backoff latches** ([`backfill_latch`])
-//! — the pure, runtime-free decision cores for paginated catch-up over an
+//! It exposes the **backfill/backoff latches** ([`backfill_latch`]) — the
+//! pure, runtime-free decision cores for paginated catch-up over an
 //! unreliable request/reply transport, extracted from harmony-client
-//! (ZEB-571 item 3). It is designed to grow to host the verified-event-log
-//! and snapshot sync engines (`VerifiedLog` / `FleetSyncEngine`; ZEB-571
-//! item 6), which the latches compose with.
+//! (ZEB-571 item 3) — and the **verified-event-log engine**
+//! ([`verified_log`]): a sans-I/O log that dedups, verifies each event
+//! against its materialized prior state, and re-materializes on demand
+//! (ZEB-571 item 6). It is designed to grow to host the snapshot sync engine
+//! (`FleetSyncEngine`) too, which the latches compose with.
 //!
 //! Everything here is sans-I/O: the types decide *what* to do (request,
 //! wait, idle) and leave *doing* it (transport, timers, persistence) to a
@@ -24,9 +26,13 @@
 // cleanliness is still enforced by a non-test `--no-default-features` build.
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 
+extern crate alloc;
+
 pub mod backfill_latch;
+pub mod verified_log;
 
 pub use backfill_latch::{
     BackfillAction, BackfillLatch, PageOutcome, RootFetchAction, RootFetchLatch,
     BACKFILL_RETRY_BASE_MS, BACKFILL_RETRY_CAP_MS,
 };
+pub use verified_log::{InsertOutcome, LogPolicy, VerifiedLog};
