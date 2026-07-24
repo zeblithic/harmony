@@ -10,5 +10,9 @@
 //! identity/crypto dependency. Signing over the record is the caller's concern.
 
 pub mod canonical;
+pub mod kernel;
+pub mod record;
 
 pub use canonical::{canonical_cbor_decode, canonical_cbor_encode, CborError};
+pub use kernel::{lww_newer, MultiDeviceMap, ReachabilityFallback, ReachabilityRecord};
+pub use record::{DelegateEndpoint, ReachabilityAnnouncePayload};

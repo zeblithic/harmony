@@ -129,7 +129,11 @@ mod tests {
         const EXPECTED_LEGACY_HEX: &str = "a5626e645820abababababababababababababababababababababababababababababababab62726c7568747470733a2f2f646572702e6578616d706c652f626461806274731b0000018bcfe568006273675840cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
         let p = fixture_payload();
         let bytes = canonical_payload_bytes(&p).expect("encode");
-        assert_eq!(hex::encode(&bytes), EXPECTED_LEGACY_HEX, "legacy wire encoding drifted");
+        assert_eq!(
+            hex::encode(&bytes),
+            EXPECTED_LEGACY_HEX,
+            "legacy wire encoding drifted"
+        );
     }
 
     fn fixture_delegate(seed: u8) -> DelegateEndpoint {

@@ -28,7 +28,8 @@ pub fn canonical_cbor_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CborErr
 /// that decodes to the same value.
 pub fn canonical_cbor_decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CborError> {
     let mut cursor = std::io::Cursor::new(bytes);
-    let value = ciborium::from_reader(&mut cursor).map_err(|e| CborError::Decode(format!("{e}")))?;
+    let value =
+        ciborium::from_reader(&mut cursor).map_err(|e| CborError::Decode(format!("{e}")))?;
     if cursor.position() as usize != bytes.len() {
         return Err(CborError::Decode(format!(
             "trailing bytes after canonical value: consumed {} of {}",
@@ -70,7 +71,11 @@ where
             E: serde::de::Error,
         {
             if value.len() != N {
-                return Err(E::custom(format!("expected {} bytes, got {}", N, value.len())));
+                return Err(E::custom(format!(
+                    "expected {} bytes, got {}",
+                    N,
+                    value.len()
+                )));
             }
             let mut arr = [0u8; N];
             arr.copy_from_slice(value);
@@ -101,7 +106,10 @@ mod tests {
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Probe {
-        #[serde(serialize_with = "serialize_bytes_as_bstr", deserialize_with = "deserialize_bytes_from_bstr")]
+        #[serde(
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
         b: [u8; 4],
     }
 
@@ -111,7 +119,10 @@ mod tests {
         let bytes = canonical_cbor_encode(&p).expect("encode");
         // map(1) "b" -> bstr(4) 01020304. The bstr header for a 4-byte string is
         // 0x44 (major type 2, length 4) — NOT 0x84 (major type 4, array len 4).
-        assert!(bytes.windows(1).any(|w| w[0] == 0x44), "value must encode as a CBOR byte string");
+        assert!(
+            bytes.windows(1).any(|w| w[0] == 0x44),
+            "value must encode as a CBOR byte string"
+        );
         let back: Probe = canonical_cbor_decode(&bytes).expect("decode");
         assert_eq!(back, p);
     }
