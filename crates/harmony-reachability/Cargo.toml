@@ -1,0 +1,17 @@
+[package]
+name = "harmony-reachability"
+description = "Reachability announce record (byte-stable CBOR) + multi-device LWW kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+ciborium = { workspace = true, features = ["std"] }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }

@@ -3818,6 +3818,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-reachability"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ciborium",
+ "hex",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "harmony-roxy"
 version = "0.1.0"
 dependencies = [
