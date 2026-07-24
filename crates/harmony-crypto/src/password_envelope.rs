@@ -126,6 +126,9 @@ pub fn open(
             got: nonce.len(),
         });
     }
+    if ciphertext.len() < TAG_LEN {
+        return Err(CryptoError::AeadDecryptFailed);
+    }
     let key = derive_key(password, salt, params)?;
     let cipher = XChaCha20Poly1305::new(key.as_ref().into());
     let pt = cipher
@@ -216,6 +219,14 @@ mod tests {
         ));
         let err = open(b"pw", &p, &[0u8; 16], &short, b"", b"xxxxxxxxxxxxxxxxx").unwrap_err();
         assert!(matches!(err, CryptoError::InvalidNonceLength { .. }));
+    }
+
+    #[test]
+    fn short_ciphertext_rejected() {
+        let p = cheap();
+        // 15 bytes < TAG_LEN (16): cannot contain a Poly1305 tag.
+        let err = open(b"pw", &p, &[0u8; 16], &[0u8; NONCE_LEN], b"", &[0u8; 15]).unwrap_err();
+        assert!(matches!(err, CryptoError::AeadDecryptFailed));
     }
 
     #[test]
