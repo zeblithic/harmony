@@ -3361,6 +3361,7 @@ name = "harmony-crypto"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "argon2",
  "blake3",
  "cbc",
  "chacha20poly1305",
