@@ -262,6 +262,29 @@ impl<K: Ord + Clone, C: Ord + Clone> ReplayTracker<K, C> {
         self.accepted.observe(ticket.source, ticket.clock)
     }
 
+    /// Record a clock this node minted for its **own** writes.
+    ///
+    /// The local entry is deliberately unreachable through
+    /// [`admit`](Self::admit) / [`commit`](Self::commit): `admit` answers
+    /// [`Admission::Echo`] for the local source, because a node never
+    /// applies its own publish, so no [`CommitTicket`] naming the local
+    /// source can exist. That is right for the *inbound* question and
+    /// insufficient for the whole job — a writer that stamps its own
+    /// publishes must also remember its last stamp, or the next one ties
+    /// or regresses.
+    ///
+    /// Both questions are usually answered from one persisted map (peer
+    /// watermarks and the local mint counter, keyed alike), and the two
+    /// key-spaces are disjoint: the inbound path only ever reads peers,
+    /// the minting path only ever touches `local`. This is the minting
+    /// path's write.
+    ///
+    /// Monotone like every other entry: returns `false` and changes
+    /// nothing when `clock` does not strictly beat what is recorded.
+    pub fn observe_local(&mut self, clock: C) -> bool {
+        self.accepted.observe(self.local.clone(), clock)
+    }
+
     /// This receiver's own source id.
     pub fn local(&self) -> &K {
         &self.local
@@ -315,6 +338,53 @@ mod tests {
     fn our_own_publish_is_an_echo() {
         let t = tracker();
         assert!(matches!(t.admit(&"me".to_string(), &1), Admission::Echo));
+    }
+
+    // The minting path: `admit`/`commit` structurally cannot reach the local
+    // entry (an echo yields no ticket), so a writer recording its own stamp
+    // needs `observe_local` — otherwise a tracker that persists both peer
+    // watermarks and the local mint counter cannot be modelled by this type
+    // at all.
+    #[test]
+    fn observe_local_records_our_own_mint_which_admit_cannot() {
+        let mut t = tracker();
+        let me = "me".to_string();
+
+        assert!(matches!(t.admit(&me, &7), Admission::Echo));
+        assert!(
+            t.accepted_from(&me).is_none(),
+            "an echo yields no ticket, so nothing can advance the local entry"
+        );
+
+        assert!(t.observe_local(7), "first local mint is recorded");
+        assert_eq!(t.accepted_from(&me), Some(&7));
+    }
+
+    #[test]
+    fn observe_local_is_monotone_like_every_other_entry() {
+        let mut t = tracker();
+        let me = "me".to_string();
+        assert!(t.observe_local(5));
+
+        assert!(!t.observe_local(5), "a tie does not advance");
+        assert!(!t.observe_local(4), "a regression does not advance");
+        assert_eq!(t.accepted_from(&me), Some(&5));
+
+        assert!(t.observe_local(6));
+        assert_eq!(t.accepted_from(&me), Some(&6));
+    }
+
+    // The local mint and the peer watermarks share one map but never collide:
+    // the inbound path only reads peers, the minting path only writes `local`.
+    #[test]
+    fn local_mint_and_peer_watermarks_persist_together() {
+        let mut t = tracker();
+        t.observe_local(9);
+        assert!(t.commit(accept(&t, "peer", 3)));
+
+        let restored = ReplayTracker::from_accepted("me".to_string(), t.accepted().clone());
+        assert_eq!(restored.accepted_from(&"me".to_string()), Some(&9));
+        assert_eq!(restored.accepted_from(&"peer".to_string()), Some(&3));
     }
 
     #[test]

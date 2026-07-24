@@ -35,6 +35,14 @@
 //! key set into this crate along with a runtime dependency (ZEB-759). What
 //! belongs here is what an engine *decides*; how it talks to the world stays
 //! with the engine.
+//!
+//! The same boundary governs *state*, not just I/O: a kernel here owns only
+//! state its callers never write behind its back. A dirty flag poked by
+//! every mutation site in an application is shared, concurrently-written
+//! caller state, so [`debounce_latch`] holds the publish window and takes
+//! the flag's value as an argument rather than owning it — a kernel that
+//! kept its own copy would force callers to mirror theirs into it, and two
+//! copies of one signal drift (ZEB-759).
 
 // no_std when the `std` feature is off — except under `test`, where the
 // test harness always links std (so the unit tests may use `Vec`/`vec!`
@@ -54,7 +62,7 @@ pub use backfill_latch::{
     BackfillAction, BackfillLatch, PageOutcome, RootFetchAction, RootFetchLatch,
     BACKFILL_RETRY_BASE_MS, BACKFILL_RETRY_CAP_MS,
 };
-pub use debounce_latch::{DebounceLatch, PublishClaim, PublishOutcome};
+pub use debounce_latch::{DebounceLatch, DirtySignal, PublishClaim, PublishOutcome};
 pub use hlc::HlcTick;
 pub use replay_admission::{Admission, CommitTicket, MonotoneMap, ReplayTracker};
 pub use verified_log::{InsertOutcome, LogPolicy, VerifiedLog};
