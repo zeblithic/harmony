@@ -55,9 +55,12 @@ pub trait LogPolicy {
     type EventId: Ord + Clone;
     /// The materialized view produced by folding an event set.
     type State;
-    /// Per-dataset configuration threaded into both `verify` and
-    /// `materialize` (e.g. a community's admin address / policy config). Not
-    /// part of any event.
+    /// Per-call configuration threaded into both `verify` and `materialize` —
+    /// e.g. a dataset's admin address, or a wall-clock floor. The caller may
+    /// rebuild it for each [`insert`](VerifiedLog::insert) and may derive parts
+    /// of it from the event being inserted (the engine passes the same `ctx`
+    /// to the prior-state `materialize` and to `verify`). It is simply not
+    /// carried *inside* the stored events.
     type Context;
     /// A verification failure reported via [`InsertOutcome::Rejected`].
     type Error;
@@ -109,6 +112,24 @@ impl<P: LogPolicy> VerifiedLog<P> {
         Self {
             events: BTreeMap::new(),
         }
+    }
+
+    /// Build a log from events whose provenance is already trusted — e.g.
+    /// loaded from local persistence that verified them when they first
+    /// arrived — **without** re-running [`LogPolicy::verify`]. Deduplicates by
+    /// [`event_id`](LogPolicy::event_id) (a later duplicate replaces an
+    /// earlier one).
+    ///
+    /// Use this only for trusted events; use [`insert`](Self::insert) for
+    /// events arriving over the wire. Domains whose persistence does not
+    /// re-verify on load (the common case) restore through here so a boot
+    /// does not re-verify the whole history.
+    pub fn from_verified_events(events: impl IntoIterator<Item = P::Event>) -> Self {
+        let mut map = BTreeMap::new();
+        for e in events {
+            map.insert(P::event_id(&e), e);
+        }
+        Self { events: map }
     }
 
     /// Insert an event: dedup by id, then verify against the materialized
@@ -267,6 +288,19 @@ mod tests {
         // But an event ordered AFTER an existing one sees it as prior -> Inserted.
         assert_eq!(log.insert(ev(3, 30, true), &()), InsertOutcome::Inserted);
         assert_eq!(log.materialize(&()), BTreeSet::from([2, 3]));
+    }
+
+    #[test]
+    fn from_verified_events_skips_verification_and_dedups() {
+        // An event that `insert` WOULD reject (needs_prior on an empty prior)
+        // is still loaded when trusted; a duplicate id collapses to one entry.
+        let log: VerifiedLog<Toy> =
+            VerifiedLog::from_verified_events([ev(1, 10, true), ev(2, 20, true), ev(1, 99, false)]);
+        assert_eq!(log.len(), 2);
+        assert!(log.contains(&1));
+        assert!(log.contains(&2));
+        // The later id-1 duplicate won.
+        assert_eq!(log.get(&1).unwrap().order, 99);
     }
 
     #[test]
