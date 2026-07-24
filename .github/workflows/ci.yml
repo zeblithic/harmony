@@ -47,6 +47,15 @@ jobs:
       - name: clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # harmony-crdt-sync is `no_std` + `alloc` and has 22 dependents, several
+      # of them `no_std`. Its `std` feature is default-ON, so every other job
+      # here builds it WITH std — a `std`-only item added to the library would
+      # pass all of them and break those dependents only at their own build.
+      # `--all-targets` is deliberately omitted: the test harness always links
+      # std, so a test-inclusive build cannot witness the property (ZEB-759).
+      - name: no_std (harmony-crdt-sync)
+        run: cargo build --locked -p harmony-crdt-sync --no-default-features
+
   rust-test:
     name: Rust — test (nextest)
     runs-on: ubuntu-latest
