@@ -11,7 +11,9 @@
 //!
 //! - the **backfill/backoff latches** ([`backfill_latch`]) — the pure,
 //!   runtime-free decision cores for paginated catch-up over an unreliable
-//!   request/reply transport (ZEB-571 item 3);
+//!   request/reply transport (ZEB-571 item 3), over the shared escalating
+//!   [`retry_backoff`] schedule that any retrying driver can compose
+//!   (ZEB-761);
 //! - the **verified-event-log engine** ([`verified_log`]) — a log that
 //!   dedups, verifies each event against its materialized prior state, and
 //!   re-materializes on demand (ZEB-571 item 6a);
@@ -56,6 +58,7 @@ pub mod backfill_latch;
 pub mod debounce_latch;
 pub mod hlc;
 pub mod replay_admission;
+pub mod retry_backoff;
 pub mod verified_log;
 
 pub use backfill_latch::{
@@ -65,4 +68,5 @@ pub use backfill_latch::{
 pub use debounce_latch::{DebounceLatch, DirtySignal, PublishClaim, PublishOutcome};
 pub use hlc::HlcTick;
 pub use replay_admission::{Admission, CommitTicket, MonotoneMap, ReplayTracker};
+pub use retry_backoff::{RetryBackoff, RETRY_BASE_MS, RETRY_CAP_MS};
 pub use verified_log::{InsertOutcome, LogPolicy, VerifiedLog};

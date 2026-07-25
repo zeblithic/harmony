@@ -35,13 +35,24 @@
 //! (spec D24 for the paging latch, D3/D6/D7 for the root-fetch latch),
 //! byte-for-behavior preserving. The async drivers, transport-epoch
 //! re-arm cooldown, and reconcile-mode selection stay caller-side.
+//!
+//! The escalating delay schedule itself is not defined here — it lives in
+//! [`RetryBackoff`], which these latches compose. A publish-retry driver
+//! needs that schedule without any of the request/reply machinery around
+//! it (ZEB-761), so the rule has one home and each consumer wraps it.
+
+use crate::retry_backoff::{RetryBackoff, RETRY_BASE_MS, RETRY_CAP_MS};
 
 /// First retry delay after an unanswered request (30 s).
-pub const BACKFILL_RETRY_BASE_MS: u64 = 30_000;
+///
+/// The backfill latches' name for the shared [`RETRY_BASE_MS`] schedule.
+pub const BACKFILL_RETRY_BASE_MS: u64 = RETRY_BASE_MS;
 
 /// Maximum delay between retry attempts (600 s). Doubling stops here; the
 /// latch retries forever at this cadence until answered.
-pub const BACKFILL_RETRY_CAP_MS: u64 = 600_000;
+///
+/// The backfill latches' name for the shared [`RETRY_CAP_MS`] schedule.
+pub const BACKFILL_RETRY_CAP_MS: u64 = RETRY_CAP_MS;
 
 /// What a paginated backfill driver should do next, as decided by
 /// [`BackfillLatch`].
@@ -72,23 +83,6 @@ pub struct PageOutcome<W> {
     pub limit: usize,
 }
 
-/// One escalation step of the shared retry-backoff schedule: first retry
-/// waits `base` clamped to `cap` (a misconfigured base > cap must not
-/// violate the cap), then doubles per consecutive miss up to the cap. Used
-/// by both latches via their shared [`RetryState`].
-///
-/// The doubling saturates: with a caller-injected `cap_ms` near `u64::MAX`
-/// an unchecked `* 2` could overflow (a debug-build panic, or a release
-/// wrap that clamps *below* the intended delay). `saturating_mul` keeps the
-/// clamp-to-`cap` semantics intact at any magnitude.
-fn arm_backoff_step(current_delay_ms: u64, base_ms: u64, cap_ms: u64) -> u64 {
-    if current_delay_ms == 0 {
-        base_ms.min(cap_ms)
-    } else {
-        current_delay_ms.saturating_mul(2).min(cap_ms)
-    }
-}
-
 /// The guard decision both latches' `next_action` reads out of their
 /// [`RetryState`].
 enum RetryPoll {
@@ -100,26 +94,22 @@ enum RetryPoll {
     Fire,
 }
 
-/// Retry/backoff bookkeeping shared by [`BackfillLatch`] and
+/// Request/reply retry bookkeeping shared by [`BackfillLatch`] and
 /// [`RootFetchLatch`]. Both latches *hold* one of these; only the
-/// request/paging specifics differ. Bundling the six fields plus the
-/// poll guard, satisfy, and backoff-arming transitions in one place keeps
-/// the two latches' retry semantics from drifting apart when one is edited.
+/// request/paging specifics differ. Bundling the in-flight guard, the
+/// satisfy/re-arm transitions, and the composed [`RetryBackoff`] in one
+/// place keeps the two latches' retry semantics from drifting apart when
+/// one is edited.
 #[derive(Debug, Clone)]
 struct RetryState {
     /// A completed answer has satisfied the query; cleared by re-arm.
     satisfied: bool,
     /// A request has been handed out and no outcome has landed yet.
     in_flight: bool,
-    /// Earliest wall-clock ms at which the next request may be sent.
-    next_retry_at: u64,
-    /// Current backoff delay (ms); 0 = no consecutive no-reply yet.
-    retry_delay_ms: u64,
-    /// First-retry delay after an unanswered request (ms). Production =
-    /// [`BACKFILL_RETRY_BASE_MS`].
-    retry_base_ms: u64,
-    /// Backoff ceiling (ms). Production = [`BACKFILL_RETRY_CAP_MS`].
-    retry_cap_ms: u64,
+    /// When the next request may be sent, and how far the delay has
+    /// escalated. Shared with every other consumer of the schedule rather
+    /// than restated here (ZEB-761).
+    backoff: RetryBackoff,
 }
 
 impl RetryState {
@@ -127,10 +117,7 @@ impl RetryState {
         Self {
             satisfied: false,
             in_flight: false,
-            next_retry_at: 0,
-            retry_delay_ms: 0,
-            retry_base_ms: base_ms,
-            retry_cap_ms: cap_ms,
+            backoff: RetryBackoff::new(base_ms, cap_ms),
         }
     }
 
@@ -141,12 +128,12 @@ impl RetryState {
         }
         if self.in_flight {
             // A request is already outstanding; nothing new until an outcome
-            // lands. `next_retry_at` may sit in the past here (only
+            // lands. The armed instant may sit in the past here (only
             // `arm_backoff` moves it), so clamp to `now`.
-            return RetryPoll::Wait(self.next_retry_at.max(now_ms));
+            return RetryPoll::Wait(self.backoff.next_at().max(now_ms));
         }
-        if now_ms < self.next_retry_at {
-            return RetryPoll::Wait(self.next_retry_at);
+        if now_ms < self.backoff.next_at() {
+            return RetryPoll::Wait(self.backoff.next_at());
         }
         self.in_flight = true;
         RetryPoll::Fire
@@ -156,8 +143,7 @@ impl RetryState {
     /// *without* satisfying (the paging loop's progress branch).
     fn rearm_now(&mut self, now_ms: u64) {
         self.in_flight = false;
-        self.retry_delay_ms = 0;
-        self.next_retry_at = now_ms;
+        self.backoff.clear(now_ms);
     }
 
     /// A served answer: satisfied, in-flight + backoff cleared.
@@ -166,14 +152,12 @@ impl RetryState {
         self.satisfied = true;
     }
 
-    /// Clear in-flight, escalate the backoff, and arm the next retry instant.
-    /// The arming saturates so a huge injected delay cannot wrap
-    /// `next_retry_at` into the past (which would defeat the backoff).
+    /// Clear in-flight, escalate the backoff, and arm the next retry
+    /// instant. The escalation and its saturation live in
+    /// [`RetryBackoff::on_failure`].
     fn arm_backoff(&mut self, now_ms: u64) {
         self.in_flight = false;
-        self.retry_delay_ms =
-            arm_backoff_step(self.retry_delay_ms, self.retry_base_ms, self.retry_cap_ms);
-        self.next_retry_at = now_ms.saturating_add(self.retry_delay_ms);
+        self.backoff.on_failure(now_ms);
     }
 }
 
@@ -281,8 +265,11 @@ impl<W: Clone + PartialEq> BackfillLatch<W> {
     /// hook); clears in-flight and backoff state. Preserves the configured
     /// backoff schedule.
     pub fn reset(&mut self, watermark: Option<W>) {
-        *self =
-            Self::new_with_backoff(watermark, self.retry.retry_base_ms, self.retry.retry_cap_ms);
+        *self = Self::new_with_backoff(
+            watermark,
+            self.retry.backoff.base_ms(),
+            self.retry.backoff.cap_ms(),
+        );
     }
 }
 
@@ -350,7 +337,7 @@ impl RootFetchLatch {
 
     /// Transport-recovery re-arm: unsatisfy, clear in-flight + backoff.
     pub fn reset(&mut self) {
-        *self = Self::new_with_backoff(self.retry.retry_base_ms, self.retry.retry_cap_ms);
+        *self = Self::new_with_backoff(self.retry.backoff.base_ms(), self.retry.backoff.cap_ms());
     }
 }
 
@@ -419,26 +406,12 @@ mod tests {
     }
 
     #[test]
-    fn arm_backoff_step_clamps_and_doubles() {
-        // base > cap must never violate the cap.
-        assert_eq!(arm_backoff_step(0, 500, 400), 400);
-        // first step from base.
-        assert_eq!(arm_backoff_step(0, 100, 400), 100);
-        // doubling.
-        assert_eq!(arm_backoff_step(100, 100, 400), 200);
-        assert_eq!(arm_backoff_step(200, 100, 400), 400);
-        // capped.
-        assert_eq!(arm_backoff_step(400, 100, 400), 400);
-    }
-
-    #[test]
     fn backoff_arithmetic_saturates_near_u64_max() {
-        // Doubling must not overflow: with a huge current delay and cap, the
-        // step saturates rather than wrapping below the intended value.
-        assert_eq!(arm_backoff_step(u64::MAX, 100, u64::MAX), u64::MAX);
-        assert_eq!(arm_backoff_step(u64::MAX / 2 + 1, 100, u64::MAX), u64::MAX);
-
-        // Arming `next_retry_at` must not wrap to the past: `now + delay`
+        // The escalation arithmetic itself is pinned in `retry_backoff`;
+        // what this asserts is that BOTH latches inherit the saturation
+        // through the schedule they compose.
+        //
+        // Arming the retry instant must not wrap to the past: `now + delay`
         // saturates, so the latch waits (never immediately re-fires).
         let mut l = BackfillLatch::<W>::new_with_backoff(Some(0), u64::MAX, u64::MAX);
         assert_eq!(l.next_action(0), BackfillAction::Request { since: Some(0) });
