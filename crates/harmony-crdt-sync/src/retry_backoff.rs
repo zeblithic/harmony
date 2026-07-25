@@ -86,11 +86,21 @@ fn escalate(current_delay_ms: u64, base_ms: u64, cap_ms: u64) -> u64 {
 /// runtime-free and testable without I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryBackoff {
-    /// Current delay (ms); `0` = no consecutive failure outstanding.
+    /// Current delay (ms), as escalated so far.
     delay_ms: u64,
     /// Earliest instant (ms) the next attempt may run. Meaningful only
-    /// while `delay_ms > 0`; see [`pending_at`](Self::pending_at).
+    /// while `armed`; see [`pending_at`](Self::pending_at).
     next_at: u64,
+    /// Whether a failure is outstanding, i.e. whether a retry is owed.
+    ///
+    /// Tracked explicitly rather than derived from `delay_ms > 0`, because
+    /// a zero delay is a legitimate schedule: `new(0, _)` (or any `cap_ms`
+    /// of 0) arms an *immediate* retry, and deriving owed-ness would report
+    /// "nothing owed" for it — a consumer scheduling off
+    /// [`pending_at`](Self::pending_at) would then never retry at all.
+    /// One field cannot answer both "how long" and "whether" (Qodo, PR
+    /// #298).
+    armed: bool,
     /// First-delay after a failure (ms). Production = [`RETRY_BASE_MS`].
     base_ms: u64,
     /// Escalation ceiling (ms). Production = [`RETRY_CAP_MS`].
@@ -107,6 +117,7 @@ impl RetryBackoff {
         Self {
             delay_ms: 0,
             next_at: 0,
+            armed: false,
             base_ms,
             cap_ms,
         }
@@ -122,6 +133,7 @@ impl RetryBackoff {
     pub fn on_failure(&mut self, now_ms: u64) -> u64 {
         self.delay_ms = escalate(self.delay_ms, self.base_ms, self.cap_ms);
         self.next_at = now_ms.saturating_add(self.delay_ms);
+        self.armed = true;
         self.next_at
     }
 
@@ -134,6 +146,7 @@ impl RetryBackoff {
     pub fn clear(&mut self, now_ms: u64) {
         self.delay_ms = 0;
         self.next_at = now_ms;
+        self.armed = false;
     }
 
     /// The earliest instant (ms) at which the next attempt may run,
@@ -151,8 +164,11 @@ impl RetryBackoff {
     /// This is the scheduling accessor: `None` means the caller should not
     /// arm a retry wakeup at all, which is what keeps an idle driver from
     /// waking on a schedule it has already satisfied.
+    ///
+    /// A zero-delay schedule still reports `Some(now)` after a failure — an
+    /// immediate retry is owed, not no retry.
     pub fn pending_at(&self) -> Option<u64> {
-        (self.delay_ms > 0).then_some(self.next_at)
+        self.armed.then_some(self.next_at)
     }
 
     /// The current delay (ms); `0` when cleared. Exposed for observability
@@ -267,6 +283,30 @@ mod tests {
         b.clear(100);
         assert_eq!(b.next_at(), 100);
         assert_eq!(b.pending_at(), None);
+    }
+
+    #[test]
+    fn a_zero_delay_schedule_still_owes_an_immediate_retry() {
+        // Owed-ness must not be inferred from the delay. A schedule with a
+        // zero base (or zero cap) arms an IMMEDIATE retry; reporting
+        // "nothing owed" for it would mean a consumer scheduling off
+        // `pending_at` never retries at all (Qodo, PR #298).
+        for (base, cap) in [(0, 600_000), (30_000, 0), (0, 0)] {
+            let mut b = RetryBackoff::new(base, cap);
+            assert_eq!(b.pending_at(), None, "nothing owed before a failure");
+
+            let armed = b.on_failure(5_000);
+            assert_eq!(armed, 5_000, "a zero delay arms at `now`");
+            assert_eq!(b.delay_ms(), 0);
+            assert_eq!(
+                b.pending_at(),
+                Some(5_000),
+                "base={base} cap={cap}: an immediate retry is still a retry owed"
+            );
+
+            b.clear(5_000);
+            assert_eq!(b.pending_at(), None, "cleared means nothing owed");
+        }
     }
 
     #[test]
