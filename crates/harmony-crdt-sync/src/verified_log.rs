@@ -25,6 +25,7 @@
 //!     type State = usize;      // count of materialized events
 //!     type Context = ();
 //!     type Error = ();
+//!     type SupersessionKey = (); // never supersedes (method left defaulted)
 //!     fn event_id(e: &(u32, u64)) -> u32 { e.0 }
 //!     fn cmp(a: &(u32, u64), b: &(u32, u64)) -> Ordering { a.1.cmp(&b.1).then(a.0.cmp(&b.0)) }
 //!     fn verify(_e: &(u32, u64), _prior: &usize, _ctx: &()) -> Result<(), ()> { Ok(()) }
@@ -37,6 +38,7 @@
 //! assert_eq!(log.materialize(&()), 1);
 //! ```
 
+use alloc::collections::btree_map::Entry;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
@@ -81,6 +83,35 @@ pub trait LogPolicy {
     /// Fold an event set into a materialized view. `events` is supplied in
     /// unspecified order; a policy that needs ordered input sorts internally.
     fn materialize(events: &[&Self::Event], ctx: &Self::Context) -> Self::State;
+
+    /// The grouping key for deterministic supersession (ZEB-813). Events
+    /// whose [`supersession_key`](LogPolicy::supersession_key) returns equal
+    /// `Some` keys form one lineage, in which only the maximum under
+    /// [`cmp`](LogPolicy::cmp) is retained. Policies that never supersede
+    /// declare `()` and leave the method defaulted.
+    type SupersessionKey: Ord;
+
+    /// Extract an event's supersession-lineage key, or `None` for events
+    /// that never supersede and are never superseded (ZEB-813).
+    ///
+    /// Contract (policy obligations; the log cannot check them):
+    ///
+    /// (a) pure — same input, same answer, on every replica;
+    /// (b) keyed events must be MATERIALIZE-NEUTRAL: dropping a superseded
+    ///     event must not change `materialize`'s output for any event
+    ///     subset, because removal changes the strictly-prior set that
+    ///     future `verify` calls see.
+    ///
+    /// Convergence is then by construction: the retained set is "the
+    /// per-key maximum under `cmp` plus all `None`-keyed events" — a
+    /// join-semilattice, identical on every replica regardless of arrival
+    /// order or merge interleaving.
+    ///
+    /// Default: `None` for everything — nothing supersedes anything (the
+    /// behavior of every adopter predating this seam).
+    fn supersession_key(_e: &Self::Event) -> Option<Self::SupersessionKey> {
+        None
+    }
 }
 
 /// The result of [`VerifiedLog::insert`].
@@ -91,6 +122,21 @@ pub enum InsertOutcome<E> {
     /// An event with this id was already present; nothing changed and
     /// `verify` was not run.
     AlreadyKnown,
+    /// The event was new but a stored event with the same
+    /// [`supersession_key`](LogPolicy::supersession_key) is greater under
+    /// [`cmp`](LogPolicy::cmp); the candidate was dropped WITHOUT running
+    /// `verify` (mirrors `AlreadyKnown`'s verify-skip: a stale record
+    /// changes nothing, so proving it valid buys nothing). Callers treat
+    /// this exactly like `AlreadyKnown`: no state change, no persistence,
+    /// no dirty mark.
+    ///
+    /// MIGRATION (ZEB-813, breaking change): this variant is new, and
+    /// `LogPolicy` gained a required `SupersessionKey` associated type.
+    /// Downstream exhaustive matches must add an arm — map it to whatever
+    /// their `AlreadyKnown` arm does — and policies that never supersede
+    /// declare `type SupersessionKey = ();`. Such policies never produce
+    /// this variant.
+    Superseded,
     /// The event was new but failed verification; it was not stored.
     Rejected(E),
 }
@@ -129,6 +175,41 @@ impl<P: LogPolicy> VerifiedLog<P> {
         for e in events {
             map.insert(P::event_id(&e), e);
         }
+        // ZEB-813: deterministic supersession compaction at load. Group by
+        // supersession key and keep only each group's maximum under `cmp` —
+        // the semilattice maximum directly, so trusted restores land on the
+        // same set an insert-ordered replica converges to, including
+        // already-over-cap logs persisted by pre-supersession builds. One
+        // key extraction per event and a map of per-group winners keep this
+        // O(n log n); the restore path exists precisely for large logs.
+        let winners: BTreeMap<P::SupersessionKey, P::EventId> = {
+            let mut best: BTreeMap<P::SupersessionKey, &P::Event> = BTreeMap::new();
+            for e in map.values() {
+                if let Some(key) = P::supersession_key(e) {
+                    match best.entry(key) {
+                        Entry::Vacant(v) => {
+                            v.insert(e);
+                        }
+                        Entry::Occupied(mut o) => {
+                            if P::cmp(e, o.get()) == Ordering::Greater {
+                                o.insert(e);
+                            }
+                        }
+                    }
+                }
+            }
+            best.into_iter().map(|(k, e)| (k, P::event_id(e))).collect()
+        };
+        let stale: Vec<P::EventId> = map
+            .values()
+            .filter(|e| {
+                P::supersession_key(e).is_some_and(|key| winners.get(&key) != Some(&P::event_id(e)))
+            })
+            .map(|e| P::event_id(e))
+            .collect();
+        for stale_id in stale {
+            map.remove(&stale_id);
+        }
         Self { events: map }
     }
 
@@ -152,6 +233,14 @@ impl<P: LogPolicy> VerifiedLog<P> {
         if self.events.contains_key(&id) {
             return InsertOutcome::AlreadyKnown;
         }
+        if let Some(key) = P::supersession_key(&event) {
+            if self.events.values().any(|existing| {
+                P::supersession_key(existing).as_ref() == Some(&key)
+                    && P::cmp(existing, &event) == Ordering::Greater
+            }) {
+                return InsertOutcome::Superseded;
+            }
+        }
         let prior_state = {
             let prior: Vec<&P::Event> = self
                 .events
@@ -162,6 +251,21 @@ impl<P: LogPolicy> VerifiedLog<P> {
         };
         match P::verify(&event, &prior_state, ctx) {
             Ok(()) => {
+                if let Some(key) = P::supersession_key(&event) {
+                    // Every stored same-key event is strictly less under
+                    // `cmp` here — a greater one would have returned
+                    // `Superseded` above, and distinct events never compare
+                    // `Equal` — so the whole lineage is stale.
+                    let stale: Vec<P::EventId> = self
+                        .events
+                        .values()
+                        .filter(|existing| P::supersession_key(existing).as_ref() == Some(&key))
+                        .map(|existing| P::event_id(existing))
+                        .collect();
+                    for stale_id in stale {
+                        self.events.remove(&stale_id);
+                    }
+                }
                 self.events.insert(id, event);
                 InsertOutcome::Inserted
             }
@@ -230,6 +334,7 @@ mod tests {
         type State = BTreeSet<u32>;
         type Context = ();
         type Error = ToyErr;
+        type SupersessionKey = ();
 
         fn event_id(e: &ToyEvent) -> u32 {
             e.id
@@ -323,5 +428,121 @@ mod tests {
         log.insert(ev(2, 20, false), &());
         let ids: Vec<u32> = log.events().map(|e| e.id).collect();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    // ── ZEB-813 supersession ───────────────────────────────────────────
+
+    /// Supersession toy: same `key`, greater order supersedes. `verify`
+    /// counts invocations through the context so tests can prove
+    /// `Superseded` skips it.
+    struct SupToy;
+
+    #[derive(Clone)]
+    struct SupEvent {
+        id: u32,
+        order: u64,
+        key: u32,
+    }
+
+    impl LogPolicy for SupToy {
+        type Event = SupEvent;
+        type EventId = u32;
+        type State = BTreeSet<u32>;
+        type Context = core::cell::Cell<u32>;
+        type Error = ();
+        type SupersessionKey = u32;
+
+        fn event_id(e: &SupEvent) -> u32 {
+            e.id
+        }
+        fn cmp(a: &SupEvent, b: &SupEvent) -> Ordering {
+            a.order.cmp(&b.order).then(a.id.cmp(&b.id))
+        }
+        fn verify(
+            _e: &SupEvent,
+            _prior: &BTreeSet<u32>,
+            ctx: &core::cell::Cell<u32>,
+        ) -> Result<(), ()> {
+            ctx.set(ctx.get() + 1);
+            Ok(())
+        }
+        fn materialize(events: &[&SupEvent], _ctx: &core::cell::Cell<u32>) -> BTreeSet<u32> {
+            events.iter().map(|e| e.id).collect()
+        }
+        fn supersession_key(e: &SupEvent) -> Option<u32> {
+            Some(e.key)
+        }
+    }
+
+    fn sup(id: u32, order: u64, key: u32) -> SupEvent {
+        SupEvent { id, order, key }
+    }
+
+    #[test]
+    fn supersession_converges_across_all_arrival_orders() {
+        let evs = [sup(1, 10, 7), sup(2, 20, 7), sup(3, 30, 7)];
+        let orders: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for order in orders {
+            let ctx = core::cell::Cell::new(0);
+            let mut log: VerifiedLog<SupToy> = VerifiedLog::new();
+            for i in order {
+                log.insert(evs[i].clone(), &ctx);
+            }
+            let ids: Vec<u32> = log.events().map(|e| e.id).collect();
+            assert_eq!(
+                ids,
+                vec![3],
+                "arrival order {order:?} must retain only newest"
+            );
+        }
+    }
+
+    #[test]
+    fn different_keys_never_supersede() {
+        let ctx = core::cell::Cell::new(0);
+        let mut log: VerifiedLog<SupToy> = VerifiedLog::new();
+        assert_eq!(log.insert(sup(1, 10, 7), &ctx), InsertOutcome::Inserted);
+        assert_eq!(log.insert(sup(2, 20, 8), &ctx), InsertOutcome::Inserted);
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn superseded_on_arrival_skips_verify() {
+        let ctx = core::cell::Cell::new(0);
+        let mut log: VerifiedLog<SupToy> = VerifiedLog::new();
+        assert_eq!(log.insert(sup(2, 20, 7), &ctx), InsertOutcome::Inserted);
+        assert_eq!(ctx.get(), 1);
+        assert_eq!(log.insert(sup(1, 10, 7), &ctx), InsertOutcome::Superseded);
+        assert_eq!(ctx.get(), 1, "Superseded must not run verify");
+        assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn from_verified_events_compacts() {
+        let log: VerifiedLog<SupToy> =
+            VerifiedLog::from_verified_events([sup(1, 10, 7), sup(2, 20, 7), sup(3, 30, 9)]);
+        let ids: Vec<u32> = log.events().map(|e| e.id).collect();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    fn default_policy_never_supersedes() {
+        // `Toy` has no `supersedes` impl — the default keeps every event
+        // and never returns Superseded, identical to pre-ZEB-813 behavior.
+        let mut log: VerifiedLog<Toy> = VerifiedLog::new();
+        for id in [1u32, 2, 3] {
+            assert_eq!(
+                log.insert(ev(id, id as u64, false), &()),
+                InsertOutcome::Inserted
+            );
+        }
+        assert_eq!(log.len(), 3);
     }
 }
