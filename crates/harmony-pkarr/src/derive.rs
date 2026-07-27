@@ -185,6 +185,9 @@ mod tests {
         assert_ne!(k4.verifying_key(), k2.verifying_key());
         assert_ne!(k4.verifying_key(), k3.verifying_key());
         assert_ne!(k5.verifying_key(), k1.verifying_key());
+        assert_ne!(k5.verifying_key(), k2.verifying_key());
+        assert_ne!(k5.verifying_key(), k3.verifying_key());
+        assert_ne!(k5.verifying_key(), k4.verifying_key());
     }
 
     #[test]
