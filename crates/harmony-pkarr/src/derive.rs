@@ -40,6 +40,17 @@ pub enum PkarrCase {
     /// Only the two parties holding the per-friendship secret can compute the
     /// slot, so the friend rendezvous is private to that friendship.
     Friend,
+    /// Case E: vine relay discovery (ZEB-811). `ikm` = the creator's public
+    /// hex address, hex-decoded to raw bytes; `info` = `epoch_be`.
+    ///
+    /// Like Case B (`Identity`), this derives from **public** input by
+    /// design: anyone who follows a creator holds their address and must be
+    /// able to find the relay-set record. The follower does NOT hold the
+    /// creator's 64-byte identity pub (addresses are one-way hashes of it),
+    /// which is why Case B's ikm is unusable here. Authenticity comes from
+    /// the record's inner `#3` identity signature plus the embedded
+    /// identity-pub→address binding checked by the client.
+    Vines,
 }
 
 impl PkarrCase {
@@ -52,6 +63,7 @@ impl PkarrCase {
             Self::Identity => b"harmony.pkarr.v1.identity",
             Self::Community => b"harmony.pkarr.v1.community",
             Self::Friend => b"harmony.pkarr.v1.friend",
+            Self::Vines => b"harmony.pkarr.v1.vines",
         }
     }
 }
@@ -136,6 +148,21 @@ mod tests {
         assert_eq!(vk_hex, expected, "case-friend v1 keying must not drift");
     }
 
+    /// Reference vector — pins the Case-E (vines) keying scheme.
+    /// Same DO-NOT-REGENERATE warning as the other reference vectors applies.
+    #[test]
+    fn reference_vector_case_vines() {
+        // ikm = 16 zero bytes (placeholder hex-decoded creator address)
+        // info = epoch_id 12345 in big-endian
+        let ikm = [0u8; 16];
+        let info = 12345u64.to_be_bytes();
+        let key = derive_ephemeral_key(PkarrCase::Vines, &ikm, &info);
+        let vk_hex = hex::encode(key.verifying_key().to_bytes());
+        // Pin: compute once, paste here. Regenerating breaks v1 records.
+        let expected = "433a95e8cba5a590bb35fec89fde6ac57d34c1ec70acb253432a24a1188c58b3";
+        assert_eq!(vk_hex, expected, "case-vines v1 keying must not drift");
+    }
+
     #[test]
     fn different_cases_produce_different_keys() {
         // Uniform `ikm`/`info` across every case is intentional: holding the
@@ -150,12 +177,17 @@ mod tests {
         let k2 = derive_ephemeral_key(PkarrCase::Identity, &ikm, &info);
         let k3 = derive_ephemeral_key(PkarrCase::Community, &ikm, &info);
         let k4 = derive_ephemeral_key(PkarrCase::Friend, &ikm, &info);
+        let k5 = derive_ephemeral_key(PkarrCase::Vines, &ikm, &info);
         assert_ne!(k1.verifying_key(), k2.verifying_key());
         assert_ne!(k1.verifying_key(), k3.verifying_key());
         assert_ne!(k2.verifying_key(), k3.verifying_key());
         assert_ne!(k4.verifying_key(), k1.verifying_key());
         assert_ne!(k4.verifying_key(), k2.verifying_key());
         assert_ne!(k4.verifying_key(), k3.verifying_key());
+        assert_ne!(k5.verifying_key(), k1.verifying_key());
+        assert_ne!(k5.verifying_key(), k2.verifying_key());
+        assert_ne!(k5.verifying_key(), k3.verifying_key());
+        assert_ne!(k5.verifying_key(), k4.verifying_key());
     }
 
     #[test]
