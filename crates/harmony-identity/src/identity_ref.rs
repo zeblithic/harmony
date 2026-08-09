@@ -11,8 +11,8 @@ use crate::pq_identity::PqIdentity;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IdentityRef {
     /// The 128-bit address hash. Derivation depends on suite:
-    /// Ed25519/MlDsa65: SHA256(pub_keys)[:16].
-    /// MlDsa65Rotatable: SHA256(inception_payload)[:16].
+    /// Ed25519/MlDsa65: `SHA256(pub_keys)[:16]`.
+    /// MlDsa65Rotatable: `SHA256(inception_payload)[:16]`.
     pub hash: IdentityHash,
     /// The cryptographic suite backing this identity.
     pub suite: CryptoSuite,
