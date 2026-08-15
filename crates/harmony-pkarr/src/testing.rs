@@ -36,6 +36,10 @@ struct MockState {
     /// When true, PUT validates the z32 key + BEP44 signature and returns 400
     /// for anything that is not a real pkarr relay payload.
     strict: bool,
+    /// When set, every PUT and GET short-circuits to this status (for
+    /// cooldown-policy tests that need a deterministic 4xx/5xx). Overrides
+    /// `strict` and the store.
+    forced_status: Option<StatusCode>,
 }
 
 /// Handle to a running mock relay. Drop to stop the server.
@@ -49,20 +53,28 @@ pub struct MockPkarrRelay {
 impl MockPkarrRelay {
     /// Start a lax mock (stores whatever is PUT). For relay-pool/cooldown tests.
     pub async fn start() -> Self {
-        Self::start_inner(false).await
+        Self::start_inner(false, None).await
     }
 
     /// Start a strict mock that validates the real pkarr relay format on PUT
     /// (z-base-32 key + `from_relay_payload` signature check). Rejects the old
     /// in-house dialect with 400.
     pub async fn start_strict() -> Self {
-        Self::start_inner(true).await
+        Self::start_inner(true, None).await
     }
 
-    async fn start_inner(strict: bool) -> Self {
+    /// Start a mock that answers EVERY PUT and GET with the fixed HTTP `status`.
+    /// For cooldown-policy tests that need a deterministic 4xx vs 5xx response.
+    pub async fn start_status(status: u16) -> Self {
+        let code = StatusCode::from_u16(status).expect("valid HTTP status");
+        Self::start_inner(false, Some(code)).await
+    }
+
+    async fn start_inner(strict: bool, forced_status: Option<StatusCode>) -> Self {
         let state = MockState {
             store: Arc::new(RwLock::new(HashMap::new())),
             strict,
+            forced_status,
         };
         let app = Router::new()
             .route("/{key}", put(put_record).get(get_record))
@@ -108,6 +120,9 @@ async fn put_record(
     State(state): State<MockState>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    if let Some(code) = state.forced_status {
+        return code;
+    }
     if state.strict {
         let Ok(pk) = pkarr::PublicKey::try_from(key.as_str()) else {
             return StatusCode::BAD_REQUEST;
@@ -122,6 +137,9 @@ async fn put_record(
 }
 
 async fn get_record(Path(key): Path<String>, State(state): State<MockState>) -> impl IntoResponse {
+    if let Some(code) = state.forced_status {
+        return code.into_response();
+    }
     match state.store.read().await.get(&key) {
         Some(bytes) => (StatusCode::OK, bytes.clone()).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
