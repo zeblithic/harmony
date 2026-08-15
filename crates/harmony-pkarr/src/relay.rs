@@ -254,10 +254,15 @@ impl RelayClient {
                     continue;
                 }
                 Ok(resp) => {
-                    // Non-success, non-429 (e.g. 500/503): record the status,
-                    // put the relay on cooldown, and rotate to the next one.
+                    // Non-success, non-429: record the status and rotate. Only a
+                    // RETRYABLE failure (5xx) cools the relay — a clean 4xx is a
+                    // deterministic rejection, so cooling it would pointlessly
+                    // remove a reachable relay for the cooldown window (matches
+                    // the `RelayConfig::cooldown` doc — ZEB-389 / CodeAnt).
                     let status = resp.status().as_u16();
-                    self.mark_cooldown(gen, &base, Op::Put);
+                    if status >= 500 {
+                        self.mark_cooldown(gen, &base, Op::Put);
+                    }
                     self.record_outcome(gen, &base, RelayOutcome::Http(status));
                     last_http_error = Some(status);
                     continue;
@@ -338,12 +343,15 @@ impl RelayClient {
                     continue;
                 }
                 Ok(resp) => {
-                    // Other non-success status (e.g. 500): we can't confirm the
-                    // key is absent. Mirror the PUT path's cooldown/skip handling
-                    // so a misbehaving relay isn't hammered with every GET — but
-                    // record the precise outcome as RelayOutcome::Http(status).
-                    self.mark_cooldown(gen, &base, Op::Get);
-                    self.record_outcome(gen, &base, RelayOutcome::Http(resp.status().as_u16()));
+                    // Other non-success status: we can't confirm the key is
+                    // absent, so this is not a definitive 404. Only a retryable
+                    // 5xx cools the relay; a clean 4xx must not remove it from
+                    // resolve availability (ZEB-389 / CodeAnt).
+                    let status = resp.status().as_u16();
+                    if status >= 500 {
+                        self.mark_cooldown(gen, &base, Op::Get);
+                    }
+                    self.record_outcome(gen, &base, RelayOutcome::Http(status));
                     all_404 = false;
                     continue;
                 }
@@ -421,8 +429,13 @@ impl RelayClient {
                 }
                 Ok(resp) => {
                     all_404 = false;
-                    self.mark_cooldown(gen, &base, Op::Get);
-                    self.record_outcome(gen, &base, RelayOutcome::Http(resp.status().as_u16()));
+                    // Only a retryable 5xx cools the relay; a clean 4xx must not
+                    // remove it from resolve availability (ZEB-389 / CodeAnt).
+                    let status = resp.status().as_u16();
+                    if status >= 500 {
+                        self.mark_cooldown(gen, &base, Op::Get);
+                    }
+                    self.record_outcome(gen, &base, RelayOutcome::Http(status));
                 }
                 Err(e) => {
                     all_404 = false;
@@ -962,6 +975,49 @@ mod tests {
             client.available_relays(Op::Get).1,
             vec![url],
             "re-added relay is fresh for GET (get cooldown pruned)"
+        );
+    }
+
+    // ---- ZEB-389 / CodeAnt: cooldown only on retryable failures ----
+
+    /// Only RETRYABLE failures (timeout / 429 / 5xx) cool a relay. A clean 4xx
+    /// rejection is deterministic — cooling it would pointlessly remove a
+    /// reachable relay (and, with a single relay, return `NoRelaysAvailable` for
+    /// the whole cooldown window). Matches the documented `cooldown` policy.
+    #[tokio::test]
+    async fn clean_4xx_does_not_cool_relay_but_5xx_does() {
+        // 400 on PUT → not retryable → relay stays Healthy.
+        let relay_400 = MockPkarrRelay::start_status(400).await;
+        let client = RelayClient::new(RelayPool::new(vec![relay_400.base_url.clone()]));
+        let _ = client.put("k", b"v").await;
+        assert!(
+            matches!(client.relay_health()[0].state, RelayState::Healthy),
+            "a clean 4xx PUT rejection must not cool the relay"
+        );
+
+        // 500 on PUT → retryable → relay cools.
+        let relay_500 = MockPkarrRelay::start_status(500).await;
+        let client5 = RelayClient::new(RelayPool::new(vec![relay_500.base_url.clone()]));
+        let _ = client5.put("k", b"v").await;
+        assert!(
+            matches!(
+                client5.relay_health()[0].state,
+                RelayState::CoolingDown { .. }
+            ),
+            "a 5xx PUT failure must cool the relay"
+        );
+    }
+
+    /// Same policy on the GET path: a clean 4xx must not remove the relay from
+    /// resolve availability.
+    #[tokio::test]
+    async fn clean_4xx_get_does_not_cool_relay() {
+        let relay_403 = MockPkarrRelay::start_status(403).await;
+        let client = RelayClient::new(RelayPool::new(vec![relay_403.base_url.clone()]));
+        let _ = client.get("k").await;
+        assert!(
+            matches!(client.relay_health()[0].state, RelayState::Healthy),
+            "a clean 4xx GET response must not cool the relay"
         );
     }
 
