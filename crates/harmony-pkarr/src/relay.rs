@@ -450,11 +450,6 @@ impl RelayClient {
         }
     }
 
-    /// Returns the current pool generation plus the subset of pool relays whose
-    /// cooldown has expired (or never started). Order is preserved so the caller
-    /// iterates in pool order. The generation is captured under the same critical
-    /// section so a put/get can detect a mid-attempt `set_relays` and drop stale
-    /// outcome writes (see `mark_cooldown` / `record_outcome`).
     /// The per-request HTTP timeout for `op` — independent PUT vs GET ceilings
     /// (ZEB-389).
     fn timeout_for(&self, op: Op) -> Duration {
@@ -464,6 +459,11 @@ impl RelayClient {
         }
     }
 
+    /// Returns the current pool generation plus the subset of pool relays whose
+    /// cooldown has expired (or never started). Order is preserved so the caller
+    /// iterates in pool order. The generation is captured under the same critical
+    /// section so a put/get can detect a mid-attempt `set_relays` and drop stale
+    /// outcome writes (see `mark_cooldown` / `record_outcome`).
     fn available_relays(&self, op: Op) -> (u64, Vec<String>) {
         let now = Instant::now();
         let cd = self.cooldowns.lock().expect("cooldowns poisoned");
@@ -981,24 +981,52 @@ mod tests {
         assert_eq!(client.timeout_for(Op::Get), Duration::from_secs(5));
     }
 
-    /// A PUT to an unroutable relay must time out after `put_timeout` — proving
-    /// the PUT path applies the PUT timeout (and NOT the much larger GET
-    /// timeout, which would make this hang far past the assertion bound).
+    /// A PUT against a relay that accepts the connection but never responds must
+    /// return via `put_timeout`, NOT the (much larger) `get_timeout`. The
+    /// accept-but-hang listener guarantees the ONLY way `put` can return is the
+    /// PUT timeout firing (no instant transport failure), so bounding elapsed
+    /// both BELOW the GET ceiling and ABOVE the PUT timeout proves the PUT path
+    /// applies its own timeout precisely — a lone upper bound would also pass an
+    /// immediate connection refusal.
     #[tokio::test]
     async fn put_applies_put_timeout_not_get_timeout() {
+        // Accept connections and hold them open without ever responding, so the
+        // request can only complete when the PUT timeout elapses.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
         let cfg = RelayConfig {
             put_timeout: Duration::from_millis(300),
             get_timeout: Duration::from_secs(30),
             cooldown: Duration::from_millis(0),
         };
-        // 192.0.2.1 (TEST-NET-1) is unrouted → the connect hangs until timeout.
-        let pool = RelayPool::new(vec!["http://192.0.2.1:80".to_string()]);
+        let pool = RelayPool::new(vec![format!("http://127.0.0.1:{port}")]);
         let client = RelayClient::with_config(pool, cfg);
+
         let start = std::time::Instant::now();
-        let _ = client.put("k", b"v").await; // Err after ~300ms (put_timeout)
+        // Outer guard: had the PUT path regressed to the 30s get_timeout, this
+        // resolves to Err(Elapsed) at 2s instead of hanging the whole test.
+        let res = tokio::time::timeout(Duration::from_secs(2), client.put("k", b"v")).await;
+        let elapsed = start.elapsed();
         assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "PUT must honor the 300ms put_timeout, not hang or use the 30s get_timeout"
+            res.is_ok(),
+            "PUT must return via the 300ms put_timeout, not the 30s get_timeout"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "PUT must actually wait for the ~300ms put_timeout, not fail instantly: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "PUT must not use the 30s get_timeout: {elapsed:?}"
         );
     }
 }
