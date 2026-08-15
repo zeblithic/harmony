@@ -108,21 +108,33 @@ fn now_ms() -> u64 {
 }
 
 /// Tunable timeouts for [`RelayClient`]. **Not user-facing** — multi-relay
-/// redundancy (ZEB-380) already removes the "5 s timeout is terminal" failure
-/// mode, so these stay code-level defaults. The struct exists so tests can use
-/// short values and a future ticket can wire knobs if needed.
+/// redundancy (ZEB-380) already removes the "timeout is terminal" failure mode,
+/// so these stay code-level defaults. The struct exists so tests can use short
+/// values and a future ticket can wire knobs if needed.
+///
+/// ZEB-389: PUT and GET carry INDEPENDENT timeouts. A valid PUT triggers a
+/// synchronous mainline-DHT write on the relay (routinely 15-20 s), so it needs
+/// a high ceiling; a GET is a cheap stored-record fetch that should rotate off a
+/// hung relay quickly. A single shared timeout forced the GET ceiling up to the
+/// PUT's (ZEB-387's blunt 20 s client override) — this splits them.
 #[derive(Debug, Clone, Copy)]
 pub struct RelayConfig {
-    /// Per-request HTTP timeout. Default 5 s.
-    pub request_timeout: Duration,
-    /// How long a relay stays on cooldown after a timeout / 429 / 5xx. Default 30 s.
+    /// Per-request HTTP timeout for PUT (publish → synchronous mainline-DHT
+    /// write). Default 20 s.
+    pub put_timeout: Duration,
+    /// Per-request HTTP timeout for GET (resolve → cheap stored-record fetch).
+    /// Default 5 s.
+    pub get_timeout: Duration,
+    /// How long a relay stays on cooldown (per operation) after a timeout / 429 /
+    /// 5xx. Default 30 s.
     pub cooldown: Duration,
 }
 
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
-            request_timeout: Duration::from_secs(5),
+            put_timeout: Duration::from_secs(20),
+            get_timeout: Duration::from_secs(5),
             cooldown: Duration::from_secs(30),
         }
     }
@@ -188,7 +200,9 @@ impl RelayClient {
     /// Build a client with an explicit [`RelayConfig`] (test/forward-compat hook).
     pub fn with_config(pool: RelayPool, config: RelayConfig) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(config.request_timeout)
+            // ZEB-389: NO client-level timeout — PUT and GET apply their own
+            // per-request timeouts (`timeout_for`) so a slow publish (PUT) can't
+            // impose its ceiling on resolve (GET).
             // ZEB-381: trust Mozilla's webpki root bundle in addition to OS-native
             // roots. `rustls-tls-native-roots` alone failed to anchor relay.pkarr.org's
             // Let's Encrypt chain — InvalidCertificate(UnknownIssuer) — on BOTH macOS
@@ -222,7 +236,14 @@ impl RelayClient {
         let (gen, relays) = self.available_relays(Op::Put);
         for base in relays {
             let url = format!("{}/{}", base, key_z32);
-            match self.http.put(&url).body(envelope.to_vec()).send().await {
+            match self
+                .http
+                .put(&url)
+                .timeout(self.timeout_for(Op::Put))
+                .body(envelope.to_vec())
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => {
                     self.record_outcome(gen, &base, RelayOutcome::Success);
                     return Ok(());
@@ -288,7 +309,13 @@ impl RelayClient {
         let mut all_404 = true;
         for base in relays {
             let url = format!("{}/{}", base, key_z32);
-            match self.http.get(&url).send().await {
+            match self
+                .http
+                .get(&url)
+                .timeout(self.timeout_for(Op::Get))
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => {
                     let bytes = resp
                         .bytes()
@@ -368,7 +395,13 @@ impl RelayClient {
         let mut hits = Vec::new();
         for base in relays {
             let url = format!("{}/{}", base, key_z32);
-            match self.http.get(&url).send().await {
+            match self
+                .http
+                .get(&url)
+                .timeout(self.timeout_for(Op::Get))
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                     Ok(b) => {
                         self.record_outcome(gen, &base, RelayOutcome::Success);
@@ -422,6 +455,15 @@ impl RelayClient {
     /// iterates in pool order. The generation is captured under the same critical
     /// section so a put/get can detect a mid-attempt `set_relays` and drop stale
     /// outcome writes (see `mark_cooldown` / `record_outcome`).
+    /// The per-request HTTP timeout for `op` — independent PUT vs GET ceilings
+    /// (ZEB-389).
+    fn timeout_for(&self, op: Op) -> Duration {
+        match op {
+            Op::Put => self.config.put_timeout,
+            Op::Get => self.config.get_timeout,
+        }
+    }
+
     fn available_relays(&self, op: Op) -> (u64, Vec<String>) {
         let now = Instant::now();
         let cd = self.cooldowns.lock().expect("cooldowns poisoned");
@@ -597,7 +639,8 @@ mod tests {
         // an outage as a definitive miss). 192.0.2.1 (TEST-NET-1) is unreachable;
         // the short timeout keeps the test fast.
         let cfg = RelayConfig {
-            request_timeout: Duration::from_millis(200),
+            put_timeout: Duration::from_millis(200),
+            get_timeout: Duration::from_millis(200),
             cooldown: Duration::from_millis(0),
         };
         let pool = RelayPool::new(vec!["http://192.0.2.1:80".to_string()]);
@@ -622,9 +665,10 @@ mod tests {
     }
 
     #[test]
-    fn relay_config_default_is_5s_30s() {
+    fn relay_config_defaults_are_put20_get5_cooldown30() {
         let cfg = RelayConfig::default();
-        assert_eq!(cfg.request_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.put_timeout, Duration::from_secs(20));
+        assert_eq!(cfg.get_timeout, Duration::from_secs(5));
         assert_eq!(cfg.cooldown, Duration::from_secs(30));
     }
 
@@ -633,7 +677,8 @@ mod tests {
         // A relay that fails goes on cooldown for the CONFIGURED duration.
         // With a 0ms cooldown the failed relay is immediately available again.
         let cfg = RelayConfig {
-            request_timeout: Duration::from_millis(200),
+            put_timeout: Duration::from_millis(200),
+            get_timeout: Duration::from_millis(200),
             cooldown: Duration::from_millis(0),
         };
         let pool = RelayPool::new(vec!["http://192.0.2.1:80".to_string()]);
@@ -693,7 +738,8 @@ mod tests {
         // Short request_timeout keeps the test fast. Both Timeout and Transport
         // trip cooldown identically; this asserts the discrimination is correct.
         let cfg = RelayConfig {
-            request_timeout: Duration::from_millis(300),
+            put_timeout: Duration::from_millis(300),
+            get_timeout: Duration::from_millis(300),
             cooldown: Duration::from_secs(30),
         };
         let pool = RelayPool::new(vec!["http://192.0.2.1:80".to_string()]);
@@ -778,7 +824,8 @@ mod tests {
         });
 
         let cfg = RelayConfig {
-            request_timeout: Duration::from_millis(300),
+            put_timeout: Duration::from_millis(300),
+            get_timeout: Duration::from_millis(300),
             cooldown: Duration::from_secs(30),
         };
         let client = std::sync::Arc::new(RelayClient::with_config(
@@ -915,6 +962,43 @@ mod tests {
             client.available_relays(Op::Get).1,
             vec![url],
             "re-added relay is fresh for GET (get cooldown pruned)"
+        );
+    }
+
+    // ---- ZEB-389: independent PUT/GET timeouts ----
+
+    /// The per-request timeout selector returns the PUT timeout for a PUT and
+    /// the GET timeout for a GET — the two are independent.
+    #[test]
+    fn timeout_for_selects_put_vs_get() {
+        let cfg = RelayConfig {
+            put_timeout: Duration::from_secs(20),
+            get_timeout: Duration::from_secs(5),
+            cooldown: Duration::from_secs(30),
+        };
+        let client = RelayClient::with_config(RelayPool::new(vec![]), cfg);
+        assert_eq!(client.timeout_for(Op::Put), Duration::from_secs(20));
+        assert_eq!(client.timeout_for(Op::Get), Duration::from_secs(5));
+    }
+
+    /// A PUT to an unroutable relay must time out after `put_timeout` — proving
+    /// the PUT path applies the PUT timeout (and NOT the much larger GET
+    /// timeout, which would make this hang far past the assertion bound).
+    #[tokio::test]
+    async fn put_applies_put_timeout_not_get_timeout() {
+        let cfg = RelayConfig {
+            put_timeout: Duration::from_millis(300),
+            get_timeout: Duration::from_secs(30),
+            cooldown: Duration::from_millis(0),
+        };
+        // 192.0.2.1 (TEST-NET-1) is unrouted → the connect hangs until timeout.
+        let pool = RelayPool::new(vec!["http://192.0.2.1:80".to_string()]);
+        let client = RelayClient::with_config(pool, cfg);
+        let start = std::time::Instant::now();
+        let _ = client.put("k", b"v").await; // Err after ~300ms (put_timeout)
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "PUT must honor the 300ms put_timeout, not hang or use the 30s get_timeout"
         );
     }
 }
