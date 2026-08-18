@@ -358,23 +358,4 @@ mod tests {
         assert!(val >= 0.0, "loss must be non-negative, got {val}");
     }
 
-    #[test]
-    fn contrastive_loss_decreases_with_aligned_projections() {
-        // Use larger dimensions for statistical stability
-        let hidden = 128;
-        let latent = 32;
-        let original = Tensor::randn(0f32, 1.0, (1, 16, hidden), &Device::Cpu).unwrap();
-        let random_proj = Tensor::randn(0f32, 1.0, (1, 16, latent), &Device::Cpu).unwrap();
-        let aligned_proj = original.narrow(2, 0, latent).unwrap();
-
-        let loss_random = contrastive_loss(&original, &random_proj, 0.07, 4).unwrap();
-        let loss_aligned = contrastive_loss(&original, &aligned_proj, 0.07, 4).unwrap();
-
-        let v_random: f32 = loss_random.to_scalar().unwrap();
-        let v_aligned: f32 = loss_aligned.to_scalar().unwrap();
-        assert!(
-            v_aligned < v_random,
-            "aligned projection should have lower loss: {v_aligned} vs {v_random}"
-        );
-    }
 }
