@@ -197,8 +197,18 @@ pub enum StorageTierAction {
 /// - `EncryptedEphemeral (11)`: always rejected by `class_admits()` — never stored or announced.
 #[derive(Debug, Clone)]
 pub struct ContentPolicy {
-    /// Whether to persist encrypted durable (10) content.
+    /// Whether to persist **locally-published** encrypted durable (10) content
+    /// and serve it to peers. Gates the publish path (`handle_publish`) and the
+    /// Bloom-filter advertisement of cached content (`rebuild_filter`) — i.e.
+    /// "do I hold and serve my own EncryptedDurable blobs?". Deliberately does
+    /// NOT gate untrusted inbound transit; see `encrypted_durable_persist_transit`.
     pub encrypted_durable_persist: bool,
+    /// Whether to admit **untrusted inbound transit** encrypted durable (10)
+    /// content from peers (`handle_transit`). ZEB-400: split out from
+    /// `encrypted_durable_persist` so a node can persist and serve its own
+    /// EncryptedDurable content without being obliged to cache arbitrary peers'
+    /// EncryptedDurable transit. Defaults `false` (reject untrusted transit).
+    pub encrypted_durable_persist_transit: bool,
     /// Whether to announce encrypted durable (10) content on Zenoh.
     pub encrypted_durable_announce: bool,
     /// Whether to announce public ephemeral (01) content on Zenoh.
@@ -209,6 +219,7 @@ impl Default for ContentPolicy {
     fn default() -> Self {
         Self {
             encrypted_durable_persist: false,
+            encrypted_durable_persist_transit: false,
             encrypted_durable_announce: false,
             public_ephemeral_announce: true,
         }
@@ -915,7 +926,12 @@ impl<B: BookStore> StorageTier<B> {
         );
 
         for cid in self.cache.iter_admitted() {
-            if self.class_admits(&cid) {
+            // Advertise everything we hold and will serve on query
+            // (`handle_content_query` is policy-blind), whether it entered via
+            // the publish (`class_admits`) or transit (`transit_admits`) axis.
+            // Otherwise a transit-only EncryptedDurable would be served on
+            // direct query but hidden from the Bloom filter (ZEB-400).
+            if self.class_admits(&cid) || self.transit_admits(&cid) {
                 filter.insert(&cid);
             }
         }
@@ -990,7 +1006,11 @@ impl<B: BookStore> StorageTier<B> {
         }
     }
 
-    /// Check whether a CID's content class is admissible under the current policy.
+    /// Check whether a CID's content class is admissible for **local publish**
+    /// and **serve/advertise** decisions (`handle_publish`, `rebuild_filter`).
+    /// For `EncryptedDurable` this is the publish/serve axis
+    /// (`encrypted_durable_persist`). Untrusted inbound transit uses
+    /// [`transit_admits`](Self::transit_admits) instead (ZEB-400).
     fn class_admits(&self, cid: &ContentId) -> bool {
         match cid.content_class() {
             ContentClass::EncryptedEphemeral => false,
@@ -999,9 +1019,26 @@ impl<B: BookStore> StorageTier<B> {
         }
     }
 
+    /// Check whether a CID's content class is admissible for **untrusted inbound
+    /// transit** (`handle_transit`). Diverges from [`class_admits`](Self::class_admits)
+    /// only for `EncryptedDurable`, which is gated on the separate
+    /// `encrypted_durable_persist_transit` axis so a node can persist and serve
+    /// its own EncryptedDurable content without being obliged to cache arbitrary
+    /// peers' EncryptedDurable transit (ZEB-400). Every other class defers to
+    /// `class_admits` — identical behavior, including the `verify_cid` +
+    /// W-TinyLFU gauntlet that follows in `handle_transit`.
+    fn transit_admits(&self, cid: &ContentId) -> bool {
+        match cid.content_class() {
+            ContentClass::EncryptedDurable => self.policy.encrypted_durable_persist_transit,
+            _ => self.class_admits(cid),
+        }
+    }
+
     fn handle_transit(&mut self, cid: ContentId, data: Vec<u8>) -> Vec<StorageTierAction> {
         // Class-based admission first — O(1) flag check before O(data_size) hash.
-        if !self.class_admits(&cid) {
+        // Untrusted transit uses the transit axis (ZEB-400), independent of the
+        // publish/serve `class_admits` used by handle_publish + rebuild_filter.
+        if !self.transit_admits(&cid) {
             self.metrics.transit_rejected += 1;
             return vec![];
         }
@@ -1954,6 +1991,8 @@ mod tests {
     fn transit_admits_encrypted_durable_when_policy_on() {
         let policy = ContentPolicy {
             encrypted_durable_persist: true,
+            // ZEB-400: transit admission is now its own axis; opt in explicitly.
+            encrypted_durable_persist_transit: true,
             encrypted_durable_announce: true,
             ..ContentPolicy::default()
         };
@@ -1970,6 +2009,106 @@ mod tests {
     }
 
     #[test]
+    fn transit_and_publish_encrypted_durable_are_decoupled() {
+        // ZEB-400: the production "member" shape — persist/serve my own
+        // EncryptedDurable publishes, but reject untrusted EncryptedDurable
+        // transit. Proves the publish and transit admission axes are independent.
+        let policy = ContentPolicy {
+            encrypted_durable_persist: true,
+            encrypted_durable_persist_transit: false,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+
+        // A local publish of EncryptedDurable is stored (publish axis on).
+        let (pub_cid, pub_data) = cid_with_class(b"my own community root", true, false);
+        tier.handle(StorageTierEvent::PublishContent {
+            cid: pub_cid,
+            data: pub_data,
+        });
+        assert_eq!(
+            tier.metrics().publishes_stored,
+            1,
+            "own EncryptedDurable publish must be persisted"
+        );
+
+        // An untrusted transit of EncryptedDurable is rejected (transit axis off).
+        let (transit_cid, transit_data) = cid_with_class(b"someone else's blob", true, false);
+        let actions = tier.handle(StorageTierEvent::TransitContent {
+            cid: transit_cid,
+            data: transit_data,
+        });
+        assert!(actions.is_empty(), "rejected transit emits no actions");
+        assert_eq!(
+            tier.metrics().transit_rejected,
+            1,
+            "untrusted EncryptedDurable transit must be rejected when the transit axis is off"
+        );
+        assert_eq!(
+            tier.metrics().transit_stored,
+            0,
+            "no transit content stored"
+        );
+    }
+
+    #[test]
+    fn transit_admits_encrypted_durable_when_transit_axis_on() {
+        // ZEB-400: opting into the transit axis re-enables untrusted transit
+        // admission (the harmony-node --encrypted-durable-persist-transit case),
+        // fully independent of the publish/serve axis (persist off here).
+        let policy = ContentPolicy {
+            encrypted_durable_persist: false,
+            encrypted_durable_persist_transit: true,
+            encrypted_durable_announce: false,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+        let (cid, data) = cid_with_class(b"peer blob", true, false);
+        tier.handle(StorageTierEvent::TransitContent { cid, data });
+        assert_eq!(
+            tier.metrics().transit_stored,
+            1,
+            "transit axis on admits EncryptedDurable transit even with persist off"
+        );
+    }
+
+    #[test]
+    fn rebuild_filter_advertises_transit_only_encrypted_durable() {
+        // ZEB-400 second-order: a node that admits untrusted EncryptedDurable
+        // transit (transit axis on) but does not persist its own (publish axis
+        // off) still serves that cached content on direct query
+        // (`handle_content_query` is policy-blind), so it must also advertise it
+        // in the Bloom filter — otherwise filter-driven peers cannot discover
+        // content the node actually serves.
+        use crate::bloom::BloomFilter;
+
+        let policy = ContentPolicy {
+            encrypted_durable_persist: false,
+            encrypted_durable_persist_transit: true,
+            ..ContentPolicy::default()
+        };
+        let mut tier = make_tier_with_policy(policy);
+        let (cid, data) = cid_with_class(b"peer encrypted blob", true, false);
+        tier.handle(StorageTierEvent::TransitContent { cid, data });
+        assert_eq!(tier.metrics().transit_stored, 1, "transit must be cached");
+
+        // Force a filter rebuild and confirm the transit-only CID is advertised.
+        let actions = tier.handle(StorageTierEvent::FilterTimerTick);
+        let payload = actions
+            .iter()
+            .find_map(|a| match a {
+                StorageTierAction::BroadcastFilter { payload } => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("FilterTimerTick must emit a BroadcastFilter");
+        let filter = BloomFilter::from_bytes(&payload).unwrap();
+        assert!(
+            filter.may_contain(&cid),
+            "transit-admitted EncryptedDurable must be advertised in the Bloom filter"
+        );
+    }
+
+    #[test]
     fn transit_encrypted_durable_survives_public_durable_pressure() {
         // Regression: EncryptedDurable (eviction_priority formerly 1) was
         // permanently rejected by should_admit when probation was full of
@@ -1982,6 +2121,9 @@ mod tests {
         };
         let policy = ContentPolicy {
             encrypted_durable_persist: true,
+            // ZEB-400: this regression exercises transit admission, now gated
+            // on its own axis — opt in.
+            encrypted_durable_persist_transit: true,
             encrypted_durable_announce: true,
             ..ContentPolicy::default()
         };
@@ -2120,6 +2262,7 @@ mod tests {
     fn transit_encrypted_durable_no_announce_when_policy_off() {
         let policy = ContentPolicy {
             encrypted_durable_persist: true, // must persist to reach announce check
+            encrypted_durable_persist_transit: true, // ZEB-400: admit the transit
             encrypted_durable_announce: false,
             ..ContentPolicy::default()
         };
@@ -2138,6 +2281,7 @@ mod tests {
     fn transit_encrypted_durable_announces_when_policy_on() {
         let policy = ContentPolicy {
             encrypted_durable_persist: true,
+            encrypted_durable_persist_transit: true, // ZEB-400: admit the transit
             encrypted_durable_announce: true,
             ..ContentPolicy::default()
         };
@@ -2702,9 +2846,10 @@ mod tests {
         assert!(actions.is_empty());
         assert_eq!(tier_off.metrics().transit_rejected, 1);
 
-        // With policy on: encrypted durable admitted.
+        // With transit axis on: encrypted durable transit admitted (ZEB-400).
         let policy_on = ContentPolicy {
             encrypted_durable_persist: true,
+            encrypted_durable_persist_transit: true,
             encrypted_durable_announce: true,
             ..ContentPolicy::default()
         };

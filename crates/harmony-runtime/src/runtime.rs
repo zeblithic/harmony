@@ -5104,6 +5104,9 @@ mod tests {
             schedule: Default::default(),
             content_policy: ContentPolicy {
                 encrypted_durable_persist: true,
+                // Preserve pre-ZEB-400 behavior for this test config: when
+                // persist was on, transit EncryptedDurable was admitted too.
+                encrypted_durable_persist_transit: true,
                 encrypted_durable_announce: true,
                 public_ephemeral_announce: false,
             },

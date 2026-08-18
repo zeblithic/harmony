@@ -75,6 +75,7 @@ pub struct ConfigFile {
     pub filter_broadcast_ticks: Option<u32>,
     pub filter_mutation_threshold: Option<u32>,
     pub encrypted_durable_persist: Option<bool>,
+    pub encrypted_durable_persist_transit: Option<bool>,
     pub encrypted_durable_announce: Option<bool>,
     pub no_public_ephemeral_announce: Option<bool>,
     pub no_mdns: Option<bool>,
@@ -309,6 +310,7 @@ compute_budget = 50000
 filter_broadcast_ticks = 60
 filter_mutation_threshold = 200
 encrypted_durable_persist = true
+encrypted_durable_persist_transit = true
 encrypted_durable_announce = true
 no_public_ephemeral_announce = false
 no_mdns = false
@@ -340,6 +342,7 @@ node_id = "112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00"
         assert_eq!(cfg.filter_broadcast_ticks, Some(60));
         assert_eq!(cfg.filter_mutation_threshold, Some(200));
         assert_eq!(cfg.encrypted_durable_persist, Some(true));
+        assert_eq!(cfg.encrypted_durable_persist_transit, Some(true));
         assert_eq!(cfg.encrypted_durable_announce, Some(true));
         assert_eq!(cfg.no_public_ephemeral_announce, Some(false));
         assert_eq!(cfg.no_mdns, Some(false));
