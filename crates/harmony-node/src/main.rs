@@ -59,6 +59,11 @@ enum Commands {
         /// Accept encrypted durable (10) content for storage
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         encrypted_durable_persist: Option<bool>,
+        /// Accept UNTRUSTED inbound transit encrypted durable (10) content from
+        /// peers (defense-in-depth axis, default off). Independent of
+        /// --encrypted-durable-persist, which governs local publishes/serving.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        encrypted_durable_persist_transit: Option<bool>,
         /// Announce encrypted durable (10) content on Zenoh
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         encrypted_durable_announce: Option<bool>,
@@ -388,6 +393,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             cache_capacity,
             compute_budget,
             encrypted_durable_persist,
+            encrypted_durable_persist_transit,
             encrypted_durable_announce,
             no_public_ephemeral_announce,
             filter_broadcast_ticks,
@@ -458,6 +464,14 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
             let encrypted_durable_persist = resolve(
                 encrypted_durable_persist,
                 config_file.encrypted_durable_persist,
+                false,
+            );
+            // ZEB-400: untrusted transit admission is a separate axis from local
+            // persistence; default off so a node rejects arbitrary peers'
+            // EncryptedDurable transit unless explicitly opted in.
+            let encrypted_durable_persist_transit = resolve(
+                encrypted_durable_persist_transit,
+                config_file.encrypted_durable_persist_transit,
                 false,
             );
             let encrypted_durable_announce = resolve(
@@ -591,6 +605,7 @@ async fn run(cli: Cli, reload_handle: LogReloadHandle) -> Result<(), Box<dyn std
 
             let content_policy = ContentPolicy {
                 encrypted_durable_persist,
+                encrypted_durable_persist_transit,
                 encrypted_durable_announce,
                 public_ephemeral_announce: !no_public_ephemeral_announce,
             };
@@ -1154,18 +1169,21 @@ mod tests {
             "harmony",
             "run",
             "--encrypted-durable-persist",
+            "--encrypted-durable-persist-transit",
             "--encrypted-durable-announce",
             "--no-public-ephemeral-announce",
         ])
         .unwrap();
         if let Commands::Run {
             encrypted_durable_persist,
+            encrypted_durable_persist_transit,
             encrypted_durable_announce,
             no_public_ephemeral_announce,
             ..
         } = cli.command
         {
             assert_eq!(encrypted_durable_persist, Some(true));
+            assert_eq!(encrypted_durable_persist_transit, Some(true));
             assert_eq!(encrypted_durable_announce, Some(true));
             assert_eq!(no_public_ephemeral_announce, Some(true));
         } else {
@@ -1178,12 +1196,14 @@ mod tests {
         let cli = Cli::try_parse_from(["harmony", "run"]).unwrap();
         if let Commands::Run {
             encrypted_durable_persist,
+            encrypted_durable_persist_transit,
             encrypted_durable_announce,
             no_public_ephemeral_announce,
             ..
         } = cli.command
         {
             assert_eq!(encrypted_durable_persist, None);
+            assert_eq!(encrypted_durable_persist_transit, None);
             assert_eq!(encrypted_durable_announce, None);
             assert_eq!(no_public_ephemeral_announce, None);
         } else {
