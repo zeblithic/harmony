@@ -357,5 +357,4 @@ mod tests {
         assert!(val.is_finite(), "loss must be finite, got {val}");
         assert!(val >= 0.0, "loss must be non-negative, got {val}");
     }
-
 }
